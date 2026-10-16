@@ -1,0 +1,72 @@
+# Two tiers:
+#   - pr-gate: fast, no external services (scripts/ci_pr_gate.sh). Runs on
+#     every push to main and every pull request.
+#   - nightly-full: the full suite against real Postgres, Redis and Toxiproxy
+#     (scripts/ci_nightly.sh). Runs nightly and on manual dispatch.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 3 * * *"     # nightly, full suite
+  workflow_dispatch: {}      # manual "run the full suite" button
+
+jobs:
+  pr-gate:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: bash scripts/ci_pr_gate.sh
+
+  nightly-full:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: rewind
+          POSTGRES_PASSWORD: rewind
+          POSTGRES_DB: rewind_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[dev,dist,chaos]"
+      - name: Fetch toxiproxy (static binary, no Docker needed)
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sSL -o "$RUNNER_TEMP/bin/toxiproxy-server" \
+            https://github.com/Shopify/toxiproxy/releases/download/v2.9.0/toxiproxy-server-linux-amd64
+          chmod +x "$RUNNER_TEMP/bin/toxiproxy-server"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: bash scripts/ci_nightly.sh
+        env:
+          REWIND_PG_DSN: postgresql://rewind:rewind@127.0.0.1:5432/rewind_test
+          REWIND_REDIS_URL: redis://127.0.0.1:6379/0

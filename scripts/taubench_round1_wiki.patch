@@ -1,0 +1,11 @@
+--- a/tau_bench/envs/retail/wiki.md
++++ b/tau_bench/envs/retail/wiki.md
+@@ -44,6 +44,8 @@
+ 
+ - For a pending order, you can take actions to modify its shipping address, payment method, or product item options, but nothing else.
+ 
++- If a single request needs both an item change and an address/payment change on the same order, modifying items must be done LAST: the item-modification action locks the order (status becomes 'pending (items modifed)') and permanently blocks any further modification or cancellation of that order, including an address or payment change you have not made yet. Do the address/payment change(s) first, confirm they succeeded, and only then modify items.
++
+ ### Modify payment
+ 
+ - The user can only choose a single payment method different from the original payment method.

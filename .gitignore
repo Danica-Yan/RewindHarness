@@ -1,0 +1,41 @@
+# Secrets -- never commit API keys
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+!src/rewind/dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+!src/rewind/env/
+
+# Test / tooling caches
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Run outputs (traces, snapshots, checkpoints, benchmark results)
+runs/
+results/
+*.sqlite
+*.db
+
+# Local tau-bench clone used by the scripts/run_taubench_*.sh scripts
+tau-bench/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

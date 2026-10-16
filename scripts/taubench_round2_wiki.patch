@@ -1,0 +1,11 @@
+--- a/tau_bench/envs/retail/wiki.md
++++ b/tau_bench/envs/retail/wiki.md
+@@ -10,6 +10,8 @@
+ 
+ - Before taking consequential actions that update the database (cancel, modify, return, exchange), you have to list the action detail and obtain explicit user confirmation (yes) to proceed.
+ 
++- When the user has more than one order, or an order has more than one item, you must restate the exact order id, item id(s), and payment method id you are about to use in the tool call as part of that confirmation, and verify each one individually against what the user actually specified for this request. Never reuse an order id, item id, or payment method id from a different order or a different request earlier in the same conversation, even if it looks similar.
++
+ - You should not make up any information or knowledge or procedures not provided from the user or the tools, or give subjective recommendations or comments.
+ 
+ - You should at most make one tool call at a time, and if you take a tool call, you should not respond to the user at the same time. If you respond to the user, you should not make a tool call.

@@ -1,0 +1,100 @@
+"""Unit tests for flywheel/taubench_failures.py's classifier, using small
+hand-built `EnvRunResult`-shaped dicts (the schema tau_bench/types.py
+defines) -- one per category, each minimal but shaped exactly like a real
+record, not a real file. The real distribution (34 real failures from the
+uploaded DeepSeek test-split run) is reported by
+scripts/taubench_failure_report.py and recorded in README.md -- this file
+only checks the classification logic itself is correct, the way
+test_eval_attribution.py checks bisect_attribute without needing a live LLM.
+"""
+from __future__ import annotations
+
+from rewind.flywheel.taubench_failures import action_shape, classify_taubench, summarize
+
+
+def _tool_msg(content: str, name: str = "get_order_details") -> dict:
+    return {"role": "tool", "name": name, "content": content}
+
+
+def _assistant_call(name: str, args: dict | None = None) -> dict:
+    return {"role": "assistant", "content": None,
+            "tool_calls": [{"function": {"name": name, "arguments": "{}"}}]}
+
+
+def _result(task_id: int, reward: float, traj: list[dict], info: dict,
+           actions: list[dict] | None = None) -> dict:
+    return {"task_id": task_id, "reward": reward, "trial": 0,
+            "info": {"reward_info": {"reward": reward, "info": info, "actions": actions or []}},
+            "traj": traj}
+
+
+def test_success_is_not_a_failure():
+    r = _result(0, 1.0, [], {"r_actions": 1.0, "gt_data_hash": "x"})
+    assert classify_taubench(r) is None
+
+
+def test_tool_runtime_error_detected_even_with_action_info():
+    traj = [_assistant_call("cancel_pending_order"), _tool_msg("Error: order not found")]
+    r = _result(1, 0.0, traj, {"r_actions": 0.0, "gt_data_hash": "x"})
+    rec = classify_taubench(r)
+    assert rec.category == "TOOL_RUNTIME_ERROR"
+    assert rec.last_tool_error == "Error: order not found"
+
+
+def test_wrong_output_when_required_text_missing():
+    r = _result(2, 0.0, [], {"r_outputs": 0.0, "outputs": {"42.00": False, "order confirmed": True}})
+    rec = classify_taubench(r)
+    assert rec.category == "WRONG_OUTPUT"
+    assert rec.missing_outputs == ["42.00"]
+
+
+def test_action_mismatch_despite_right_output():
+    r = _result(3, 0.0, [], {"r_outputs": 1.0, "outputs": {"42.00": True}})
+    rec = classify_taubench(r)
+    assert rec.category == "ACTION_MISMATCH_DESPITE_RIGHT_OUTPUT"
+
+
+def test_wrong_action_for_action_only_task():
+    r = _result(4, 0.0, [], {"r_actions": 0.0, "gt_data_hash": "x"})
+    rec = classify_taubench(r)
+    assert rec.category == "WRONG_ACTION"
+
+
+def test_unknown_when_no_recognizable_signal():
+    r = _result(5, 0.0, [], {})
+    rec = classify_taubench(r)
+    assert rec.category == "UNKNOWN"
+
+
+def test_summarize_distribution():
+    results = [
+        _result(0, 1.0, [], {"r_actions": 1.0, "gt_data_hash": "x"}),
+        _result(1, 0.0, [], {"r_actions": 0.0, "gt_data_hash": "x"}),
+        _result(2, 0.0, [], {"r_actions": 0.0, "gt_data_hash": "x"}),
+    ]
+    records, dist = summarize(results)
+    assert len(records) == 2
+    assert dist["WRONG_ACTION"] == 2
+
+
+def test_action_shape_never_attempted():
+    traj = []
+    actions = [{"name": "cancel_pending_order", "kwargs": {}}]
+    r = _result(6, 0.0, traj, {"r_actions": 0.0, "gt_data_hash": "x"}, actions=actions)
+    rec = classify_taubench(r)
+    assert action_shape(rec) == "never attempted a mutating action"
+
+
+def test_action_shape_same_tools_different_args():
+    traj = [_assistant_call("cancel_pending_order")]
+    actions = [{"name": "cancel_pending_order", "kwargs": {}}]
+    r = _result(7, 0.0, traj, {"r_actions": 0.0, "gt_data_hash": "x"}, actions=actions)
+    rec = classify_taubench(r)
+    assert "arguments" in action_shape(rec)
+
+
+def test_action_shape_extra_unrequired_action():
+    traj = [_assistant_call("cancel_pending_order")]
+    r = _result(8, 0.0, traj, {"r_actions": 0.0, "gt_data_hash": "x"}, actions=[])
+    rec = classify_taubench(r)
+    assert action_shape(rec) == "took a mutating action the task didn't call for"

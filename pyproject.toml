@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rewind-harness"
+version = "0.1.0"
+description = "Replayable, forkable, crash-safe runtime for LLM agents with counterfactual attribution and evaluation"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Qi Yan" }]
+keywords = ["llm", "agents", "replay", "checkpointing", "evaluation", "tau-bench"]
+requires-python = ">=3.10"
+dependencies = ["pydantic>=2.5"]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40"]
+deepseek = ["openai>=1.0"]  # DeepSeek's API is OpenAI-compatible; see DeepSeekProvider
+dist = ["asyncpg>=0.29", "redis>=5.0"]
+chaos = ["requests>=2.31"]
+# Not on PyPI -- this installs the real benchmark straight from its own repo.
+# See src/rewind/env/taubench_adapter.py's module docstring for what this
+# adapter does and doesn't do without a live LLM.
+taubench = ["tau_bench @ git+https://github.com/sierra-research/tau-bench.git"]
+dev = ["pytest>=8", "hypothesis>=6"]
+
+[project.scripts]
+rewind = "rewind.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
