@@ -41,6 +41,11 @@ class AgentConfig:
     loop_warn_at: int = 3            # identical (tool,args) calls: warn (block) at Nth
     loop_kill_at: int = 5            # ... abort at Nth
     max_transient_tool_retries: int = 2
+    # compatibility with other harnesses (e.g. tau-bench's own ToolCallingAgent,
+    # which executes only the first tool call of a turn and reports tool
+    # failures as "Error: <msg>"); defaults keep rewind's native behaviour
+    single_tool_call: bool = False
+    tool_error_format: str = "ERROR[{cls}]: {msg}"
 
 
 @dataclass
@@ -160,6 +165,10 @@ class AgentRunner:
                 last_step = step
                 resp = await self._llm_step(messages, tools, step, trace, state, rng, forced)
                 forced = None
+                if cfg.single_tool_call and len(resp.tool_calls) > 1:
+                    trace.emit("guard", step, {"guard": "truncate_tool_calls",
+                                               "dropped": len(resp.tool_calls) - 1})
+                    resp = resp.model_copy(update={"tool_calls": resp.tool_calls[:1]})
 
                 assistant = {"role": "assistant", "content": resp.text or "",
                              "tool_calls": [{"id": c.id, "name": c.name, "args": c.args}
@@ -186,21 +195,51 @@ class AgentRunner:
                 self.debug_hook("after_intent_checkpoint", step)
 
                 if not resp.tool_calls:
-                    final_text = resp.text
-                    break
+                    # Dialogue envs (e.g. a simulated user) answer a text turn
+                    # instead of ending the run. The reply is recorded twice on
+                    # purpose: as a `user_turn` event (what the user said, and
+                    # whether they ended the conversation -- this is what
+                    # replay serves back instead of calling the user model) and
+                    # as an ordinary `message` (so fork's prefix rebuild and
+                    # LoopState.from_events need no special case).
+                    on_text = getattr(env, "on_text_turn", None)
+                    if on_text is None:
+                        final_text = resp.text
+                        break
+                    turn = await on_text(resp.text or "")
+                    trace.emit("user_turn", step, {"reply": turn.reply, "done": turn.done})
+                    if turn.done:
+                        final_text = resp.text
+                        break
+                    user_msg = {"role": "user", "content": turn.reply}
+                    messages.append(user_msg)
+                    trace.emit("message", step, {"message": user_msg})
+                    if self.checkpointer is not None:
+                        await self.checkpointer.save("step", step, trace, env, messages, state)
+                    self.debug_hook("after_step_checkpoint", step)
+                    step += 1
+                    continue
 
                 outcomes = await self._run_tool_batch(env, resp, step, pre_tool_messages, state, trace, rng)
                 for idx, call in enumerate(resp.tool_calls):
                     outcome = outcomes[idx]
                     tool_msg = {"role": "tool", "tool_call_id": call.id,
                                 "content": (outcome.content if outcome.ok
-                                            else f"ERROR[{outcome.error_class}]: {outcome.content}"),
+                                            else cfg.tool_error_format.format(
+                                                cls=outcome.error_class, msg=outcome.content)),
                                 "is_error": not outcome.ok}
                     messages.append(tool_msg)
                     trace.emit("message", step, {"message": tool_msg})
 
                 if state.consecutive_invalid > cfg.max_invalid_args:
                     raise RunAbort("invalid_args", f"{state.consecutive_invalid} consecutive invalid calls")
+
+                # Some envs end the episode from a tool (tau-bench's
+                # transfer_to_human_agents). The step is complete either way.
+                if getattr(env, "terminated", False):
+                    if self.checkpointer is not None:
+                        await self.checkpointer.save("step", step, trace, env, messages, state)
+                    break
 
                 # All of this step's tools durably applied: confirm the step so a
                 # resume starts step+1 fresh instead of replaying it.

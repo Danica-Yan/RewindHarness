@@ -29,6 +29,11 @@ class Tool:
     args_model: type[BaseModel]
     fn: Callable[[Any, Any], Any]
     mutating: bool = False
+    # Optional overrides for wrapping a third-party tool set verbatim: publish
+    # its own JSON schema instead of the pydantic-generated one, and pass a
+    # string result through as-is instead of JSON-encoding it.
+    input_schema: dict | None = None
+    raw_text_result: bool = False
 
 
 @dataclass
@@ -65,7 +70,8 @@ class ToolRegistry:
         """Sorted by name so the request hash is stable."""
         return [
             {"name": t.name, "description": t.description,
-             "input_schema": t.args_model.model_json_schema()}
+             "input_schema": t.input_schema if t.input_schema is not None
+             else t.args_model.model_json_schema()}
             for t in sorted(self._tools.values(), key=lambda t: t.name)
         ]
 
@@ -94,7 +100,8 @@ class ToolRegistry:
             return ToolOutcome(False, str(e), "TOOL_TRANSIENT_ERROR", transient=True)
         except ToolError as e:
             return ToolOutcome(False, str(e), "TOOL_RUNTIME_ERROR")
-        outcome = ToolOutcome(True, canonical_json(result))
+        content = result if (tool.raw_text_result and isinstance(result, str)) else canonical_json(result)
+        outcome = ToolOutcome(True, content)
         if tool.mutating:
             env.applied[action_id] = asdict(outcome)
         return outcome

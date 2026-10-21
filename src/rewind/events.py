@@ -18,6 +18,7 @@ EventType = Literal[
     "tool_call",   # one tool execution (or guard-blocked call)
     "env_snapshot",
     "guard",       # loop warning/kill, repair prompt, fallback switch
+    "user_turn",   # a dialogue env's reply to an agent text turn (+ whether it ended the episode)
     "error",       # transient tool errors etc.
     "run_end",
 ]
