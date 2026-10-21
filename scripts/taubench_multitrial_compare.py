@@ -36,54 +36,17 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import random
 import sys
-from collections import defaultdict
 
 sys.path.insert(0, "src")
 from rewind.flywheel.taubench_failures import load_results  # noqa: E402
 
 
-def per_task_rewards(results: list[dict]) -> dict[int, list[float]]:
-    by_task: dict[int, list[float]] = defaultdict(list)
-    for r in results:
-        by_task[r["task_id"]].append(r["reward"])
-    return dict(by_task)
-
-
-def pooled_pass1(by_task: dict[int, list[float]]) -> tuple[float, int]:
-    all_rewards = [r for rewards in by_task.values() for r in rewards]
-    n = len(all_rewards)
-    return (sum(1 for r in all_rewards if r >= 1.0) / n if n else 0.0), n
-
-
-def pass_k(by_task: dict[int, list[float]]) -> tuple[float, int]:
-    n_tasks = len(by_task)
-    n_all_pass = sum(1 for rewards in by_task.values() if all(r >= 1.0 for r in rewards))
-    return (n_all_pass / n_tasks if n_tasks else 0.0), n_tasks
-
-
-def mean_delta(common: list[int], a: dict[int, list[float]], b: dict[int, list[float]]) -> float:
-    deltas = [(sum(b[t]) / len(b[t])) - (sum(a[t]) / len(a[t])) for t in common]
-    return sum(deltas) / len(deltas) if deltas else 0.0
-
-
-def paired_bootstrap_ci(common: list[int], a: dict[int, list[float]], b: dict[int, list[float]],
-                        n_resamples: int, seed: int) -> tuple[float, float]:
-    rng = random.Random(seed)
-    per_task_delta = {t: (sum(b[t]) / len(b[t])) - (sum(a[t]) / len(a[t])) for t in common}
-    deltas = list(per_task_delta.values())
-    n = len(deltas)
-    if n == 0:
-        return (0.0, 0.0)
-    boot_means = []
-    for _ in range(n_resamples):
-        sample = rng.choices(deltas, k=n)
-        boot_means.append(sum(sample) / n)
-    boot_means.sort()
-    lo = boot_means[int(0.025 * n_resamples)]
-    hi = boot_means[min(int(0.975 * n_resamples), n_resamples - 1)]
-    return (lo, hi)
+# The statistics now live in rewind.evolve.stats so the evolution gate uses
+# exactly this code; re-exported here under the original names.
+from rewind.evolve.stats import (  # noqa: E402,F401
+    mean_delta, paired_bootstrap_ci, pass_all as pass_k, per_task_rewards, pooled_pass1,
+)
 
 
 def main() -> None:

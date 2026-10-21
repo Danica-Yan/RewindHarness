@@ -666,12 +666,54 @@ CI includes 0.
 | 本轮新增 | **分布式漏洞修复 1**：`jobs` 表加部分索引（真实 Postgres，5 万条历史记录 + 20 条活跃任务） | 修前 Seq Scan，8.228ms；修后 Index Scan，0.046ms（约 180 倍），`EXPLAIN` 输出直接断言 |
 | 本轮新增 | **分布式漏洞修复 2**：Gateway single-flight 锁加心跳续期（真实 Redis，`lock_ttl_ms=100` vs 真实 delay 400ms） | 去掉心跳复现漏洞（provider 被调用 2 次），加回心跳后只调用 1 次——两种状态都真实跑过，不是单边断言 |
 
+### Evolve P0：真实 τ-bench 对话接入 rewind loop（本轮新增）
+
+**为什么要做**：之前的真实基线（pass^1 = 70.4%）是用 tau-bench 自带的 `run.py` 跑的，没有经过 rewind 的 `AgentRunner`，所以这 115 个任务没有 trace、没有 env snapshot，真实失败无法 replay、fork 或归因。自迭代（Evolve）的 fork 初筛必须建立在这一步之上。
+
+**做了什么**
+
+- `env/taubench_dialogue.py`：`TauBenchDialogueEnv` 把 tau-bench 的 user simulator 变成 env 的一部分。agent 的文本回合交给 simulator（loop 新增的 `on_text_turn` 钩子），回复作为下一条 user 消息继续；`###STOP###` 或 `transfer_to_human_agents` 结束一轮，和 tau-bench `Env.step` 的两种结束方式一致。
+- simulator 的 system prompt 直接调用 tau-bench 自己的 `build_system_prompt`（不是复制），角色约定也一致；它的整段对话是 env snapshot 的一部分，所以 **fork 到第 k 步时，simulator 的记忆也回到第 k 步**。
+- `grade()` 是 tau-bench 的完整 reward：`r_actions`（数据 hash）加 `r_outputs`（必须说出的字符串）。之前 golden adapter 只能跳过的 37 个带 outputs 的 test 任务，现在可以正常评分。
+- **snapshot 去重**：1.3 MB 的零售数据库按内容 hash 只存一份，每步的 env snapshot 只引用它；只有写操作之后才重新 hash。所有任务共享同一份初始数据库，读操作步骤几乎零成本。
+- `run_episode` / `fork_episode` / `replay_episode`：replay 用 trace 里记录的 user 回复（`user_turn` 事件），不调用任何 API。
+- loop 新增两个兼容选项：`single_tool_call`（和 tau-bench 的 agent 一样每轮只执行第一个 tool call）、`tool_error_format`（工具报错用 `Error: ...`）。`faithful_config()` 把这些和 30 步上限、wiki 作为 system prompt 组合在一起，并关闭 rewind 独有的循环检测和非法参数中止（tau-bench 没有这两项）。默认值保持 rewind 原有行为，原有测试全部不变。
+- `rewind/evolve/stats.py`：把多 trial 对比脚本里的统计函数抽成库（数值与原脚本一致），并新增 tau-bench 的 pass^k 无偏估计、回归任务统计和 Wilson 区间。
+
+**怎么跑**
+
+```bash
+export DEEPSEEK_API_KEY=sk-...
+export REWIND_TAUBENCH_SRC=../tau-bench
+# 1. 在 rewind loop 里重跑 test 基线（结果文件格式与 run.py 相同）
+python scripts/run_taubench_rewind.py --split test --num-trials 3 --out runs/p0/test_rewind.json
+# 2. 与 run.py 的多 trial 结果对比：P0 门槛之一是两者的 CI 重叠
+python scripts/taubench_multitrial_compare.py <run.py 多trial结果> runs/p0/test_rewind.json \
+    --label-a run.py --label-b rewind
+# 3. 空补丁 fork 校准：fork 到不同位置、不打补丁续跑，看和原结果的一致率
+python scripts/taubench_fork_calibration.py runs/p0/test_rewind.json \
+    --store-dir runs/p0/snapshots --reruns runs/p0/test_rewind.json --n 5 \
+    --out runs/p0/fork_calibration.json
+```
+
+**和 run.py 仍然存在的差异（如实记录，P0 对比时要考虑）**
+
+- 工具列表顺序：rewind 按名字排序，tau-bench 按 `ALL_TOOLS` 原顺序；schema 和描述本身完全一致。
+- 参数校验：rewind 先按 schema 校验参数，非法参数的报错文本和 tau-bench 的 Python 异常文本不同。
+- 重试：模型 API 的瞬时错误 rewind 会重试；user simulator 调用也加了重试。tau-bench 遇到这类错误整轮直接失败，所以 rewind 的通过率可能略高一点。
+- 模型输出无法解析时，rewind 会追加一条修复提示再试一次，tau-bench 会直接报错。
+- 同样是 temperature 0，DeepSeek 也不保证逐字确定，所以 P0 的对比只看分布（多 trial + bootstrap CI），不看单次。
+
+**离线测试**：`tests/test_taubench_dialogue.py`（9 个）用 golden 动作加脚本化的 user 回复覆盖对话回合、完整 reward、snapshot 去重、确定性 replay、空补丁 fork、反事实 fork 翻转、终止工具和报错格式；`tests/test_taubench_scripts.py` 用假模型端到端跑通两个脚本（含断点续跑）；`tests/test_evolve_stats.py` 覆盖统计库。全部 118 个测试通过。
+
+**还没做**：真实 DeepSeek 运行需要本地 API key，P0 的两个门槛数字（与 run.py 基线一致、空补丁 fork 一致率）需要在本地跑出来后补进这里。
+
 ## 已知局限（诚实版）
 
 - Fork 前缀是**复制**而非引用共享；blob 内联在事件里，未走对象存储。
 - 每个 tool 后都存一次 env snapshot（玩具环境够用，真实环境应只在 hash 变化时存或改增量）。
 - 回放/分叉/checkpoint 目前绑定 toy env 的 CLI；`env/taubench_adapter.py` 已经实现了 `snapshot/restore/applied/db_hash`，但**没有**接 replay/fork/checkpoint 的 CLI 命令（`rewind demo`/`ckpt-demo`/`attribute-demo` 这些仍然只认 toy env），也**没有记录 user simulator 的 LLM 调用**——因为这个 adapter 完全没有驱动真实 user simulator（见下一条）。
-- **tau-bench adapter 没有、也不能模拟真实用户对话**：tau-bench 的任务是多轮对话，需要一个真实 LLM 驱动的用户模拟器（`tau_bench.envs.user`，基于 `litellm`），这个沙箱没有任何 LLM API key，agent 侧和用户模拟器侧都调不了。`env/taubench_adapter.py` 能验证的只是"黄金轨迹回放+状态哈希比对"这一半（`r_actions` reward 组件），test split 里 37/115 个需要"agent 说过的话"（`r_outputs`）的任务被显式识别并跳过，不是悄悄算进同一个通过率——100% 这个数字衡量的是"adapter 接得对不对"，不是"模型解决任务的能力"，这两者不能混为一谈（和 W7/W8 合成 ground truth 的局限是同一类问题：排除了"adapter 本身有 bug"的风险，不能预测真实模型表现）。
+- **（已由 Evolve P0 解决，见上文 `taubench_dialogue.py`；以下为当时的记录）tau-bench adapter 没有、也不能模拟真实用户对话**：tau-bench 的任务是多轮对话，需要一个真实 LLM 驱动的用户模拟器（`tau_bench.envs.user`，基于 `litellm`），这个沙箱没有任何 LLM API key，agent 侧和用户模拟器侧都调不了。`env/taubench_adapter.py` 能验证的只是"黄金轨迹回放+状态哈希比对"这一半（`r_actions` reward 组件），test split 里 37/115 个需要"agent 说过的话"（`r_outputs`）的任务被显式识别并跳过，不是悄悄算进同一个通过率——100% 这个数字衡量的是"adapter 接得对不对"，不是"模型解决任务的能力"，这两者不能混为一谈（和 W7/W8 合成 ground truth 的局限是同一类问题：排除了"adapter 本身有 bug"的风险，不能预测真实模型表现）。
 - tau-bench adapter 跑一个任务（含每步的 env snapshot 深拷贝 ~1550 条记录的 DB）大约 0.9-1s，500 个 train 任务跑全量要 8-9 分钟——这个开销目前没有优化过（深拷贝整个 DB 字典，不是增量/引用共享，和上面"snapshot 目前是复制不是引用共享"是同一个局限的另一个实例），对"黄金轨迹回放校验"这个用途够用，接真实模型跑大规模 eval 时需要重新考虑。
 - 这个沙箱装 `tau_bench`（走 `pip install git+...`）会撞上系统 setuptools 的一个 legacy-`setup.py`-安装坑（`AttributeError: install_layout`），和 tau-bench 自己的代码无关；这里用 `REWIND_TAUBENCH_SRC` 环境变量绕过（直接把 clone 的目录加进 `sys.path`，不走 pip 的 build 步骤），正常机器上大概率不会碰到这个问题。
 - 幂等台账 `env.applied` 目前是 env 状态的一部分，靠"和 env 一起被 checkpoint、一起被恢复"来保证跨崩溃安全；如果换成真正的外部系统（订单 DB、支付 API），台账必须是外部系统自己承诺的幂等键（如 Idempotency-Key），而不能只依赖我们这边 checkpoint 的时机——这是分布式幂等的标准做法，本仓库只是在单一玩具 env 里把同样的原则演示了一遍。

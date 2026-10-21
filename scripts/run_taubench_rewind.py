@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Run real tau-bench retail episodes INSIDE rewind's loop (P0).
+
+Same model setup as scripts/run_taubench_deepseek.sh (deepseek-chat agent at
+temperature 0, deepseek-chat user simulator, tool-calling behaviour), but the
+episodes run through rewind's AgentRunner, so every episode leaves:
+
+  * a JSONL trace          (--trace-dir/<split>-<task>-t<trial>.jsonl)
+  * content-addressed env snapshots incl. the user simulator's state
+                           (--store-dir, shared by all episodes; the 1.3 MB DB
+                            is stored once per distinct content)
+  * a results row in tau-bench's own run.py format (--out)
+
+so the existing analysis scripts work unchanged, and any episode can later be
+replayed, forked or attributed.
+
+The results file is rewritten after every episode, and (task, trial) pairs
+already in it are skipped -- an interrupted run resumes where it stopped.
+
+Usage:
+  export DEEPSEEK_API_KEY=sk-...
+  export REWIND_TAUBENCH_SRC=../tau-bench      # or pip install the benchmark
+  python scripts/run_taubench_rewind.py --split test --num-trials 1 \
+      --out runs/p0/test_baseline.json
+
+  # P0 parity check against the run.py baseline (70.4% pass^1 on test):
+  python scripts/taubench_multitrial_compare.py <run.py results> runs/p0/test_baseline.json
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from rewind.env.taubench_dialogue import (  # noqa: E402
+    faithful_config, litellm_user_llm, n_tasks, result_record, run_episode,
+)
+from rewind.evolve.stats import pass_hat_k, per_task_rewards, pooled_pass1  # noqa: E402
+from rewind.providers import DeepSeekProvider  # noqa: E402
+from rewind.snapshot import SnapshotStore  # noqa: E402
+
+
+def parse_ids(spec: str | None, total: int) -> list[int]:
+    if not spec:
+        return list(range(total))
+    ids: list[int] = []
+    for part in spec.split(","):
+        if "-" in part:
+            a, b = part.split("-")
+            ids.extend(range(int(a), int(b) + 1))
+        else:
+            ids.append(int(part))
+    return [i for i in ids if 0 <= i < total]
+
+
+def load_existing(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_atomic(path: Path, rows: list[dict]) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(sorted(rows, key=lambda r: (r["trial"], r["task_id"])),
+                              ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+    tmp.replace(path)
+
+
+async def main_async(args: argparse.Namespace) -> None:
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    trace_dir = Path(args.trace_dir or out.with_suffix("").as_posix() + "_traces")
+    store = SnapshotStore(args.store_dir or out.parent / "snapshots")
+    rows = load_existing(out)
+    done = {(r["task_id"], r["trial"]) for r in rows}
+
+    ids = parse_ids(args.task_ids, n_tasks(args.split))
+    jobs = [(t, i) for t in range(args.num_trials) for i in ids if (i, t) not in done]
+    print(f"{len(jobs)} episodes to run ({len(done)} already in {out})", flush=True)
+
+    provider = DeepSeekProvider(model=args.model)
+    user_llm = litellm_user_llm(model=args.user_model, provider=args.user_provider)
+    cfg = faithful_config()
+    sem = asyncio.Semaphore(args.concurrency)
+    lock = asyncio.Lock()
+    t0 = time.time()
+
+    async def one(trial: int, idx: int) -> None:
+        async with sem:
+            name = f"{args.split}-{idx}-t{trial}"
+            path = trace_dir / f"{name}.jsonl"
+            try:
+                ep = await run_episode(args.split, idx, provider=provider, user_llm=user_llm,
+                                       store=store, cfg=cfg, run_id=name, trace_path=str(path))
+            except Exception as e:  # one broken episode must not kill the batch
+                print(f"[error] {name}: {type(e).__name__}: {e}", flush=True)
+                return
+            row = result_record(ep.env, ep.result, trial, str(path), ep.events)
+            async with lock:
+                rows.append(row)
+                write_atomic(out, rows)
+            print(f"[{len(rows):4d}] {name}: reward={row['reward']:.0f} "
+                  f"status={ep.result.status} steps={ep.result.steps} "
+                  f"({time.time() - t0:.0f}s)", flush=True)
+
+    await asyncio.gather(*(one(t, i) for t, i in jobs))
+
+    by_task = per_task_rewards(rows)
+    p1, n = pooled_pass1(by_task)
+    k_max = min(len(v) for v in by_task.values()) if by_task else 0
+    print(f"\npooled pass^1 = {p1:.4f} over {n} episodes, {len(by_task)} tasks")
+    for k in range(1, k_max + 1):
+        print(f"pass^{k} = {pass_hat_k(by_task, k):.4f}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--split", default="test", choices=["train", "dev", "test"])
+    ap.add_argument("--task-ids", help="e.g. 0-49 or 3,7,12 (default: all)")
+    ap.add_argument("--num-trials", type=int, default=1)
+    ap.add_argument("--concurrency", type=int, default=4)
+    ap.add_argument("--out", required=True, help="results json (tau-bench run.py format)")
+    ap.add_argument("--trace-dir")
+    ap.add_argument("--store-dir")
+    ap.add_argument("--model", default="deepseek-chat")
+    ap.add_argument("--user-model", default="deepseek-chat")
+    ap.add_argument("--user-provider", default="deepseek")
+    asyncio.run(main_async(ap.parse_args()))
+
+
+if __name__ == "__main__":
+    main()
