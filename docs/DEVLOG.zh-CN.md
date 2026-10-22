@@ -768,6 +768,31 @@ python scripts/run_evolve.py status
 
 **已知局限**：安全性检查每任务 1 个 trial、约 190 个任务，只能发现约 4–5 个点以上的伤害，更小的副作用会漏过；有效性检查只有 2–3 个目标任务，只能证明较强的效果；签名是规则化的，语义相近但签名不同的失败不会合并；校验模板（规则下沉为代码检查）留到 P3。
 
+### Evolve 第一个真实结果：门禁拦下了一条"有效但有副作用"的规则（本轮新增）
+
+**过程**（train v0：200 个任务，pass^1 89.5%，21 个失败）
+
+1. 聚类：两个可用簇，"换货出错"和"改订单商品出错"，各 9 个任务（21 个失败里的 18 个）。
+2. 第一个簇的候选没过初筛。第二个簇（`WRONG_ACTION|modify_pending_order_items`）由 DeepSeek 写出的规则 `empty_variant_means_self_swap` 通过初筛：
+
+   > When a customer asks to modify an item's options to empty ({}), perform a same-item modification by passing the current item_id as both item_ids and new_item_ids; do not refuse or offer alternative variants.
+
+3. 本轮预算不够过门禁（需要 203，剩 167），用 `gate-pending` 单独补跑，前面的步骤没有重做。
+4. **门禁一（有效性）通过**：proposer 没见过的 3 个稳定失败（任务 8、55、149），不改时 15 次全部失败，加规则后 15 次成功 6 次，提升 +0.40，单侧 Fisher p = 0.008。
+5. **门禁二（安全性）拒绝**：188 个没见过的任务各跑 1 次，修好 5 个、弄坏 12 个，pass^1 下降 3.7 个点，95% CI [−8.0%, +0.5%]，超过"下降不超过 2 点"的上限。门禁二共 188 次 episode，加门禁一 15 次，合计 203 次。
+
+**拒绝是不是噪声？事后归因（`scripts/evolve_gate_report.py`，不调 API）**
+
+- 被弄坏的 12 个任务**全部**涉及 `modify_pending_order_items` 或 `exchange_delivered_order_items`，也就是这条规则改变的"商品怎么选"的行为。
+- 前 200 个 train 任务里涉及这两个工具的只占 64.5%。如果 12 个失败只是重跑噪声，全部落在这类任务上的概率是 0.645¹² ≈ **0.5%**。
+- 修好的 5 个任务也全部是这类任务（随机约 11%）：规则确实作用在目标行为上，只是范围写宽了——后半句"不要拒绝、不要推荐其他规格"把正常的改商品流程也带偏了。
+
+**结论**：这是 GRASP 论文描述的那类问题——修好一类轨迹的规则悄悄弄坏另一类——在真实 LLM 和真实 benchmark 上的一个实例，而门禁把它拦住了。如果只看目标任务或只看初筛，这条规则会被采用。注意 CI 上界是 +0.5%，单看整体比较不能证明有害；拒绝依据是"下降超过容忍上限"，副作用的证据来自事后的工具集中度检验。
+
+**花费**：第一轮 93 次 episode + 2 次 proposer 调用；`gate-pending` 203 次。train 基线 200 次另计。
+
+**下一步（未做）**：把门禁拒绝的具体信息（弄坏了哪类任务、一个被弄坏任务的对话片段）反馈给 proposer，并允许复用同一簇的 A/B 分组重写更窄的规则；每次重试约 220 次 episode。
+
 ## 已知局限（诚实版）
 
 - Fork 前缀是**复制**而非引用共享；blob 内联在事件里，未走对象存储。
@@ -797,6 +822,7 @@ python scripts/run_evolve.py status
 
 ## 下一步
 
+0. **Evolve（自迭代，当前主线）**：P0、P1 已完成，第一个真实结果见上文。下一步是拒绝原因的具体反馈和同簇重试，然后用最终版本在 test 上跑 3 trial 做最终评估（E1）。W8 一条里"候选修复从写死的查找表换成自动生成"已由 Evolve 的 proposer 实现。
 1. W1 收尾（**这条线已完整收尾**）：真实 DeepSeek baseline（pass^1=70.4%，81/115）→ 真实失败归因（`flywheel/taubench_failures.py`）→ 挖出一个具体可复现 bug（改商品锁单导致改地址失败）→ round 1 真实 patch + 重跑（单 trial +2，看起来有效）→ 噪声基线对照（什么都不改也有 +9，比 round 1 还大，起疑）→ 认真跑 `--num-trials 3` 的多 trial 对照 + 配对 bootstrap 统计检验（最终结果：pooled pass^1 72.17%→75.36%，95% CI=[-2.0%, +8.7%] 包含 0；`pass^k`(k=3) 反而从 57.39% 降到 55.65%）。**最终诚实结论：排除噪声之后，仍不能证明这个具体修复有统计意义上的系统性效果**——这不是失败，是一次完整、方法论上站得住的"评估一个 LLM agent 改动有没有效"的真实案例，大多数只跑一次就下结论的"改进"在这个标准下都站不住。还没做的（可选，按需再做）：① 如果还想继续，可以换一个更大的候选修复（比如针对 WRONG_ACTION 里"工具名对、参数错"那 12 个案例，或者把 `action_shape()` 细化到真正逐参数 diff）重新走一遍这整套流程；② 把 `rewind demo`/`ckpt-demo`/`attribute-demo` 这些 CLI 命令接到 tau-bench env（而不是只认 toy env）仍然没做。
 2. W5 收尾（可选，按需再做）：优先级/公平调度；Trace Writer 接一个真正的持久化 sink；Mock LLM 服务；MinIO 对象存储。另外本轮代码审查还发现了 4 个没修的分布式漏洞（按价值排序）：① Gateway 的缓存 key（`request_hash`）不含模型/provider 身份，同一个 Redis 被不同模型共享时会撞 key，可能把 A 模型的回复当成 B 模型的回复返回；② `TraceStreamConsumer.seen_seqs` 只是进程内存里的 set，consumer 进程本身重启后这份去重状态就丢了，不是真正跨重启持久的去重；③ `drain()`/`reclaim_stale()` 遇到解析失败的消息（毒丸）会在 `xack` 之前抛异常，这条消息永远不会被确认，会无限重投递、无限再抛同一个异常；④ `jobs.attempt` 只递增，没有上限或死信机制，一个总是让 worker 崩溃的任务会在 claim→崩溃→lease 过期→再 claim 之间无限循环。
 3. W6 收尾（可选，按需再做）：跨机器的 chaos 验证（不只是同机两个进程）；接连多次 kill 的级联恢复场景；Toxiproxy 故障和真实进程 kill 组合的场景；扩展性实验换成有真实延迟分布的 mock LLM。

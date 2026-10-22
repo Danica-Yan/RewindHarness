@@ -1,10 +1,10 @@
 # RewindHarness
 
-[![CI](https://github.com/YOUR_USERNAME/RewindHarness/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USERNAME/RewindHarness/actions/workflows/ci.yml)
+[![CI](https://github.com/Danica-Yan/RewindHarness/actions/workflows/ci.yml/badge.svg)](https://github.com/Danica-Yan/RewindHarness/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-**A replayable, forkable, crash-safe runtime for LLM agents — with counterfactual root-cause attribution and an evaluation loop that tests whether a fix actually worked.**
+**A replayable, forkable, crash-safe runtime for LLM agents — with counterfactual root-cause attribution, an evaluation loop that tests whether a fix actually worked, and a gated self-improvement loop in which an LLM proposes context edits and statistics decide whether they ship.**
 
 Most agent frameworks make it easy to *run* an agent and hard to answer the questions that come after a failure: *What exactly happened? Which step caused it? If I change that step, does the run succeed? And did my fix really help, or was that noise?* RewindHarness is built around those questions.
 
@@ -15,6 +15,8 @@ Most agent frameworks make it easy to *run* an agent and hard to answer the ques
 - **Distributed execution** — Postgres job queue (`FOR UPDATE SKIP LOCKED`) and a Redis LLM gateway (cache, single-flight, RPM/TPM rate limiting, shared circuit breaker).
 - **Real chaos testing** — real `kill -9` of worker processes and real network faults injected with Toxiproxy.
 - **Evaluation on a real benchmark** — DeepSeek on the τ-bench retail domain, failure classification, a targeted patch, and multi-trial bootstrap analysis.
+- **Real multi-turn episodes inside the runtime** — τ-bench's LLM user simulator is part of the env snapshot, so real conversations can be replayed and forked like any other run.
+- **Gated self-improvement (Evolve)** — failures are clustered, filtered for reproducibility with null forks, an LLM proposes context edits, and an edit ships only after proving an effect on held-out failures *and* no harm on tasks it never saw. Model weights never change.
 
 > The Python package is named `rewind`, so the CLI and imports use that name.
 
@@ -32,8 +34,12 @@ Most agent frameworks make it easy to *run* an agent and hard to answer the ques
 | **Parallel tool calls** — 5 read-only calls in one turn, 0.2 s each | 1.00 s serial → **0.209 s**; mutating calls stay strictly ordered |
 | **Postgres claim query** — 50k historical rows | 8.2 ms seq scan → 0.046 ms with a partial index (~180×), asserted from `EXPLAIN` |
 | **Attribution accuracy** — synthetic ground truth, 5 root-cause positions | 100% exact match, 2.4 oracle calls on average |
+| **Same benchmark inside rewind** — τ-bench test, 3 trials, rewind loop vs τ-bench's own `run.py` | pass^1 73.3% vs 72.2%, 95% CI [−3.5%, +5.8%]: indistinguishable (two `run.py` runs differ by [−8.4%, +5.5%]) |
+| **Fork fidelity** — replay each fork with the parent's recorded model and user replies, hash-check every request | 391/391 fork points byte-identical on 40 τ-bench tasks (offline scripted episodes; the same check runs on real traces via `scripts/taubench_fork_fidelity.py`) — after fixing a bug where restored DB records came back with sorted keys and forked agents saw different tool output |
+| **Null-fork calibration** — 20 parents × 4 fork points × 5 continuations | passing parents re-pass 86–96%; failing parents split into *stable* failures (≤1/5 pass) and *flaky* ones (mostly pass) — only stable ones are worth an edit |
+| **Evolve, first real edit** — LLM-written rule on train (v0 pass^1 89.5%) | proven effect on 3 held-out stable failures (0/15 → 6/15, Fisher p = 0.008) but **rejected by the safety gate**: 188 unseen tasks, −3.7 pt, 12 broken — all 12 on the item-changing tools the rule touches (0.5% chance if random) |
 
-The τ-bench evaluation is the part I would point to first: the obvious single-run story ("my patch improved pass^1 by 2 points") turned out not to hold up once the noise floor was measured. The full write-up is in the [dev log](docs/DEVLOG.zh-CN.md).
+The τ-bench evaluation and the Evolve gate are the parts I would point to first: the obvious single-run story ("my patch improved pass^1 by 2 points") turned out not to hold up once the noise floor was measured. The full write-up is in the [dev log](docs/DEVLOG.zh-CN.md).
 
 ## Architecture
 
@@ -85,12 +91,29 @@ flowchart TB
     Cluster --> Round
 ```
 
+## Self-improvement loop (Evolve)
+
+One round, run with `scripts/run_evolve.py` (`plan`, `round`, `gate-pending`, `status`, `rollback`):
+
+1. **Run** the current context version on τ-bench train tasks; every episode is a rewind trace.
+2. **Cluster** failures by a deterministic signature (category | tool | which arguments differed), keep only clusters whose share of failed tasks has a Wilson lower bound above a floor.
+3. **Stability filter**: re-run each failure from its first user turn with no change; only failures that pass ≤1 of 5 null forks are "stable". Flaky failures are never optimised.
+4. **Split** stable failures into A (shown to the proposer) and B (held out); both leave the gate pool for good.
+5. **Propose**: one DeepSeek call returns up to 3 candidate edits — a learned policy line or a tool-description note — seeing A's evidence and every previously rejected edit with its reason.
+6. **Offline checks** reject case-specific text (order ids, emails, …), unknown tools, oversize context.
+7. **Fork screen** on B against each task's own null-fork rate.
+8. **Gate, efficacy**: fresh forks of B under the candidate vs their null passes, one-sided Fisher test.
+9. **Gate, safety**: all never-shown tasks, paired with the incumbent; not significantly worse and not more than 2 pt down.
+10. **Commit** to a SQLite ledger (versions, every decision and its numbers) or reject with the reason.
+
+Every phase checks a worst-case episode budget before spending; `plan` prints the cost of a round without calling any API. The first real round is written up in the dev log: the gate stopped an edit that genuinely fixed its target failures but broke 12 tasks of the same kind.
+
 ## Quickstart
 
 Everything below runs offline, with no API key and no external services.
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/RewindHarness.git
+git clone https://github.com/Danica-Yan/RewindHarness.git
 cd RewindHarness
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
@@ -127,7 +150,21 @@ rewind fork runs/<run-id>/trace.jsonl --at 2 \
   --patch '{"tool_calls":[{"name":"get_order","args":{"order_id":"O1"}}]}'
 ```
 
-The τ-bench experiments are driven by `scripts/run_taubench_*.sh` (baseline, round-1 patch, noise floor, multi-trial) and analysed with `scripts/taubench_multitrial_compare.py`. τ-bench is not on PyPI; install it with `pip install -e ".[taubench]"`.
+The τ-bench experiments are driven by `scripts/run_taubench_*.sh` (baseline, round-1 patch, noise floor, multi-trial) and analysed with `scripts/taubench_multitrial_compare.py`. τ-bench is not on PyPI; install it with `pip install -e ".[taubench]"` (or point `REWIND_TAUBENCH_SRC` at a clone).
+
+Real episodes inside rewind, and the self-improvement loop:
+
+```bash
+export DEEPSEEK_API_KEY=sk-... REWIND_TAUBENCH_SRC=../tau-bench
+python scripts/run_taubench_rewind.py --split train --task-ids 0-199 \
+    --out runs/p1/train_base.json --store-dir runs/p1/snapshots       # baseline (resumable)
+python scripts/taubench_fork_fidelity.py runs/p1/train_base.json \
+    --store-dir runs/p1/snapshots                                       # free: forks restore exactly
+python scripts/run_evolve.py plan  --base runs/p1/train_base.json     # free: clusters + worst-case cost
+python scripts/run_evolve.py round --base runs/p1/train_base.json --budget 260
+python scripts/run_evolve.py status                                    # free: versions and decisions
+python scripts/evolve_gate_report.py                                   # free: explain the last gate decision
+```
 
 ### Running the infrastructure tests
 
@@ -148,7 +185,7 @@ curl -sSL -o ~/.local/bin/toxiproxy-server \
 chmod +x ~/.local/bin/toxiproxy-server
 export PATH="$HOME/.local/bin:$PATH"
 
-bash scripts/ci_nightly.sh             # full suite: 131 pass, 5 skip without τ-bench installed
+bash scripts/ci_nightly.sh             # full suite; τ-bench tests skip themselves if τ-bench is not installed
 ```
 
 Connection strings can be overridden with `REWIND_PG_DSN` and `REWIND_REDIS_URL`.
@@ -161,6 +198,9 @@ Connection strings can be overridden with `REWIND_PG_DSN` and `REWIND_REDIS_URL`
 - **Locks prove ownership before release and renewal.** Gateway locks use compare-and-delete and compare-and-extend Lua scripts. A heartbeat renews the single-flight lock during slow LLM calls. Without it, a call that outlived the lock TTL was silently duplicated. Removing the heartbeat makes the regression test fail with exactly that duplicate call.
 - **Parallelism only where it is provably safe.** Tool calls in the same turn were generated without seeing each other's results, so read-only calls in that turn run concurrently. Mutating calls keep their original order, because a later mutation can depend on the effect of an earlier one.
 - **Measure the noise floor before claiming an improvement.** All τ-bench comparisons use the same protocol, report flips in both directions, and use multi-trial paired bootstrap confidence intervals.
+- **Check that a fork sees exactly what its parent saw, not just that it grades the same.** The key-order bug passed every outcome-level test (the grader hashes order-insensitively) and was only caught by null-fork calibration; the fidelity check now hash-verifies every model request of a forked continuation, for free.
+- **Only optimise failures that reproduce.** Half the failed parents in calibration passed most null forks. Writing rules for those would "fix" randomness and fool the screen.
+- **A targeted gate, not a whole-pool superiority test.** At a ~90% baseline a 9-task cluster moves pass^1 by ~2.5 pt — below what one trial over ~190 tasks can resolve — and a no-op re-run already "breaks" several passing tasks. So the gate asks two separate questions: is there an effect on held-out targets (Fisher test), and is there no significant harm elsewhere (paired CI)? Raw regression counts are reported but not a veto.
 
 ## Project layout
 
@@ -172,9 +212,10 @@ src/rewind/
   checkpoint.py, worker.py            sqlite coordinator, checkpointer, job execution
   dist/                               Postgres coordinator, Redis gateway and event stream, Toxiproxy, invariants
   flywheel/                           failure classification, attribution, data flywheel, τ-bench failure analysis
-  env/                                offline toy retail env and the τ-bench retail adapter
+  env/                                offline toy retail env, τ-bench adapter, real multi-turn τ-bench episodes
+  evolve/                             self-improvement: surface, prevalence, stability, proposer, screen, gate, ledger, loop
 scripts/                              experiments, τ-bench runs and comparisons, CI entry points
-tests/                                136 tests (pytest + hypothesis)
+tests/                                pytest + hypothesis; τ-bench and infra tiers skip themselves when unavailable
 docs/DEVLOG.zh-CN.md                  detailed design notes and experiment log (Chinese)
 ```
 
@@ -191,12 +232,16 @@ Module docstrings refer to the milestones the project was built in:
 | W6 | Chaos testing with real `kill -9` and Toxiproxy |
 | W7 | Failure classification and root-cause attribution |
 | W8 | Data flywheel and CI regression gate |
+| Evolve P0 | τ-bench user simulator inside the runtime, fork fidelity, null-fork calibration |
+| Evolve P1 | Gated self-improvement loop and its first real round |
 
 ## Limitations
 
 I have tried to be explicit about what is and isn't demonstrated:
 
 - The W7 attribution accuracy (100%) uses **synthetic** ground truth. Real failures are non-monotonic and noisy, so real accuracy will be lower.
+- Evolve has run **one real round** so far, and its only gated edit was rejected. The safety check uses one trial over ~190 tasks, so it can only see harm of roughly 4–5 pt or more; the efficacy check has 2–3 target tasks, so only a strong effect can pass. Both are stated limits, not tuned away.
+- Evolve edits only the agent's context (learned policy lines, tool notes). The proposer cannot write code, and model weights are never trained.
 - The W8 data flywheel runs on a **deterministic heuristic policy**, not a real LLM. It validates the mechanics (split → classify → cluster → gate → merge), and its candidate fixes come from a fixed lookup table.
 - Replay, fork, and checkpoint CLI commands work on the toy environment. The τ-bench adapter supports snapshot and restore but isn't wired into those commands yet.
 - Chaos tests run two processes on a single machine. Multi-host network partitions are not covered.
