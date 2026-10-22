@@ -30,16 +30,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from rewind.env.taubench_dialogue import (  # noqa: E402
-    faithful_config, litellm_user_llm, n_tasks, result_record, run_episode,
-)
+from rewind.env.taubench_dialogue import litellm_user_llm, n_tasks  # noqa: E402
+from rewind.evolve.runner import run_batch  # noqa: E402
+from rewind.evolve.surface import ContextVersion  # noqa: E402
 from rewind.evolve.stats import pass_hat_k, per_task_rewards, pooled_pass1  # noqa: E402
 from rewind.providers import DeepSeekProvider  # noqa: E402
 from rewind.snapshot import SnapshotStore  # noqa: E402
@@ -58,58 +56,15 @@ def parse_ids(spec: str | None, total: int) -> list[int]:
     return [i for i in ids if 0 <= i < total]
 
 
-def load_existing(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def write_atomic(path: Path, rows: list[dict]) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(sorted(rows, key=lambda r: (r["trial"], r["task_id"])),
-                              ensure_ascii=False, indent=1, default=str), encoding="utf-8")
-    tmp.replace(path)
-
-
 async def main_async(args: argparse.Namespace) -> None:
     out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    trace_dir = Path(args.trace_dir or out.with_suffix("").as_posix() + "_traces")
     store = SnapshotStore(args.store_dir or out.parent / "snapshots")
-    rows = load_existing(out)
-    done = {(r["task_id"], r["trial"]) for r in rows}
-
     ids = parse_ids(args.task_ids, n_tasks(args.split))
-    jobs = [(t, i) for t in range(args.num_trials) for i in ids if (i, t) not in done]
-    print(f"{len(jobs)} episodes to run ({len(done)} already in {out})", flush=True)
-
-    provider = DeepSeekProvider(model=args.model)
-    user_llm = litellm_user_llm(model=args.user_model, provider=args.user_provider)
-    cfg = faithful_config()
-    sem = asyncio.Semaphore(args.concurrency)
-    lock = asyncio.Lock()
-    t0 = time.time()
-
-    async def one(trial: int, idx: int) -> None:
-        async with sem:
-            name = f"{args.split}-{idx}-t{trial}"
-            path = trace_dir / f"{name}.jsonl"
-            try:
-                ep = await run_episode(args.split, idx, provider=provider, user_llm=user_llm,
-                                       store=store, cfg=cfg, run_id=name, trace_path=str(path))
-            except Exception as e:  # one broken episode must not kill the batch
-                print(f"[error] {name}: {type(e).__name__}: {e}", flush=True)
-                return
-            row = result_record(ep.env, ep.result, trial, str(path), ep.events)
-            async with lock:
-                rows.append(row)
-                write_atomic(out, rows)
-            print(f"[{len(rows):4d}] {name}: reward={row['reward']:.0f} "
-                  f"status={ep.result.status} steps={ep.result.steps} "
-                  f"({time.time() - t0:.0f}s)", flush=True)
-
-    await asyncio.gather(*(one(t, i) for t, i in jobs))
-
+    rows = await run_batch(args.split, ids, args.num_trials, out, ctx=ContextVersion(),
+                           provider=DeepSeekProvider(model=args.model),
+                           user_llm=litellm_user_llm(model=args.user_model, provider=args.user_provider),
+                           store=store, trace_dir=args.trace_dir, concurrency=args.concurrency,
+                           log=lambda m: print(m, flush=True))
     by_task = per_task_rewards(rows)
     p1, n = pooled_pass1(by_task)
     k_max = min(len(v) for v in by_task.values()) if by_task else 0

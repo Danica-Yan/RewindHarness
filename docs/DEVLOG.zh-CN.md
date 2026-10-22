@@ -722,6 +722,47 @@ python scripts/taubench_fork_calibration.py runs/p0/test_rewind.json \
 - 123 次失败续跑里 27 次是 `r_outputs` 失败（数据库对了但没说出要求的内容）。
 - 结论：只有稳定失败值得写编辑；空补丁 fork 通过率骤降的位置就是失败被锁定的位置。P1 据此加入"稳定性过滤"，并把初筛对照改为同任务同位置的空补丁基线。
 
+### Evolve P1：自迭代闭环（本轮新增）
+
+一轮的流程：现有版本在 train 上的结果 → 失败签名聚类（免费）→ 只取"普遍"的簇 → 稳定性过滤（空补丁 fork）→ 稳定失败分成 A/B 两半 → proposer 只看 A 提出候选编辑（1 次 LLM 调用）→ 离线检查 → 在 B 上 fork 初筛 → 在从未给 proposer 看过的任务上过统计门禁 → 提交或拒绝。
+
+**模块**（`src/rewind/evolve/`）
+
+| 文件 | 作用 |
+| --- | --- |
+| `surface.py` | `ContextVersion`：学到的规则（附加在 wiki 末尾的独立小节，原 wiki 不改）和工具说明补充；编辑是数据，函数式应用；泄漏检查（订单号、商品号、用户名、邮箱、任务编号）|
+| `prevalence.py` | 确定性失败签名 `类别 | 工具 | 细节`（rewind trace 里有真实参数，所以能看出是哪个参数错了）；按**不同任务数**计数，用 Wilson 下界判定是否普遍 |
+| `stability.py` | 每个失败从起点空补丁 fork，最多 1 次通过才算稳定失败；顺序执行，一旦超过就提前停止 |
+| `proposer.py` | 一次调用返回多个候选（JSON 模式）；只给看 A 半的失败、正确动作和对话摘录，以及之前被拒绝的编辑和原因 |
+| `screen.py` | 候选上下文下从起点 fork B 半任务，和**同一任务**的空补丁通过率比较；任务内、任务间都会提前止损 |
+| `gate.py` | 与现有版本按任务配对比较，bootstrap CI 下界 > 0 且回归数在预算内才接受；现有版本结果复用不重跑；默认每任务 1 个 trial；先跑一半，明显更差就停 |
+| `ledger.py` | SQLite：所有版本、每个候选在哪一步被拒及原因、哪些任务被 proposer 或初筛看过（永久排除出门禁集）|
+| `loop.py` | 一轮的编排；每一步先按最坏情况检查预算，`plan()` 不调 API 打印本轮最坏用量 |
+| `sftdata.py` | 顺带收集 train 上通过的轨迹（版本 0 或通过门禁的版本），test 在类型上就不允许 |
+| `runner.py` | 按版本批量跑真实 episode，可断点续跑（`run_taubench_rewind.py` 也改用它）|
+
+**为什么从起点 fork 而不是从中间**：上下文编辑从第一轮就会改变行为，把新 system prompt 拼到旧 prompt 下生成的历史里，测的是"规则在第 k 步突然出现"，是有偏的反事实。P0 校准也显示起点 fork 和重跑一致，所以初筛统一从起点 fork。
+
+**省 API 的设计**（DeepSeek 用量有限）：签名、聚类、计划、状态全部免费；稳定性和初筛顺序执行并提前停止；门禁复用现有版本结果、默认 1 trial、半程止损；每轮最多一个候选进门禁；`--budget` 是每轮硬上限；`round` 默认先打印计划并要求确认。
+
+**离线端到端测试**（`tests/test_evolve_loop.py`）：假 agent 在真实 retail 任务、真实工具和真实 grader 上运行，除"第一个写操作是换货"的 17 个任务外都按正确动作完成，这 17 个任务只有 system prompt 里出现特定规则才会做。一轮下来：泄漏 id 的规则被离线拒绝；"禁止调用工具"的有毒规则在初筛 4 次 fork 后被淘汰；正确规则初筛 3/3、门禁 54 个任务 +20.4%（CI [+11.1%, +31.5%]，修好 11 个、弄坏 0 个）被提交；共用 79 次 episode。另外两个测试覆盖"修好簇但弄坏其他任务的规则被门禁以回归拒绝"和"预算不够时在门禁前停下"。
+
+**怎么跑**
+
+```bash
+# 1. train 基线（失败样本来源，同时是 v0 的门禁对照）
+python scripts/run_taubench_rewind.py --split train --task-ids 0-199 \
+    --out runs/p1/train_base.json --store-dir runs/p1/snapshots
+# 2. 看本轮最坏用量（不调 API）
+python scripts/run_evolve.py plan --base runs/p1/train_base.json --store-dir runs/p1/snapshots
+# 3. 跑一轮（会先打印计划并要求确认）
+python scripts/run_evolve.py round --base runs/p1/train_base.json --store-dir runs/p1/snapshots --budget 250
+# 4. 查看结果（不调 API）
+python scripts/run_evolve.py status
+```
+
+**已知局限**：门禁每任务 1 个 trial、约 190 个任务，只能检出几个百分点以上的提升，更小的真实提升会被判为不显著（宁可漏掉也不误收）；签名是规则化的，语义相近但签名不同的失败不会合并；校验模板（规则下沉为代码检查）留到 P3。
+
 ## 已知局限（诚实版）
 
 - Fork 前缀是**复制**而非引用共享；blob 内联在事件里，未走对象存储。

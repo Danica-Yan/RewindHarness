@@ -32,7 +32,12 @@ class ForkPatch(BaseModel):
 
 async def fork_run(base_events: list[Event], snapshots: SnapshotStore, *, at_step: int,
                    runner: AgentRunner, env_factory: Callable[[dict], Any],
-                   trace: TraceWriter, patch: ForkPatch | None = None) -> RunResult:
+                   trace: TraceWriter, patch: ForkPatch | None = None,
+                   system_prompt: str | None = None) -> RunResult:
+    """`system_prompt`, if given, replaces the system message of the rebuilt
+    history -- the counterfactual "what if this context had been in effect
+    from the start" used to screen context edits (tool-description edits
+    take effect through `runner.registry`, which is read on every call)."""
     start = base_events[0]
     if start.type != "run_start":
         raise ValueError("trace must begin with run_start")
@@ -45,10 +50,15 @@ async def fork_run(base_events: list[Event], snapshots: SnapshotStore, *, at_ste
               if e.type not in ("run_start", "run_end") and e.step < at_step]
     state = LoopState.from_events(prefix)
     messages = [copy.deepcopy(e.data["message"]) for e in prefix if e.type == "message"]
+    if system_prompt is not None:
+        if not messages or messages[0].get("role") != "system":
+            raise ValueError("cannot override the system prompt: history has no system message")
+        messages[0] = {**messages[0], "content": system_prompt}
 
     child_start = {**start.data, "cfg": asdict(runner.cfg),
                    "parent_run_id": start.run_id, "fork_step": at_step,
-                   "patch": patch.model_dump() if patch else None}
+                   "patch": patch.model_dump() if patch else None,
+                   "system_prompt_override": system_prompt is not None}
     trace.emit("run_start", 0, child_start)
     for e in prefix:
         trace.emit(e.type, e.step, e.data, inherited=True)

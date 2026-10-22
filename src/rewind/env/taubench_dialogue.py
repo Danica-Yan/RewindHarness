@@ -382,7 +382,8 @@ async def run_episode(split: str, index: int, *, provider: Any, user_llm: UserLL
 async def fork_episode(base_events: list[Event], at_step: int, *, provider: Any, user_llm: UserLLM,
                        store: SnapshotStore, cfg: Any = None, registry: ToolRegistry | None = None,
                        patch: Any = None, run_id: str | None = None,
-                       trace_path: str | None = None) -> Episode:
+                       trace_path: str | None = None,
+                       system_prompt: str | None = None) -> Episode:
     """Restore env + simulator at `at_step` of a recorded episode and continue
     live. With `patch=None` this is the *null fork* used to calibrate how much
     a continuation varies on its own; with a `ForkPatch` it is a
@@ -404,7 +405,8 @@ async def fork_episode(base_events: list[Event], at_step: int, *, provider: Any,
     rid = run_id or f"{base_events[0].run_id}~fork{at_step}"
     with TraceWriter(rid, path=trace_path) as trace:
         rr = await fork_run(base_events, store, at_step=at_step, runner=runner,
-                            env_factory=env_factory, trace=trace, patch=patch)
+                            env_factory=env_factory, trace=trace, patch=patch,
+                            system_prompt=system_prompt)
         events = list(trace.events)
     env = holder["env"]
     return Episode(rr, env, events, grade(env))
