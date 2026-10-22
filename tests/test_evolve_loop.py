@@ -14,7 +14,6 @@ unless its system prompt contains a specific learned rule. So:
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 
 import pytest
@@ -137,11 +136,6 @@ def test_good_rule_is_committed_and_bad_ones_are_stopped_at_screening(tmp_path):
     assert set(prop.seen_tasks) <= ledger.shown()
     assert rep.gate["improvements"] and not rep.gate["regressions"]
     assert rep.episodes_used <= cfg.budget_episodes
-    # SFT file: only train successes, tagged with the version they ran under
-    sft = [json.loads(line) for line in
-           (tmp_path / "run" / "sft" / "train_success.jsonl").read_text().splitlines()]
-    assert sft and all(d["split"] == "train" and d["reward"] == 1.0 for d in sft)
-    assert {d["ctx_version"] for d in sft} == {0, 1}
 
     # next round: the fixed cluster is gone from the new incumbent's failures
     rep2 = asyncio.run(run_round(cfg, ledger, provider=FakeAgent(), user_llm=fake_user, store=store,
@@ -170,6 +164,18 @@ def test_budget_cap_stops_before_the_gate(tmp_path):
     assert rep.gate is None and rep.version_to is None
     assert any("NOT gated" in e for e in rep.events)
     assert rep.episodes_used <= 40
+
+    # gate-pending finishes the job: no stability, screening or proposer redone
+    from rewind.evolve.loop import gate_pending, pending_candidates
+    pend = pending_candidates(ledger, cfg)
+    assert len(pend) == 1 and len(pend[0]["targets"]) == 3
+    shown_before = ledger.shown()
+    res = asyncio.run(gate_pending(cfg.model_copy(update={"budget_episodes": 200}), ledger,
+                                   provider=FakeAgent(), user_llm=fake_user, store=store,
+                                   log=lambda m: None))
+    assert res[0]["verdict"]["accepted"] and ledger.current().version == 1
+    assert ledger.shown() == shown_before and prop.calls == 1
+    assert pending_candidates(ledger, cfg) == []
 
 
 def test_leak_checks_and_edit_application():

@@ -5,6 +5,7 @@
   round     run one round (asks for confirmation unless --yes)
   status    versions, decisions, shown tasks -- NO API calls
   rollback  make an earlier version current -- NO API calls
+  gate-pending  gate edits that passed screening but were not gated (budget)
 
 The ledger, stability cache, gate results, round reports and SFT data all
 live under --run-dir. First use registers the baseline results file as v0.
@@ -28,7 +29,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from rewind.env.taubench_dialogue import build_dialogue_registry, litellm_user_llm  # noqa: E402
 from rewind.evolve.gate import GatePolicy  # noqa: E402
 from rewind.evolve.ledger import EditLedger  # noqa: E402
-from rewind.evolve.loop import EvolveConfig, plan, run_round  # noqa: E402
+from rewind.evolve.loop import (  # noqa: E402
+    EvolveConfig, gate_pending, pending_candidates, plan, run_round,
+)
 from rewind.evolve.prevalence import PrevalencePolicy  # noqa: E402
 from rewind.evolve.proposer import LLMProposer, deepseek_json_llm  # noqa: E402
 from rewind.evolve.screen import ScreenPolicy  # noqa: E402
@@ -60,7 +63,7 @@ def open_ledger(a: argparse.Namespace) -> EditLedger:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["plan", "round", "status", "rollback"])
+    ap.add_argument("cmd", choices=["plan", "round", "status", "rollback", "gate-pending"])
     ap.add_argument("--base", help="baseline results json (registered as v0 on first use)")
     ap.add_argument("--run-dir", default="runs/p1")
     ap.add_argument("--store-dir", default="runs/p1/snapshots")
@@ -101,6 +104,31 @@ def main() -> None:
         return
     if a.cmd == "rollback":
         print(f"current is now v{led.rollback(a.to).version}")
+        return
+
+    if a.cmd == "gate-pending":
+        pend = pending_candidates(led, cfg)
+        if not pend:
+            print("no edit is waiting for the gate")
+            return
+        for p in pend:
+            e = p["edit"]
+            pool = len({r["task_id"] for r in json.loads(Path(led.rows_path(led.current().version))
+                                                         .read_text())} - led.shown())
+            print(f"pending: {e.kind} {e.target}: {e.text!r}\n  cluster {p['cluster']}, "
+                  f"targets {[t[0] for t in p['targets']]} (null passes "
+                  f"{[f'{t[2]}/{t[3]}' for t in p['targets']]})\n  cost <= "
+                  f"{len(p['targets']) * cfg.gate.efficacy_n} efficacy forks, then <= "
+                  f"{pool * cfg.gate.trials} pool episodes only if efficacy passes")
+        if not a.yes and input("\ngate now? [y/N] ").strip().lower() != "y":
+            return
+        res = asyncio.run(gate_pending(cfg, led, provider=DeepSeekProvider(model=a.model),
+                                       user_llm=litellm_user_llm(model=a.model, provider="deepseek"),
+                                       store=SnapshotStore(a.store_dir),
+                                       log=lambda m: print(m, flush=True)))
+        print(json.dumps([{"target": r["edit"]["target"], "accepted": r["verdict"]["accepted"],
+                           "reason": r["verdict"]["reason"], "episodes": r["verdict"]["episodes"]}
+                          for r in res], indent=1, ensure_ascii=False))
         return
 
     print(plan(cfg, led))

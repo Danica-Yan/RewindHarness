@@ -22,7 +22,6 @@ from .ledger import EditLedger
 from .prevalence import PrevalencePolicy, clusters, describe, eligible, evidence_rows
 from .runner import load_rows, version_setup
 from .screen import ScreenPolicy, screen
-from .sftdata import append_jsonl, collect
 from .stability import assess_failures
 from .surface import validate_edit
 
@@ -71,8 +70,7 @@ class Budget:
 
 def _paths(cfg: EvolveConfig) -> dict[str, Path]:
     d = Path(cfg.run_dir)
-    return {"stability": d / "stability.json", "gate": d / "gate", "rounds": d / "rounds",
-            "sft": d / "sft" / "train_success.jsonl"}
+    return {"stability": d / "stability.json", "gate": d / "gate", "rounds": d / "rounds"}
 
 
 def _pool(rows: list[dict], shown: set[int]) -> list[int]:
@@ -117,6 +115,11 @@ def plan(cfg: EvolveConfig, ledger: EditLedger) -> str:
     worst += g + eff
     lines.append(f"gate pool (only if efficacy passes): <= {g} episodes "
                  f"({'about half if the candidate is clearly harmful' if cfg.gate.futility_stop else 'no early stop'})")
+    if elig:
+        m0 = min(len(elig[0].tasks), cfg.max_members_per_cluster)
+        first = m0 * cfg.stability_n + cfg.n_candidates * (m0 // 2) * cfg.screen.n + g + \
+            (m0 // 2) * (cfg.gate.efficacy_n if cfg.gate.mode == "targeted" else 0)
+        lines.append(f"to be sure the FIRST cluster can reach the gate this round: --budget {first}")
     lines.append(f"proposer: <= {len(elig)} LLM calls (small)")
     lines.append(f"worst case this round: {worst} episodes; hard cap budget_episodes = {cfg.budget_episodes}")
     return "\n".join(lines)
@@ -183,6 +186,7 @@ async def run_round(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, use
         tools = set(inc_registry._tools)  # noqa: SLF001
         note(f"  proposer returned {len(edits)} candidate edit(s)")
         b_tasks = [(r.task_id, r.trace, r.null_rate) for r in b]
+        stop_round = False
         for e in edits:
             if e.edit_id in ledger.tried_edit_ids():
                 continue
@@ -214,7 +218,9 @@ async def run_round(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, use
                 len(targets) * cfg.gate.efficacy_n if cfg.gate.mode == "targeted" else 0)
             if not budget.can(cost):
                 note(f"budget: gate needs <= {cost} episodes, {budget.left} left -- "
-                     f"edit passed screening but is NOT gated this round")
+                     f"edit passed screening but is NOT gated this round; "
+                     f"run `run_evolve.py gate-pending` to gate it without redoing anything")
+                stop_round = True
                 break
             out = paths["gate"] / f"v{cand.version}_{e.edit_id}.json"
             v = await gate(cand, rows, pool, split=cfg.split, out=out, provider=provider,
@@ -228,17 +234,75 @@ async def run_round(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, use
                 ledger.commit(cand, [e], str(out), v.model_dump())
                 rep.version_to = cand.version
                 rep.committed_edit = e.model_dump()
-                added = append_jsonl(paths["sft"], collect(load_rows(out), cfg.split, cand.version))
-                note(f"  committed v{cand.version}; +{added} SFT trajectories")
+                note(f"  committed v{cand.version}")
             break  # at most one gate per round
-        if rep.gate is not None:
-            break
+        if rep.gate is not None or stop_round:
+            break  # a gated or gate-pending candidate ends the round
 
-    if inc.version == 0:  # baseline successes are SFT data too (v0 = the original agent)
-        append_jsonl(paths["sft"], collect(rows, cfg.split, 0))
     rep.episodes_used = budget.used
     _save(paths, rep)
     return rep
+
+
+def pending_candidates(ledger: EditLedger, cfg: EvolveConfig) -> list[dict]:
+    """Edits that passed screening but were never gated (e.g. the round ran
+    out of budget), each with its held-out targets rebuilt from the screening
+    record and the stability cache -- so gating them redoes nothing."""
+    from .stability import load_records
+    from .surface import Edit
+    rows = ledger.db.execute(
+        "SELECT round, version_from, edit_json, cluster, data_json FROM decisions "
+        "WHERE stage='screen' AND accepted=1 ORDER BY id").fetchall()
+    gated = {r[0] for r in ledger.db.execute(
+        "SELECT edit_id FROM decisions WHERE stage='gate'").fetchall()}
+    stab = load_records(_paths(cfg)["stability"])
+    out = []
+    for round_no, v_from, ej, cluster, dj in rows:
+        e = Edit.model_validate_json(ej)
+        if e.edit_id in gated or v_from != ledger.current().version:
+            continue
+        targets = []
+        for t in json.loads(dj)["tasks"]:
+            rec = next((r for r in stab.values()
+                        if r.task_id == t["task_id"] and r.ctx_version == v_from), None)
+            if rec is not None:
+                targets.append((rec.task_id, rec.trace, rec.passes, rec.n))
+        out.append({"round": round_no, "version_from": v_from, "edit": e, "cluster": cluster,
+                    "targets": targets})
+    return out
+
+
+async def gate_pending(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, user_llm: Any,
+                       store: Any, log: Callable[[str], None] = print) -> list[dict]:
+    """Gate every pending candidate (oldest first) until one is accepted."""
+    results = []
+    budget = Budget(cfg.budget_episodes)
+    for p in pending_candidates(ledger, cfg):
+        inc = ledger.current()
+        rows = load_rows(ledger.rows_path(inc.version))
+        pool = _pool(rows, ledger.shown())
+        e = p["edit"]
+        cost = len(pool) * cfg.gate.trials + len(p["targets"]) * cfg.gate.efficacy_n
+        if not budget.can(cost):
+            log(f"budget: gate needs <= {cost}, {budget.left} left -- stop")
+            break
+        _, reg = version_setup(inc)
+        cand = inc.apply(e, known_tools=set(reg._tools)).model_copy(  # noqa: SLF001
+            update={"version": ledger.next_version_number(), "parent": inc.version})
+        log(f"gating {e.kind} {e.target}: {e.text!r} on {len(p['targets'])} targets + {len(pool)} pool tasks")
+        out = _paths(cfg)["gate"] / f"v{cand.version}_{e.edit_id}.json"
+        v = await gate(cand, rows, pool, split=cfg.split, out=out, provider=provider, user_llm=user_llm,
+                       store=store, policy=cfg.gate, targets=p["targets"],
+                       concurrency=cfg.concurrency, log=log)
+        budget.spend(v.episodes)
+        ledger.record(p["round"], inc.version, e, "gate", v.accepted, v.reason, v.model_dump())
+        log(f"  gate: {'ACCEPT' if v.accepted else 'reject'} -- {v.reason}")
+        results.append({"edit": e.model_dump(), "verdict": v.model_dump()})
+        if v.accepted:
+            ledger.commit(cand, [e], str(out), v.model_dump())
+            log(f"  committed v{cand.version}")
+            break
+    return results
 
 
 def _save(paths: dict[str, Path], rep: RoundReport) -> None:
