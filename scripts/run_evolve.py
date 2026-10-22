@@ -41,7 +41,8 @@ def make_cfg(a: argparse.Namespace) -> EvolveConfig:
         split=a.split, run_dir=a.run_dir,
         prevalence=PrevalencePolicy(min_distinct_tasks=a.min_tasks, min_share_lb=a.min_share_lb),
         stability_n=a.stability_n, screen=ScreenPolicy(n=a.screen_n, tau=a.tau),
-        gate=GatePolicy(trials=a.gate_trials, regression_budget=a.regression_budget),
+        gate=GatePolicy(mode=a.gate_mode, trials=a.gate_trials, efficacy_n=a.efficacy_n,
+                        max_drop=a.max_drop, regression_budget=a.regression_budget),
         n_candidates=a.candidates, max_clusters_per_round=a.max_clusters,
         max_members_per_cluster=a.max_members, budget_episodes=a.budget, concurrency=a.concurrency)
 
@@ -73,7 +74,11 @@ def main() -> None:
     ap.add_argument("--screen-n", type=int, default=3)
     ap.add_argument("--tau", type=float, default=0.5)
     ap.add_argument("--gate-trials", type=int, default=1)
-    ap.add_argument("--regression-budget", type=int, default=2)
+    ap.add_argument("--gate-mode", choices=["targeted", "superiority"], default="targeted")
+    ap.add_argument("--efficacy-n", type=int, default=5)
+    ap.add_argument("--max-drop", type=float, default=0.02)
+    ap.add_argument("--regression-budget", type=int, default=None,
+                    help="optional hard cap on raw regressions (noisy at high baselines)")
     ap.add_argument("--candidates", type=int, default=3)
     ap.add_argument("--max-clusters", type=int, default=2)
     ap.add_argument("--max-members", type=int, default=10)

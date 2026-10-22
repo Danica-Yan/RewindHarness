@@ -180,3 +180,28 @@ def test_leak_checks_and_edit_application():
     assert v1.version == 1 and "Always confirm." in v1.render_system_prompt("WIKI")
     v2 = v1.apply(Edit(kind="rule", target="r1", op="delete"))
     assert v2.render_system_prompt("WIKI") == "WIKI"
+
+
+def test_fisher_one_sided():
+    from rewind.evolve.gate import fisher_greater
+    assert fisher_greater(15, 15, 0, 9) < 1e-5
+    assert fisher_greater(1, 5, 1, 5) > 0.5
+    assert abs(fisher_greater(3, 5, 0, 5) - 0.0833) < 1e-3  # textbook value
+
+
+def test_targeted_gate_skips_the_pool_when_there_is_no_effect(tmp_path):
+    """A no-op rule fails efficacy on the held-out targets and never spends
+    the ~pool-sized run -- the expensive part of the gate."""
+    from rewind.evolve.gate import gate
+    from rewind.evolve.runner import load_rows as lr
+    store, ledger, cfg = _setup(tmp_path)
+    rows = lr(ledger.rows_path(0))
+    hard_rows = [r for r in rows if r["task_id"] in HARD][:3]
+    targets = [(r["task_id"], r["info"]["rewind"]["trace"], 0, 5) for r in hard_rows]
+    noop = ContextVersion().apply(rule("noop", "Be polite to the customer."))
+    out = tmp_path / "noop_gate.json"
+    v = asyncio.run(gate(noop, rows, [r["task_id"] for r in rows if r["task_id"] not in HARD],
+                         split="train", out=out, provider=FakeAgent(), user_llm=fake_user, store=store,
+                         policy=GatePolicy(efficacy_n=5), targets=targets, log=lambda m: None))
+    assert not v.accepted and "no proven effect" in v.reason
+    assert v.episodes == 15 and not out.exists()

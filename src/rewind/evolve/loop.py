@@ -110,9 +110,13 @@ def plan(cfg: EvolveConfig, ledger: EditLedger) -> str:
         lines.append(f"cluster {c.key}: stability <= {st} forks, screening <= {sc} forks")
     pool_after = len(_pool(rows, shown)) - (min(len(elig[0].tasks), cfg.max_members_per_cluster) if elig else 0)
     g = pool_after * cfg.gate.trials
-    worst += g
-    lines.append(f"gate (one candidate at most): <= {g} episodes "
-                 f"({'about half if the candidate is clearly worse' if cfg.gate.futility_stop else 'no early stop'})")
+    eff = 0
+    if cfg.gate.mode == "targeted" and elig:
+        eff = (min(len(elig[0].tasks), cfg.max_members_per_cluster) // 2) * cfg.gate.efficacy_n
+        lines.append(f"gate efficacy (held-out targets, runs first): <= {eff} forks")
+    worst += g + eff
+    lines.append(f"gate pool (only if efficacy passes): <= {g} episodes "
+                 f"({'about half if the candidate is clearly harmful' if cfg.gate.futility_stop else 'no early stop'})")
     lines.append(f"proposer: <= {len(elig)} LLM calls (small)")
     lines.append(f"worst case this round: {worst} episodes; hard cap budget_episodes = {cfg.budget_episodes}")
     return "\n".join(lines)
@@ -205,14 +209,16 @@ async def run_round(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, use
                 continue
 
             pool = _pool(rows, ledger.shown())
-            cost = len(pool) * cfg.gate.trials
+            targets = [(r.task_id, r.trace, r.passes, r.n) for r in b]
+            cost = len(pool) * cfg.gate.trials + (
+                len(targets) * cfg.gate.efficacy_n if cfg.gate.mode == "targeted" else 0)
             if not budget.can(cost):
                 note(f"budget: gate needs <= {cost} episodes, {budget.left} left -- "
                      f"edit passed screening but is NOT gated this round")
                 break
             out = paths["gate"] / f"v{cand.version}_{e.edit_id}.json"
             v = await gate(cand, rows, pool, split=cfg.split, out=out, provider=provider,
-                           user_llm=user_llm, store=store, policy=cfg.gate,
+                           user_llm=user_llm, store=store, policy=cfg.gate, targets=targets,
                            concurrency=cfg.concurrency, log=log)
             budget.spend(v.episodes)
             rep.gate = v.model_dump()
