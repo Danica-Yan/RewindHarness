@@ -14,6 +14,9 @@ continue live N times. Two things come out of it:
    the root-cause step already disagree with the parent half the time, a
    patched fork's flip rate must be read against that noise floor.
 
+Run scripts/taubench_fork_fidelity.py first (free): if forks do not restore
+exactly what the agent saw, these numbers measure that bug, not noise.
+
 Usage:
   export DEEPSEEK_API_KEY=sk-...
   python scripts/taubench_fork_calibration.py runs/p0/test_baseline.json \
@@ -77,7 +80,9 @@ async def main_async(args: argparse.Namespace) -> None:
                 print(f"[error] task {row['task_id']} frac {frac} #{i}: {e}", flush=True)
                 return
         out_rows.append({"task_id": row["task_id"], "parent_reward": row["reward"], "frac": frac,
-                         "fork_step": k, "sample": i, "reward": ep.reward.reward})
+                         "fork_step": k, "sample": i, "reward": ep.reward.reward,
+                         "status": ep.result.status, "reason": ep.result.reason,
+                         "steps": ep.result.steps, "r_actions": ep.reward.r_actions})
         print(f"task {row['task_id']:3d} frac {frac:.2f} step {k:2d} #{i}: "
               f"parent={row['reward']:.0f} fork={ep.reward.reward:.0f}", flush=True)
 

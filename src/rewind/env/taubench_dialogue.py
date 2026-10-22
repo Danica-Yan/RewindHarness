@@ -172,7 +172,8 @@ class TauBenchDialogueEnv(TauBenchRetailEnv):
     # -- snapshot protocol ---------------------------------------------------
     def snapshot(self) -> dict[str, Any]:
         if self._data_ref is None:
-            self._data_ref = self.store.put(self.data)
+            # ordered: tool results expose the DB's key order to the agent
+            self._data_ref = self.store.put(self.data, ordered=True)
         return {"data_ref": self._data_ref, "_applied": copy.deepcopy(self._applied),
                 "user": copy.deepcopy(self.user.messages), "responses": list(self.responses),
                 "terminated": self.terminated, "user_stopped": self.user_stopped,
@@ -418,3 +419,37 @@ async def replay_episode(events: list[Event], store: SnapshotStore,
     user_llm = recorded_user_llm(events)
     return await replay_run(events, store, registry,
                             lambda s: TauBenchDialogueEnv.restore(s, store=store, user_llm=user_llm))
+
+
+class FidelityResult(BaseModel):
+    step: int
+    ok: bool
+    error: str | None = None
+
+
+async def fork_fidelity(events: list[Event], store: SnapshotStore, steps: list[int] | None = None,
+                        registry: ToolRegistry | None = None) -> list[FidelityResult]:
+    """API-free check that forking a recorded episode at step k restores
+    EXACTLY what the agent saw: fork at k, then serve the parent's own
+    recorded model responses and user replies from k on, with every request
+    hash-checked against the recording (ReplayProvider). Any difference in
+    restored DB content or order, dialogue state or message history shows up
+    as a request-hash mismatch; the final env must also hash the same."""
+    from ..replay import ReplayMismatch, ReplayProvider
+    registry = registry or build_dialogue_registry()
+    all_steps = sorted({e.step for e in events if e.type == "step_start"})
+    parent_end = next(e for e in reversed(events) if e.type == "run_end").data["env_hash"]
+    out: list[FidelityResult] = []
+    for k in (steps or all_steps):
+        rest = [e for e in events if e.step >= k]
+        try:
+            ep = await fork_episode(events, k, provider=ReplayProvider(rest),
+                                    user_llm=recorded_user_llm(rest), store=store,
+                                    registry=registry, run_id=f"{events[0].run_id}~fid{k}")
+        except (ReplayMismatch, RuntimeError) as e:
+            out.append(FidelityResult(step=k, ok=False, error=str(e)))
+            continue
+        end = next(e for e in reversed(ep.events) if e.type == "run_end").data["env_hash"]
+        out.append(FidelityResult(step=k, ok=end == parent_end,
+                                  error=None if end == parent_end else "final env differs"))
+    return out

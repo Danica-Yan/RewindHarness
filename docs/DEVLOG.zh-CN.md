@@ -706,6 +706,14 @@ python scripts/taubench_fork_calibration.py runs/p0/test_rewind.json \
 
 **离线测试**：`tests/test_taubench_dialogue.py`（9 个）用 golden 动作加脚本化的 user 回复覆盖对话回合、完整 reward、snapshot 去重、确定性 replay、空补丁 fork、反事实 fork 翻转、终止工具和报错格式；`tests/test_taubench_scripts.py` 用假模型端到端跑通两个脚本（含断点续跑）；`tests/test_evolve_stats.py` 覆盖统计库。全部 118 个测试通过。
 
+**P0 实测结果与一个 bug**
+
+- 门槛 1（迁移一致性）通过：rewind 3 trial pooled pass^1 = 73.3%，run.py = 72.2%，差值 +1.2%，95% CI [−3.5%, +5.8%]。两次相同设置的 run.py 互比 CI 为 [−8.4%, +5.5%]，rewind 落在同一噪声范围内；略偏高与 rewind 的重试和修复提示方向一致。
+- 门槛 2（空补丁 fork）第一次没过：fork 到起点的通过率 20.4%，同一批任务重跑是 61.7%；各 fork 位置与父结果的一致率都只有 0.49–0.56。
+- 原因：`SnapshotStore` 用 `sort_keys` 的 canonical JSON 落盘，数据库读回来后每条记录的键被按字母重排。tau-bench 的工具把记录原样 `json.dumps` 返回给 agent，所以新进程里 fork 出来的 agent 看到的工具返回和父 episode 不一样（`order_id, user_id, address…` 变成 `address, fulfillments, items…`）。同进程的测试读的是内存副本，reward 的 hash 又与键序无关，所以离线测试没发现。
+- 修复：`SnapshotStore.put(..., ordered=True)` 按插入顺序哈希和落盘（`sha256o:` 键），对话 env 的数据库改用它；快照写入改为原子写。新增 `fork_fidelity` 检查和 `scripts/taubench_fork_fidelity.py`：从某一步 fork，回放父 episode 记录的模型回复和用户回复，逐步校验请求 hash，**不调用 API**。修复后 40 个任务 391 个 fork 点全部逐字节一致（修复前第一个 fork 点就不一致）。
+- 教训：fork 的正确性不能只看"结果对不对"，要看"agent 看到的输入是否逐字节一致"；以后任何改动快照格式的地方，都先跑 fidelity 再花钱跑 calibration。
+
 **还没做**：真实 DeepSeek 运行需要本地 API key，P0 的两个门槛数字（与 run.py 基线一致、空补丁 fork 一致率）需要在本地跑出来后补进这里。
 
 ## 已知局限（诚实版）

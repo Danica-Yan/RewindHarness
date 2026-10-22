@@ -201,3 +201,36 @@ def test_faithful_config_disables_rewind_only_aborts():
     assert cfg.single_tool_call and cfg.max_steps == 30
     assert cfg.loop_kill_at > 100 and cfg.max_invalid_args > 100
     assert cfg.system_prompt.startswith("# Retail agent policy")
+
+
+def test_fork_from_disk_store_reproduces_exactly_what_the_agent_saw(tmp_path):
+    """Regression: the DB used to be stored with sorted keys, so a fork in a
+    new process (store read from disk) showed the agent differently-ordered
+    tool results than its parent. Checked with hash-verified replay from a
+    store that has only the files, not the in-memory copies."""
+    from rewind.env.taubench_dialogue import fork_fidelity
+    from rewind.trace import load_trace
+    for split, with_outputs in (("train", False), ("test", True)):
+        idx = _first_task(split, with_outputs=with_outputs, min_mutations=1)
+        task = load_task(split, idx)
+        final = "Summary: " + " ".join(task.outputs) if task.outputs else "All done."
+        script, replies = golden_dialogue(split, idx, final_text=final)
+        path = tmp_path / f"{split}.jsonl"
+        ep = _run(run_episode(split, idx, provider=ScriptedProvider(script),
+                              user_llm=scripted_user(["hi", *replies]),
+                              store=SnapshotStore(tmp_path / "snaps"), trace_path=str(path)))
+        assert ep.reward.reward == 1.0
+        fresh = SnapshotStore(tmp_path / "snaps")  # disk only, like a new process
+        res = _run(fork_fidelity(load_trace(path), fresh))
+        assert res and all(r.ok for r in res), [r for r in res if not r.ok][:1]
+        # and a plain replay from disk
+        assert _run(replay_episode(load_trace(path), SnapshotStore(tmp_path / "snaps"))).ok
+
+
+def test_ordered_snapshot_preserves_key_order_through_disk(tmp_path):
+    s = SnapshotStore(tmp_path)
+    h = s.put({"b": 1, "a": {"z": 1, "y": 2}}, ordered=True)
+    assert h.startswith("sha256o:")
+    got = SnapshotStore(tmp_path).get(h)
+    assert list(got) == ["b", "a"] and list(got["a"]) == ["z", "y"]
+    assert s.put({"a": {"y": 2, "z": 1}, "b": 1}, ordered=True) != h  # order is part of identity
