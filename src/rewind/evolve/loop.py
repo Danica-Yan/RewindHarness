@@ -107,13 +107,13 @@ def plan(cfg: EvolveConfig, ledger: EditLedger) -> str:
         worst += st + sc
         lines.append(f"cluster {c.key}: stability <= {st} forks, screening <= {sc} forks")
     pool_after = len(_pool(rows, shown)) - (min(len(elig[0].tasks), cfg.max_members_per_cluster) if elig else 0)
-    g = pool_after * cfg.gate.trials
+    g = pool_after * cfg.gate.trials + 2 * cfg.gate.confirm_k * max(4, round(0.15 * pool_after))
     eff = 0
     if cfg.gate.mode == "targeted" and elig:
         eff = (min(len(elig[0].tasks), cfg.max_members_per_cluster) // 2) * cfg.gate.efficacy_n
         lines.append(f"gate efficacy (held-out targets, runs first): <= {eff} forks")
     worst += g + eff
-    lines.append(f"gate pool (only if efficacy passes): <= {g} episodes "
+    lines.append(f"gate pool + flip confirmation (only if efficacy passes): <= {g} episodes "
                  f"({'about half if the candidate is clearly harmful' if cfg.gate.futility_stop else 'no early stop'})")
     if elig:
         m0 = min(len(elig[0].tasks), cfg.max_members_per_cluster)
@@ -177,65 +177,11 @@ async def run_round(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, use
         ledger.mark_shown([r.task_id for r in b], round_no, "screen")
         ledger.record(round_no, inc.version, None, "stability", True,
                       f"{len(stable)} stable: A={[r.task_id for r in a]} B={[r.task_id for r in b]}",
-                      cluster=cluster.key)
+                      {"A": [r.task_id for r in a], "B": [r.task_id for r in b]}, cluster=cluster.key)
 
-        a_rows = evidence_rows(pool_rows, [r.task_id for r in a])
-        edits = await proposer.propose(cluster.key, a_rows, cfg.split, inc,
-                                       ledger.rejected_for_prompt(), cfg.n_candidates)
-        rep.proposer_calls += 1
-        tools = set(inc_registry._tools)  # noqa: SLF001
-        note(f"  proposer returned {len(edits)} candidate edit(s)")
-        b_tasks = [(r.task_id, r.trace, r.null_rate) for r in b]
-        stop_round = False
-        for e in edits:
-            if e.edit_id in ledger.tried_edit_ids():
-                continue
-            why = validate_edit(e, inc, known_tools=tools, max_tokens=cfg.gate.max_ctx_tokens)
-            if why:
-                ledger.record(round_no, inc.version, e, "invalid", False, why)
-                note(f"  [invalid] {e.kind} {e.target}: {why}")
-                continue
-            cost = len(b_tasks) * cfg.screen.n
-            if not budget.can(cost):
-                note(f"budget: screening needs <= {cost}, {budget.left} left -- stop")
-                break
-            cand = inc.apply(e, known_tools=tools).model_copy(
-                update={"version": ledger.next_version_number(), "parent": inc.version})
-            cand_cfg, cand_reg = version_setup(cand)
-            note(f"  screening {e.kind} {e.target}: {e.text!r}")
-            sr = await screen([e.edit_id], b_tasks, system_prompt=cand_cfg.system_prompt,
-                              registry=cand_reg, store=store, provider=provider, user_llm=user_llm,
-                              policy=cfg.screen, log=log)
-            budget.spend(sr.forks)
-            ledger.record(round_no, inc.version, e, "screen", sr.passed, sr.reason, sr.model_dump())
-            note(f"  screen: {'PASS' if sr.passed else 'fail'} -- {sr.reason}")
-            if not sr.passed:
-                continue
-
-            pool = _pool(rows, ledger.shown())
-            targets = [(r.task_id, r.trace, r.passes, r.n) for r in b]
-            cost = len(pool) * cfg.gate.trials + (
-                len(targets) * cfg.gate.efficacy_n if cfg.gate.mode == "targeted" else 0)
-            if not budget.can(cost):
-                note(f"budget: gate needs <= {cost} episodes, {budget.left} left -- "
-                     f"edit passed screening but is NOT gated this round; "
-                     f"run `run_evolve.py gate-pending` to gate it without redoing anything")
-                stop_round = True
-                break
-            out = paths["gate"] / f"v{cand.version}_{e.edit_id}.json"
-            v = await gate(cand, rows, pool, split=cfg.split, out=out, provider=provider,
-                           user_llm=user_llm, store=store, policy=cfg.gate, targets=targets,
-                           concurrency=cfg.concurrency, log=log)
-            budget.spend(v.episodes)
-            rep.gate = v.model_dump()
-            ledger.record(round_no, inc.version, e, "gate", v.accepted, v.reason, v.model_dump())
-            note(f"  gate: {'ACCEPT' if v.accepted else 'reject'} -- {v.reason}")
-            if v.accepted:
-                ledger.commit(cand, [e], str(out), v.model_dump())
-                rep.version_to = cand.version
-                rep.committed_edit = e.model_dump()
-                note(f"  committed v{cand.version}")
-            break  # at most one gate per round
+        stop_round = await _try_edits(cfg, ledger, round_no, inc, rows, pool_rows, cluster.key, a, b,
+                                      budget, rep, provider=provider, user_llm=user_llm, store=store,
+                                      proposer=proposer, log=log, note=note)
         if rep.gate is not None or stop_round:
             break  # a gated or gate-pending candidate ends the round
 
@@ -243,6 +189,232 @@ async def run_round(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, use
     _save(paths, rep)
     return rep
 
+
+
+def _gate_reserve(cfg: EvolveConfig, pool: list[int], n_targets: int) -> int:
+    """Worst-case-ish gate cost: efficacy + pool + flip confirmation (flips
+    budgeted at 15% of the pool, both versions)."""
+    eff = n_targets * cfg.gate.efficacy_n if cfg.gate.mode == "targeted" else 0
+    conf = 2 * cfg.gate.confirm_k * max(4, round(0.15 * len(pool)))
+    return eff + len(pool) * cfg.gate.trials + conf
+
+
+def _record_gate(ledger: EditLedger, round_no: int, inc: Any, e: Any, v: Any, rows: list[dict],
+                 split: str, extra: dict | None = None) -> int:
+    from .feedback import gate_feedback
+    data = v.model_dump()
+    data.update(extra or {})
+    did = ledger.record(round_no, inc.version, e, "gate", v.accepted, v.reason, data)
+    if not v.accepted and Path(v.rows_path).exists():
+        ledger.set_feedback(did, gate_feedback(data, rows, load_rows(v.rows_path), split))
+    return did
+
+
+async def _try_edits(cfg: EvolveConfig, ledger: EditLedger, round_no: int, inc: Any, rows: list[dict],
+                     pool_rows: list[dict], cluster_key: str, a: list, b: list, budget: Budget,
+                     rep: RoundReport, *, provider: Any, user_llm: Any, store: Any, proposer: Any,
+                     log: Callable[[str], None], note: Callable[[str], None]) -> bool:
+    """Propose for one cluster's A half, then check, screen and gate. Returns
+    True if the round must stop (a candidate was gated, or one passed
+    screening but the budget cannot cover its gate)."""
+    _, inc_registry = version_setup(inc)
+    tools = set(inc_registry._tools)  # noqa: SLF001
+    a_rows = evidence_rows(rows, [r.task_id for r in a])
+    edits = await proposer.propose(cluster_key, a_rows, cfg.split, inc,
+                                   ledger.rejected_for_prompt(cluster_key), cfg.n_candidates)
+    rep.proposer_calls += 1
+    note(f"  proposer returned {len(edits)} candidate edit(s)")
+    b_tasks = [(r.task_id, r.trace, r.null_rate) for r in b]
+    for e in edits:
+        if e.edit_id in ledger.tried_edit_ids():
+            continue
+        why = validate_edit(e, inc, known_tools=tools, max_tokens=cfg.gate.max_ctx_tokens)
+        if why:
+            ledger.record(round_no, inc.version, e, "invalid", False, why, cluster=cluster_key)
+            note(f"  [invalid] {e.kind} {e.target}: {why}")
+            continue
+        cost = len(b_tasks) * cfg.screen.n
+        if not budget.can(cost):
+            note(f"budget: screening needs <= {cost}, {budget.left} left -- stop")
+            return True
+        cand = inc.apply(e, known_tools=tools).model_copy(
+            update={"version": ledger.next_version_number(), "parent": inc.version})
+        cand_cfg, cand_reg = version_setup(cand)
+        note(f"  screening {e.kind} {e.target}: {cand.rules.get(e.target) or cand.tool_notes.get(e.target)!r}")
+        sr = await screen([e.edit_id], b_tasks, system_prompt=cand_cfg.system_prompt,
+                          registry=cand_reg, store=store, provider=provider, user_llm=user_llm,
+                          policy=cfg.screen, log=log)
+        budget.spend(sr.forks)
+        ledger.record(round_no, inc.version, e, "screen", sr.passed, sr.reason, sr.model_dump(),
+                      cluster=cluster_key)
+        note(f"  screen: {'PASS' if sr.passed else 'fail'} -- {sr.reason}")
+        if not sr.passed:
+            continue
+
+        pool = _pool(rows, ledger.shown())
+        targets = [(r.task_id, r.trace, r.passes, r.n) for r in b]
+        cost = _gate_reserve(cfg, pool, len(targets))
+        if not budget.can(cost):
+            note(f"budget: gate needs <= {cost} episodes, {budget.left} left -- "
+                 f"edit passed screening but is NOT gated this round; "
+                 f"run `run_evolve.py gate-pending` to gate it without redoing anything")
+            return True
+        out = _paths(cfg)["gate"] / f"v{cand.version}_{e.edit_id}.json"
+        v = await gate(cand, rows, pool, split=cfg.split, out=out, provider=provider,
+                       user_llm=user_llm, store=store, policy=cfg.gate, targets=targets,
+                       concurrency=cfg.concurrency, log=log, incumbent=inc)
+        budget.spend(v.episodes)
+        rep.gate = v.model_dump()
+        _record_gate(ledger, round_no, inc, e, v, rows, cfg.split)
+        note(f"  gate: {'ACCEPT' if v.accepted else 'reject'} -- {v.reason}")
+        if v.accepted:
+            ledger.commit(cand, [e], str(out), v.model_dump())
+            rep.version_to = cand.version
+            rep.committed_edit = e.model_dump()
+            note(f"  committed v{cand.version}")
+        return True  # at most one gate per round
+    return False
+
+
+def retry_candidates(ledger: EditLedger, cfg: EvolveConfig) -> list[dict]:
+    """Clusters at the current version whose A/B split exists and that have no
+    accepted edit yet, with their attempt count (proposer batches so far)."""
+    import re
+    from .stability import load_records
+    v = ledger.current().version
+    stab = load_records(_paths(cfg)["stability"])
+    out = []
+    for did, cluster, reason, dj in ledger.db.execute(
+            "SELECT id, cluster, reason, data_json FROM decisions WHERE stage='stability' "
+            "AND accepted=1 AND version_from=? ORDER BY id", (v,)):
+        data = json.loads(dj) if dj else {}
+        a_ids, b_ids = data.get("A"), data.get("B")
+        if a_ids is None:  # recorded before A/B were stored as data
+            m = re.search(r"A=\[([\d, ]*)\] B=\[([\d, ]*)\]", reason or "")
+            if not m:
+                continue
+            a_ids = [int(x) for x in m.group(1).split(",") if x.strip()]
+            b_ids = [int(x) for x in m.group(2).split(",") if x.strip()]
+        rec = {r.task_id: r for r in stab.values() if r.ctx_version == v}
+        if not all(t in rec for t in a_ids + b_ids):
+            continue
+        accepted = ledger.db.execute(
+            "SELECT 1 FROM decisions WHERE stage='gate' AND accepted=1 AND cluster=? AND version_from=?",
+            (cluster, v)).fetchone()
+        attempts = ledger.db.execute(
+            "SELECT COUNT(DISTINCT round) FROM decisions WHERE cluster=? AND version_from=? "
+            "AND stage IN ('invalid','screen')", (cluster, v)).fetchone()[0]
+        if not accepted:
+            out.append({"cluster": cluster, "A": [rec[t] for t in a_ids], "B": [rec[t] for t in b_ids],
+                        "attempts": attempts})
+    return out
+
+
+async def retry_cluster(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, user_llm: Any,
+                        store: Any, proposer: Any, cluster_key: str | None = None,
+                        max_attempts: int = 3, log: Callable[[str], None] = print) -> RoundReport:
+    """Another proposal for a cluster whose A/B split already exists: no
+    stability re-run, the proposer sees this cluster's rejections WITH their
+    feedback. Note: B has now screened more than one candidate, so screening
+    on it is mildly optimistic; the gate's efficacy check uses fresh forks
+    and the pool never contains A or B."""
+    paths = _paths(cfg)
+    budget = Budget(cfg.budget_episodes)
+    inc = ledger.current()
+    rows = load_rows(ledger.rows_path(inc.version))
+    backfill_feedback(ledger, cfg)
+    cands = [c for c in retry_candidates(ledger, cfg) if cluster_key in (None, c["cluster"])]
+    round_no = ledger.bump_round()
+    rep = RoundReport(round=round_no, version_from=inc.version)
+
+    def note(msg: str) -> None:
+        rep.events.append(msg)
+        log(msg)
+
+    if not cands:
+        note("no cluster to retry at this version")
+        _save(paths, rep)
+        return rep
+    c = cands[-1] if cluster_key is None else cands[0]
+    if c["attempts"] >= max_attempts:
+        note(f"cluster {c['cluster']} already had {c['attempts']} attempts (max {max_attempts})")
+        _save(paths, rep)
+        return rep
+    rep.clusters_considered.append(c["cluster"])
+    note(f"retry {c['cluster']} (attempt {c['attempts'] + 1}): "
+         f"A={[r.task_id for r in c['A']]} B={[r.task_id for r in c['B']]}")
+    pool_rows = [r for r in rows if r["task_id"] not in ledger.shown()]
+    await _try_edits(cfg, ledger, round_no, inc, rows, pool_rows, c["cluster"], c["A"], c["B"], budget,
+                     rep, provider=provider, user_llm=user_llm, store=store, proposer=proposer,
+                     log=log, note=note)
+    rep.episodes_used = budget.used
+    _save(paths, rep)
+    return rep
+
+
+def backfill_feedback(ledger: EditLedger, cfg: EvolveConfig) -> int:
+    """Attach feedback to rejected gate decisions recorded before feedback
+    existed. Free: reads results already on disk."""
+    from .feedback import gate_feedback
+    n = 0
+    for did, v, data in ledger.gate_rejections_without_feedback():
+        if Path(data["rows_path"]).exists():
+            inc_rows = load_rows(ledger.rows_path(v))
+            ledger.set_feedback(did, gate_feedback(data, inc_rows, load_rows(data["rows_path"]), cfg.split))
+            n += 1
+    return n
+
+
+def regate_candidates(ledger: EditLedger) -> list[dict]:
+    """Rejected gate decisions at the current version that were decided
+    without flip confirmation (before it existed) and passed efficacy."""
+    from .surface import Edit
+    v = ledger.current().version
+    out = []
+    for did, rnd, ej, dj in ledger.db.execute(
+            "SELECT id, round, edit_json, data_json FROM decisions WHERE stage='gate' AND accepted=0 "
+            "AND version_from=? ORDER BY id", (v,)):
+        data = json.loads(dj)
+        eff = data.get("efficacy")
+        if eff and eff.get("passed") and not data.get("confirm_episodes") and not data.get("regated"):
+            out.append({"decision_id": did, "round": rnd, "edit": Edit.model_validate_json(ej),
+                        "verdict": data})
+    return out
+
+
+async def regate(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, user_llm: Any, store: Any,
+                 decision_id: int | None = None, log: Callable[[str], None] = print) -> list[dict]:
+    """Re-decide earlier gate rejections under the current policy. Reuses the
+    efficacy result and every pool episode already run (the runner skips
+    them); only flip confirmation is new."""
+    from .gate import Efficacy
+    results = []
+    for c in regate_candidates(ledger):
+        if decision_id is not None and c["decision_id"] != decision_id:
+            continue
+        inc = ledger.current()
+        rows = load_rows(ledger.rows_path(inc.version))
+        old = c["verdict"]
+        pool = sorted({r["task_id"] for r in load_rows(old["rows_path"])}) if Path(old["rows_path"]).exists() \
+            else _pool(rows, ledger.shown())
+        e = c["edit"]
+        _, reg = version_setup(inc)
+        cand = inc.apply(e, known_tools=set(reg._tools)).model_copy(  # noqa: SLF001
+            update={"version": ledger.next_version_number(), "parent": inc.version})
+        log(f"re-gating {e.kind} {e.target} (decision {c['decision_id']}): was '{old['reason']}'")
+        v = await gate(cand, rows, pool, split=cfg.split, out=Path(old["rows_path"]), provider=provider,
+                       user_llm=user_llm, store=store, policy=cfg.gate, concurrency=cfg.concurrency,
+                       log=log, incumbent=inc, prior_efficacy=Efficacy(**old["efficacy"]))
+        _record_gate(ledger, c["round"], inc, e, v, rows, cfg.split,
+                     {"regate_of": c["decision_id"]})
+        ledger.mark_regated(c["decision_id"])
+        log(f"  gate: {'ACCEPT' if v.accepted else 'reject'} -- {v.reason}")
+        results.append({"edit": e.model_dump(), "verdict": v.model_dump(), "was": old["reason"]})
+        if v.accepted:
+            ledger.commit(cand, [e], old["rows_path"], v.model_dump())
+            log(f"  committed v{cand.version}")
+            break
+    return results
 
 def pending_candidates(ledger: EditLedger, cfg: EvolveConfig) -> list[dict]:
     """Edits that passed screening but were never gated (e.g. the round ran
@@ -282,7 +454,7 @@ async def gate_pending(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, 
         rows = load_rows(ledger.rows_path(inc.version))
         pool = _pool(rows, ledger.shown())
         e = p["edit"]
-        cost = len(pool) * cfg.gate.trials + len(p["targets"]) * cfg.gate.efficacy_n
+        cost = _gate_reserve(cfg, pool, len(p["targets"]))
         if not budget.can(cost):
             log(f"budget: gate needs <= {cost}, {budget.left} left -- stop")
             break
@@ -293,9 +465,9 @@ async def gate_pending(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, 
         out = _paths(cfg)["gate"] / f"v{cand.version}_{e.edit_id}.json"
         v = await gate(cand, rows, pool, split=cfg.split, out=out, provider=provider, user_llm=user_llm,
                        store=store, policy=cfg.gate, targets=p["targets"],
-                       concurrency=cfg.concurrency, log=log)
+                       concurrency=cfg.concurrency, log=log, incumbent=inc)
         budget.spend(v.episodes)
-        ledger.record(p["round"], inc.version, e, "gate", v.accepted, v.reason, v.model_dump())
+        _record_gate(ledger, p["round"], inc, e, v, rows, cfg.split)
         log(f"  gate: {'ACCEPT' if v.accepted else 'reject'} -- {v.reason}")
         results.append({"edit": e.model_dump(), "verdict": v.model_dump()})
         if v.accepted:

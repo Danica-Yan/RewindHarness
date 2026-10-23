@@ -20,22 +20,13 @@ import argparse
 import json
 import sqlite3
 import sys
-from math import comb
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from rewind.env.taubench_adapter import MUTATING_TOOLS  # noqa: E402
-from rewind.env.taubench_dialogue import load_task  # noqa: E402
-
-
-def tail(k: int, n: int, p: float) -> float:
-    """P(X >= k) for X ~ Binomial(n, p)."""
-    return sum(comb(n, i) * p ** i * (1 - p) ** (n - i) for i in range(k, n + 1))
-
-
-def tools_of(split: str, t: int) -> set[str]:
-    return {a.name for a in load_task(split, t).actions if a.name in MUTATING_TOOLS}
+from rewind.evolve.feedback import binom_tail as tail  # noqa: E402
+from rewind.evolve.feedback import task_tools as tools_of  # noqa: E402
 
 
 def main() -> None:

@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rewind viewer</title>
+<style>
+:root {
+  --bg: #fbfaf7; --panel: #ffffff; --ink: #1f1e1b; --muted: #6b6a64; --line: #e4e1d8;
+  --accent: #3d5a80; --ok: #2f7d4f; --ok-bg: #e6f2ea; --bad: #b23a2c; --bad-bg: #f8e7e4;
+  --warn: #8a5a12; --warn-bg: #f7eedb; --code: #f3f1ea; --dim: .45;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, "PingFang SC", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #161614; --panel: #1f1e1b; --ink: #ecebe6; --muted: #a09e96; --line: #33322e;
+    --accent: #8fb3de; --ok: #7cc79a; --ok-bg: #1d3226; --bad: #ef8e80; --bad-bg: #3b1f1b;
+    --warn: #e2b96a; --warn-bg: #3a2e17; --code: #2a2925; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.55 var(--sans); }
+header { position: sticky; top: 0; z-index: 2; background: var(--bg); border-bottom: 1px solid var(--line);
+  padding: 10px 20px; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .01em; }
+nav { display: flex; gap: 4px; }
+nav button { font: inherit; border: 1px solid transparent; background: none; color: var(--muted);
+  padding: 4px 10px; border-radius: 6px; cursor: pointer; }
+nav button.on { color: var(--ink); border-color: var(--line); background: var(--panel); }
+nav button:disabled { opacity: .4; cursor: default; }
+.load { margin-left: auto; color: var(--muted); font-size: 13px; display: flex; gap: 8px; align-items: center; }
+.load label { border: 1px dashed var(--line); padding: 4px 10px; border-radius: 6px; cursor: pointer; }
+main { max-width: 1180px; margin: 0 auto; padding: 20px; }
+.empty { border: 1px dashed var(--line); border-radius: 12px; padding: 48px 24px; text-align: center; color: var(--muted); }
+.empty code { font-family: var(--mono); background: var(--code); padding: 1px 5px; border-radius: 4px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin: 0 0 12px; }
+.round-h { display: flex; gap: 4px 10px; align-items: baseline; margin: 22px 0 8px; flex-wrap: wrap; }
+.round-h h2 { white-space: nowrap; }
+.round-h .muted, .card, .goal { overflow-wrap: anywhere; }
+.round-h h2 { font-size: 16px; margin: 0; }
+.muted { color: var(--muted); }
+.pill { display: inline-block; font-size: 11.5px; padding: 1px 8px; border-radius: 99px; border: 1px solid var(--line);
+  color: var(--muted); margin-right: 6px; white-space: nowrap; }
+.pill.ok { color: var(--ok); background: var(--ok-bg); border-color: transparent; }
+.pill.bad { color: var(--bad); background: var(--bad-bg); border-color: transparent; }
+.pill.warn { color: var(--warn); background: var(--warn-bg); border-color: transparent; }
+.edit { font-family: var(--mono); font-size: 12.5px; background: var(--code); padding: 8px 10px; border-radius: 6px;
+  margin: 8px 0; white-space: pre-wrap; word-break: break-word; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; margin: 10px 0; }
+.stat { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.stat b { display: block; font-size: 16px; font-variant-numeric: tabular-nums; }
+.stat span { color: var(--muted); font-size: 12px; }
+.feedback { border-left: 3px solid var(--warn); padding: 6px 10px; margin: 10px 0; white-space: pre-wrap;
+  font-size: 13px; color: var(--ink); background: var(--warn-bg); border-radius: 0; }
+.flips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.flips button { font: inherit; font-size: 12.5px; border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+  border-radius: 6px; padding: 3px 9px; cursor: pointer; }
+.flips button.broke { border-color: var(--bad); }
+.flips button.fixed { border-color: var(--ok); }
+.flips button .c { font-size: 11px; color: var(--muted); }
+table.rules { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.rules td { border-top: 1px solid var(--line); padding: 6px 8px; vertical-align: top; }
+table.rules td:first-child { font-family: var(--mono); white-space: nowrap; color: var(--muted); width: 1%; }
+.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 820px) { .cols { grid-template-columns: 1fr; } }
+.col h3 { font-size: 13px; margin: 0 0 6px; display: flex; gap: 8px; align-items: center; }
+.tl { display: flex; flex-direction: column; gap: 6px; }
+.it { border-radius: 8px; padding: 6px 10px; font-size: 13px; white-space: pre-wrap; word-break: break-word; border: 1px solid var(--line); }
+.it .k { font-size: 11px; color: var(--muted); display: block; margin-bottom: 2px; }
+.it.user { background: var(--panel); }
+.it.agent { background: var(--code); }
+.it.call { font-family: var(--mono); font-size: 12.5px; border-color: var(--accent); }
+.it.call.diverge { outline: 2px solid var(--warn); }
+.it.result { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.it.result.err { color: var(--bad); border-color: var(--bad); background: var(--bad-bg); }
+.it.guard { border-style: dashed; color: var(--warn); }
+.it.system { color: var(--muted); font-size: 12px; }
+.it.end, .it.stop { text-align: center; font-size: 12px; color: var(--muted); border-style: dotted; }
+.it.inh { opacity: var(--dim); }
+details summary { cursor: pointer; }
+.goal { font-size: 13px; color: var(--muted); margin: 0 0 12px; }
+select { font: inherit; background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; max-width: 100%; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Rewind viewer</h1>
+  <nav id="nav">
+    <button data-v="rounds" class="on">Rounds</button>
+    <button data-v="versions">Versions</button>
+    <button data-v="compare" disabled>Compare</button>
+    <button data-v="episode">Episodes</button>
+  </nav>
+  <div class="load">
+    <span id="src">no data loaded</span>
+    <label>Load file<input id="file" type="file" accept=".json,.jsonl" multiple hidden></label>
+  </div>
+</header>
+<main id="main"></main>
+<script>
+const S = { data: null, view: "rounds", pair: null, episode: null };
+const $ = (sel) => document.querySelector(sel);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const pct = (x) => (x == null ? "–" : (x * 100).toFixed(1) + "%");
+const sgn = (x) => (x == null ? "–" : (x >= 0 ? "+" : "") + (x * 100).toFixed(1) + " pt");
+
+function editText(e) {
+  if (!e) return "";
+  const trig = e.trigger ? `When ${e.trigger}: ` : "";
+  return `${e.kind} ${e.target}${e.op && e.op !== "add" ? " (" + e.op + ")" : ""}\n${trig}${e.text ?? ""}`;
+}
+
+function stagePill(d) {
+  const cls = d.accepted ? "ok" : (d.stage === "invalid" ? "warn" : "bad");
+  const word = d.stage === "stability" ? (d.accepted ? "stable failures found" : "mostly noise")
+    : d.accepted ? "pass" : "reject";
+  return `<span class="pill">${esc(d.stage)}</span><span class="pill ${cls}">${word}</span>`;
+}
+
+function gateBlock(d) {
+  const g = d.gate || {};
+  const eff = g.efficacy;
+  const conf = g.confirmed_regressions;
+  let h = `<div class="stats">`;
+  if (eff) h += `<div class="stat"><b>${eff.cand_passes}/${eff.cand_n} vs ${eff.null_passes}/${eff.null_n}</b><span>held-out targets, with vs without (Fisher p = ${eff.p_value.toFixed(3)})</span></div>`;
+  if (g.n_tasks != null) h += `<div class="stat"><b>${sgn(g.delta)}</b><span>${g.n_tasks} unseen tasks, CI [${sgn(g.ci?.[0])}, ${sgn(g.ci?.[1])}]</span></div>`;
+  if (g.regressions) h += `<div class="stat"><b>${g.improvements.length} fixed · ${g.regressions.length} broke</b><span>single re-run of the pool</span></div>`;
+  if (conf && g.confirm_episodes) h += `<div class="stat"><b>${conf.length} of ${g.regressions.length}</b><span>breaks that reproduce on re-runs</span></div>`;
+  else if (g.regressions?.length) h += `<div class="stat"><b>not run</b><span>flip confirmation${g.stopped_early || (g.ci && g.ci[1] < 0) ? " (pool already significantly worse)" : ""}</span></div>`;
+  if (g.episodes != null) h += `<div class="stat"><b>${g.episodes}</b><span>episodes spent${g.stopped_early ? " (stopped early)" : ""}</span></div>`;
+  h += `</div>`;
+  if (g.regate_of) h += `<div class="muted">re-gate of decision ${g.regate_of} under the current policy</div>`;
+  if (d.feedback) h += `<div class="feedback">${esc(d.feedback)}</div>`;
+  if (d.pairs?.length) {
+    h += `<div class="muted" style="margin-top:8px">Flipped tasks — open one to compare before and after:</div><div class="flips">`;
+    d.pairs.forEach((p, i) => {
+      h += `<button class="${p.kind}" data-dec="${d.id}" data-i="${i}">#${p.task_id} ${p.kind}${p.confirmed ? ' <span class="c">confirmed</span>' : ""}</button>`;
+    });
+    h += `</div>`;
+  }
+  return h;
+}
+
+function viewRounds() {
+  const ds = S.data.decisions;
+  const rounds = [...new Set(ds.map((d) => d.round))].sort((a, b) => a - b);
+  let h = "";
+  for (const r of rounds) {
+    const rd = ds.filter((d) => d.round === r);
+    h += `<div class="round-h"><h2>Round ${r}</h2><span class="muted">from v${rd[0].version_from} · ${esc(rd[0].cluster || "")}</span></div>`;
+    for (const d of rd) {
+      h += `<div class="card">${stagePill(d)}<span class="muted">${esc(d.reason)}</span>`;
+      if (d.split?.A) h += `<div class="muted">A (shown to proposer): ${d.split.A.join(", ")} · B (held out): ${d.split.B.join(", ")}</div>`;
+      if (d.edit) h += `<div class="edit">${esc(editText(d.edit))}</div>`;
+      if (d.stage === "screen" && d.screen?.tasks?.length) {
+        h += `<div class="muted">` + d.screen.tasks.map((t) => `#${t.task_id}: ${t.passes} pass in ${t.forks} forks (null ${pct(t.null_rate)})`).join(" · ") + `</div>`;
+      }
+      if (d.stage === "gate") h += gateBlock(d);
+      h += `</div>`;
+    }
+  }
+  return h || `<div class="empty">No decisions in this file.</div>`;
+}
+
+function viewVersions() {
+  let h = "";
+  for (const v of S.data.versions) {
+    h += `<div class="card"><b>v${v.version}</b> <span class="muted">${v.parent == null ? "baseline" : "from v" + v.parent}</span>`;
+    const rows = [...Object.entries(v.rules).map(([k, t]) => [k, t]),
+                  ...Object.entries(v.tool_notes).map(([k, t]) => ["note on " + k, t])];
+    h += rows.length ? `<table class="rules">` + rows.map(([k, t]) => `<tr><td>${esc(k)}</td><td>${esc(t)}</td></tr>`).join("") + `</table>`
+      : `<div class="muted">no learned rules — the benchmark's own context</div>`;
+    h += `</div>`;
+  }
+  return h;
+}
+
+function callKey(it) { return it.kind === "call" ? it.name + it.args : null; }
+
+function timeline(ep, divergeIdx) {
+  if (!ep) return `<div class="muted">episode not in this file</div>`;
+  let calls = 0;
+  return `<div class="tl">` + ep.items.map((it) => {
+    const inh = it.inherited ? " inh" : "";
+    if (it.kind === "system") return `<div class="it system${inh}">system prompt · ${it.chars} chars${it.learned ? `<br><b>learned:</b>\n${esc(it.learned)}` : ""}</div>`;
+    if (it.kind === "user") return `<div class="it user${inh}"><span class="k">customer · step ${it.step}</span>${esc(it.text)}</div>`;
+    if (it.kind === "agent") return `<div class="it agent${inh}"><span class="k">agent · step ${it.step}</span>${esc(it.text)}</div>`;
+    if (it.kind === "call") { const i = calls++; return `<div class="it call${inh}${i === divergeIdx ? " diverge" : ""}"><span class="k">tool call · step ${it.step}${i === divergeIdx ? " · first difference" : ""}</span>${esc(it.name)}(${esc(it.args)})</div>`; }
+    if (it.kind === "result") return `<div class="it result${it.error ? " err" : ""}${inh}"><details${it.error ? " open" : ""}><summary>${it.error ? "error" : "result"}</summary>${esc(it.text)}</details></div>`;
+    if (it.kind === "guard") return `<div class="it guard${inh}">${esc(it.text)}</div>`;
+    if (it.kind === "stop") return `<div class="it stop">customer ends the conversation</div>`;
+    if (it.kind === "end") return `<div class="it end">run ${esc(it.status)}${it.reason ? " · " + esc(it.reason) : ""}</div>`;
+    return "";
+  }).join("") + `</div>`;
+}
+
+function viewCompare() {
+  const p = S.pair;
+  if (!p) return `<div class="empty">Pick a flipped task in a gate decision on the Rounds page.</div>`;
+  const eb = S.data.episodes[p.before?.trace], ea = S.data.episodes[p.after?.trace];
+  const cb = (eb?.items || []).filter((i) => i.kind === "call").map(callKey);
+  const ca = (ea?.items || []).filter((i) => i.kind === "call").map(callKey);
+  let d = 0; while (d < cb.length && d < ca.length && cb[d] === ca[d]) d++;
+  const div = d < Math.max(cb.length, ca.length) ? d : -1;
+  const res = (r) => r == null ? "" : `<span class="pill ${r >= 1 ? "ok" : "bad"}">${r >= 1 ? "passed" : "failed"}</span>`;
+  return `<div class="card"><b>Task #${p.task_id}</b> <span class="pill ${p.kind === "broke" ? "bad" : "ok"}">${p.kind} by the edit</span>${p.confirmed ? '<span class="pill warn">reproduced on re-runs</span>' : ""}
+    <p class="goal">${esc(p.before?.goal || p.after?.goal || "")}</p>
+    <div class="cols"><div class="col"><h3>Before · incumbent ${res(p.before?.reward)}</h3>${timeline(eb, div)}</div>
+    <div class="col"><h3>After · candidate ${res(p.after?.reward)}</h3>${timeline(ea, div)}</div></div></div>`;
+}
+
+function viewEpisode() {
+  const keys = Object.keys(S.data.episodes);
+  if (!keys.length) return `<div class="empty">No episodes in this file.</div>`;
+  const cur = S.episode && S.data.episodes[S.episode] ? S.episode : keys[0];
+  const ep = S.data.episodes[cur];
+  const opts = keys.map((k) => `<option value="${esc(k)}"${k === cur ? " selected" : ""}>${esc(S.data.episodes[k].run_id)}</option>`).join("");
+  const lineage = ep.parent_run_id ? `<div class="muted">fork of ${esc(ep.parent_run_id)} at step ${ep.fork_step}; dimmed items are the inherited prefix</div>` : "";
+  return `<div class="card"><select id="epsel">${opts}</select>${lineage}<div style="margin-top:10px">${timeline(ep, -1)}</div></div>`;
+}
+
+function render() {
+  document.querySelectorAll("#nav button").forEach((b) => {
+    b.classList.toggle("on", b.dataset.v === S.view);
+    if (b.dataset.v === "compare") b.disabled = !S.pair;
+  });
+  const m = $("#main");
+  if (!S.data) {
+    m.innerHTML = `<div class="empty">Load <code>viewer.json</code> from <code>python scripts/export_viewer.py</code>, or any rewind trace (<code>.jsonl</code>).<br>You can also drop the file onto this page.</div>`;
+    return;
+  }
+  m.innerHTML = { rounds: viewRounds, versions: viewVersions, compare: viewCompare, episode: viewEpisode }[S.view]();
+}
+
+document.addEventListener("click", (ev) => {
+  const nb = ev.target.closest("#nav button");
+  if (nb && !nb.disabled) { S.view = nb.dataset.v; render(); window.scrollTo(0, 0); return; }
+  const fb = ev.target.closest(".flips button");
+  if (fb) {
+    const d = S.data.decisions.find((x) => x.id === +fb.dataset.dec);
+    S.pair = d.pairs[+fb.dataset.i]; S.view = "compare"; render(); window.scrollTo(0, 0);
+  }
+});
+document.addEventListener("change", (ev) => {
+  if (ev.target.id === "epsel") { S.episode = ev.target.value; render(); }
+});
+
+function traceToEpisode(text, name) {
+  const items = [], lines = text.split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l));
+  const start = lines[0]?.data || {};
+  for (const e of lines) {
+    const d = e.data || {}, base = { step: e.step, inherited: !!e.inherited };
+    if (e.type === "message") {
+      const m = d.message;
+      if (m.role === "system") { const c = m.content || ""; const L = "## Additional policies (learned)";
+        items.push({ ...base, kind: "system", chars: c.length, learned: c.includes(L) ? c.split(L)[1].trim() : "" }); }
+      else if (m.role === "assistant") {
+        if (m.content) items.push({ ...base, kind: "agent", text: m.content });
+        for (const c of m.tool_calls || []) items.push({ ...base, kind: "call", name: c.name, args: JSON.stringify(c.args || {}) });
+      } else if (m.role === "tool") items.push({ ...base, kind: "result", text: String(m.content), error: !!m.is_error || /^(Error|ERROR)/.test(String(m.content)) });
+      else if (m.role === "user") items.push({ ...base, kind: "user", text: m.content });
+    } else if (e.type === "user_turn" && d.done) items.push({ ...base, kind: "stop" });
+    else if (e.type === "guard") items.push({ ...base, kind: "guard", text: d.guard });
+    else if (e.type === "run_end") items.push({ ...base, kind: "end", status: d.status, reason: d.reason });
+  }
+  return { run_id: lines[0]?.run_id || name, path: name, parent_run_id: start.parent_run_id, fork_step: start.fork_step, items };
+}
+
+async function loadFiles(files) {
+  const data = S.data || { versions: [], decisions: [], episodes: {} };
+  for (const f of files) {
+    const text = await f.text();
+    if (f.name.endsWith(".jsonl")) { const ep = traceToEpisode(text, f.name); data.episodes[f.name] = ep; S.episode = f.name; S.view = "episode"; }
+    else { const d = JSON.parse(text); Object.assign(data, { versions: d.versions, decisions: d.decisions }); Object.assign(data.episodes, d.episodes); S.view = "rounds"; }
+  }
+  S.data = data; $("#src").textContent = [...files].map((f) => f.name).join(", "); render();
+}
+$("#file").addEventListener("change", (e) => loadFiles(e.target.files));
+document.addEventListener("dragover", (e) => e.preventDefault());
+document.addEventListener("drop", (e) => { e.preventDefault(); loadFiles(e.dataTransfer.files); });
+render();
+</script>
+</body>
+</html>

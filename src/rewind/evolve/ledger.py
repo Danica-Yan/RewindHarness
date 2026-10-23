@@ -92,8 +92,8 @@ class EditLedger:
 
     # -- decisions -----------------------------------------------------------------
     def record(self, round_no: int, version_from: int, edit: Edit | None, stage: str, accepted: bool,
-               reason: str, data: dict | None = None, cluster: str | None = None) -> None:
-        self.db.execute(
+               reason: str, data: dict | None = None, cluster: str | None = None) -> int:
+        cur = self.db.execute(
             "INSERT INTO decisions(round,version_from,edit_id,cluster,edit_json,stage,accepted,reason,"
             "data_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (round_no, version_from, edit.edit_id if edit else None,
@@ -101,16 +101,49 @@ class EditLedger:
              edit.model_dump_json() if edit else None, stage, int(accepted), reason,
              json.dumps(data or {}, default=str), time.time()))
         self.db.commit()
+        return cur.lastrowid
 
     def rejected_for_prompt(self, cluster: str | None = None, limit: int = 12) -> list[dict]:
-        q = ("SELECT edit_json, stage, reason FROM decisions WHERE accepted=0 AND edit_json IS NOT NULL"
-             + (" AND cluster=?" if cluster else "") + " ORDER BY id DESC LIMIT ?")
-        args = (cluster, limit) if cluster else (limit,)
+        """Rejected edits for the proposer prompt: this cluster's first (with the
+        full gate feedback, if any), then others, newest first."""
+        rows = self.db.execute(
+            "SELECT edit_json, stage, reason, data_json, cluster FROM decisions "
+            "WHERE accepted=0 AND edit_json IS NOT NULL ORDER BY id DESC").fetchall()
+        rows.sort(key=lambda r: r[4] != cluster)  # stable: same cluster first, newest first within
         out = []
-        for ej, stage, reason in self.db.execute(q, args):
+        for ej, stage, reason, dj, cl in rows[:limit]:
             e = json.loads(ej)
+            fb = ((json.loads(dj) if dj else {}) or {}).get("feedback") or {}
             out.append({"kind": e["kind"], "target": e["target"], "text": e.get("text"),
-                        "reason": f"{stage}: {reason}"})
+                        "trigger": e.get("trigger"), "reason": f"{stage}: {reason}",
+                        "feedback": fb.get("text") if cl == cluster else None})
+        return out
+
+    def set_feedback(self, decision_id: int, feedback: dict) -> None:
+        dj = self.db.execute("SELECT data_json FROM decisions WHERE id=?", (decision_id,)).fetchone()[0]
+        data = json.loads(dj) if dj else {}
+        data["feedback"] = feedback
+        self.db.execute("UPDATE decisions SET data_json=? WHERE id=?", (json.dumps(data, default=str),
+                                                                        decision_id))
+        self.db.commit()
+
+    def mark_regated(self, decision_id: int) -> None:
+        dj = self.db.execute("SELECT data_json FROM decisions WHERE id=?", (decision_id,)).fetchone()[0]
+        data = json.loads(dj) if dj else {}
+        data["regated"] = True
+        self.db.execute("UPDATE decisions SET data_json=? WHERE id=?", (json.dumps(data, default=str),
+                                                                        decision_id))
+        self.db.commit()
+
+    def gate_rejections_without_feedback(self) -> list[tuple[int, int, dict]]:
+        """(decision id, version_from, verdict) of rejected gate decisions that
+        have no feedback yet -- e.g. recorded before feedback existed."""
+        out = []
+        for did, v, dj in self.db.execute(
+                "SELECT id, version_from, data_json FROM decisions WHERE stage='gate' AND accepted=0"):
+            data = json.loads(dj) if dj else {}
+            if "feedback" not in data and data.get("rows_path"):
+                out.append((did, v, data))
         return out
 
     def tried_edit_ids(self) -> set[str]:

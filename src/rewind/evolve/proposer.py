@@ -28,15 +28,24 @@ You see failures that share one pattern. Propose GENERAL policy fixes that would
 pattern on unseen customers and orders.
 
 You may propose two kinds of edits:
-- "rule": one short policy line added to the agent's instructions (target = a short snake_case id).
-- "tool_note": one short note appended to a tool's description (target = the exact tool name).
+- "tool_note": a note on ONE tool's description (target = the exact tool name). The agent sees it only
+  when it considers that tool. PREFER THIS whenever the failure is about how one tool is used.
+- "rule": a policy line in the agent's instructions (target = a short snake_case id), only for
+  behaviour that spans several tools or the whole conversation.
 Ops: "add", "replace" (an existing rule id / tool note), "delete".
+
+Every edit has a "trigger": the specific situation it applies to ("the customer asks to change an
+item's options to an empty set"). It is written as "When <trigger>: <text>". Make the trigger as
+NARROW as the evidence allows -- rules that change behaviour beyond their situation break other tasks.
 
 Hard requirements:
 - No order ids, item ids, user ids, emails, names or task numbers. Describe the situation, not the case.
 - One policy per edit, at most 2 sentences. Do not restate existing rules.
+- No unconditional "never" / "always" / "do not" outside the trigger's situation.
 - Prefer the smallest change that explains ALL the shown failures.
-Return JSON: {"edits": [{"kind": ..., "target": ..., "op": ..., "text": ..., "rationale": ...}]}"""
+- If a previous edit for this pattern was rejected with feedback, address that feedback explicitly.
+Return JSON: {"edits": [{"kind": ..., "target": ..., "op": ..., "trigger": ..., "text": ...,
+"rationale": ...}]}"""
 
 
 class Proposer(Protocol):
@@ -73,7 +82,11 @@ def build_messages(cluster_key: str, evidence: list[dict], split: str, ctx: Cont
         parts.append("")
     if rejected:
         parts.append("Already tried and rejected (do not repeat):")
-        parts += [f"- {r['kind']} {r['target']}: {r.get('text')!r} -> {r['reason']}" for r in rejected]
+        for r in rejected:
+            trig = f" [when {r['trigger']}]" if r.get("trigger") else ""
+            parts.append(f"- {r['kind']} {r['target']}{trig}: {r.get('text')!r} -> {r['reason']}")
+            if r.get("feedback"):
+                parts += ["    " + line for line in r["feedback"].splitlines()]
         parts.append("")
     for i, row in enumerate(evidence, 1):
         task = load_task(split, row["task_id"])
@@ -103,7 +116,8 @@ def parse_edits(text: str, cluster_key: str, evidence_tasks: list[int]) -> list[
     for d in (data.get("edits") or []) if isinstance(data, dict) else []:
         try:
             out.append(Edit(kind=d["kind"], target=str(d["target"]).strip(), op=d.get("op", "add"),
-                            text=d.get("text"), rationale=d.get("rationale", ""),
+                            text=d.get("text"), trigger=d.get("trigger"),
+                            rationale=d.get("rationale", ""),
                             source_cluster=cluster_key, evidence_tasks=evidence_tasks))
         except Exception:  # malformed item: skip it, keep the rest
             continue
@@ -118,6 +132,7 @@ class LLMProposer:
 
     async def propose(self, cluster_key, evidence, split, ctx, rejected, n=3) -> list[Edit]:
         msgs = build_messages(cluster_key, evidence, split, ctx, rejected, n, self.tool_names)
+        self.last_messages = msgs
         self.calls += 1
         text = await self.llm(msgs)
         return parse_edits(text, cluster_key, [r["task_id"] for r in evidence])[:n]

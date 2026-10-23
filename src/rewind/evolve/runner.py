@@ -43,12 +43,15 @@ def write_rows(path: str | Path, rows: list[dict]) -> None:
 async def run_batch(split: str, task_ids: list[int], trials: int, out: str | Path, *,
                     ctx: ContextVersion, provider: Any, user_llm: Any, store: SnapshotStore,
                     trace_dir: str | Path | None = None, concurrency: int = 4,
-                    log: Callable[[str], None] = print) -> list[dict]:
+                    log: Callable[[str], None] = print, trial_offset: int = 0) -> list[dict]:
+    """Run `trials` trials (numbered from `trial_offset`) of each task; rows
+    already in `out` are kept and skipped."""
     out = Path(out)
     trace_dir = Path(trace_dir or out.with_suffix("").as_posix() + "_traces")
     rows = load_rows(out)
     done = {(r["task_id"], r["trial"]) for r in rows}
-    jobs = [(t, i) for t in range(trials) for i in task_ids if (i, t) not in done]
+    jobs = [(t, i) for t in range(trial_offset, trial_offset + trials) for i in task_ids
+            if (i, t) not in done]
     log(f"{out.name}: {len(jobs)} episodes to run ({len(done)} already done)")
     cfg, registry = version_setup(ctx)
     sem = asyncio.Semaphore(concurrency)

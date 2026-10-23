@@ -36,6 +36,7 @@ class Edit(BaseModel):
     target: str                       # rule id, or tool name
     op: EditOp
     text: str | None = None           # new text for add / replace
+    trigger: str | None = None        # the situation the policy applies to ("the customer ...")
     rationale: str = ""
     source_cluster: str = ""
     evidence_tasks: list[int] = Field(default_factory=list)
@@ -43,12 +44,24 @@ class Edit(BaseModel):
     def model_post_init(self, _ctx) -> None:
         if not self.edit_id:
             h = hashlib.sha256(json.dumps(
-                [self.kind, self.target, self.op, self.text], ensure_ascii=False).encode()).hexdigest()
+                [self.kind, self.target, self.op, self.text, self.trigger],
+                ensure_ascii=False).encode()).hexdigest()
             self.edit_id = "e_" + h[:12]
 
 
 class EditError(ValueError):
     pass
+
+
+def scoped_text(edit: "Edit") -> str:
+    """What is actually written into the context: the policy prefixed by its
+    trigger, so the agent reads a conditional rule, never a blanket one."""
+    body = (edit.text or "").strip()
+    trig = (edit.trigger or "").strip().rstrip(".:")
+    if not trig:
+        return body
+    trig = trig[0].lower() + trig[1:] if trig[:1].isupper() and not trig[:2].isupper() else trig
+    return f"When {trig.removeprefix('when ').removeprefix('When ')}: {body}"
 
 
 class ContextVersion(BaseModel):
@@ -68,13 +81,13 @@ class ContextVersion(BaseModel):
                 raise EditError(f"{edit.kind} {edit.target!r} already exists (use replace)")
             if not (edit.text or "").strip():
                 raise EditError("add needs text")
-            table[edit.target] = edit.text.strip()
+            table[edit.target] = scoped_text(edit)
         elif edit.op == "replace":
             if edit.target not in table:
                 raise EditError(f"{edit.kind} {edit.target!r} does not exist")
             if not (edit.text or "").strip():
                 raise EditError("replace needs text")
-            table[edit.target] = edit.text.strip()
+            table[edit.target] = scoped_text(edit)
         else:
             if edit.target not in table:
                 raise EditError(f"{edit.kind} {edit.target!r} does not exist")
@@ -140,8 +153,20 @@ def validate_edit(edit: Edit, ctx: ContextVersion, *, known_tools: set[str],
                   max_tokens: int) -> str | None:
     """None if the edit may be tried, else the reason it is refused before
     spending any evaluation on it."""
-    if edit.text and leak_reasons(edit.text):
-        return "looks case-specific: " + ", ".join(leak_reasons(edit.text))
+    both = f"{edit.text or ''} {edit.trigger or ''}"
+    if leak_reasons(both):
+        return "looks case-specific: " + ", ".join(leak_reasons(both))
+    if edit.op != "delete":
+        # Scope (round-1 lesson: an unconditional "do not offer alternatives"
+        # clause broke 12 tasks of the same kind). A global rule must say when
+        # it applies; a rule about one tool belongs on that tool.
+        if edit.kind == "rule" and len((edit.trigger or "").split()) < 3:
+            return ("a rule needs a trigger: the specific situation it applies to "
+                    "(at least a few words), not a blanket instruction")
+        if edit.kind == "rule":
+            named = sorted(t for t in known_tools if t in both)
+            if len(named) == 1:
+                return f"this rule is about one tool -- make it a tool_note on {named[0]}"
     if edit.text and len(edit.text) > 600:
         return "too long (>600 chars): a learned rule should be one policy, not a procedure dump"
     try:

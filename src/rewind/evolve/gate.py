@@ -13,8 +13,26 @@ tasks in a pool whose baseline is ~90%:
      must beat the same tasks' null-fork passes by a one-sided Fisher exact
      test (p < alpha) and by at least `min_lift` in rate.
   2. safety: on the gate pool (train tasks never shown to the proposer or to
-     screening), paired with the incumbent: NOT significantly worse (CI upper
-     bound >= 0) and the point change >= -max_drop.
+     screening), paired with the incumbent, one trial each: NOT significantly
+     worse (CI upper bound >= 0).
+  3. confirmation: every task that flipped (broke or got fixed) is re-run
+     `confirm_k` more times under BOTH versions. A regression is confirmed
+     only if the candidate fails EVERY re-run AND the incumbent passes EVERY
+     re-run -- i.e. the task is reliable without the edit and reliably broken
+     with it. More than `max_confirmed_regressions` confirmed -> reject.
+
+     Calibration (simulation in the dev log, per-task flakiness fitted to the
+     P0 null-fork data, k = 2): a harmless edit is rejected ~3% of the time,
+     5 truly broken tasks are caught ~99% of the time. The weaker variant
+     "incumbent passes at least one re-run" rejected ~13% of harmless edits,
+     because coin-flip tasks often fail twice in a row.
+
+  Why confirmation instead of a drop margin: the original "drop <= 2 pt"
+  rule rejected a HARMLESS edit 18-24% of the time at this pool size and
+  baseline (simulation in the dev log) -- it measured re-run noise, not
+  harm. Confirming the handful of flipped tasks costs ~4 x flips episodes
+  and separates reproducible breakage from noise, the same way the
+  stability filter separates stable failures from bad luck.
 
   Efficacy runs first (10-15 episodes); a candidate that fails it never
   spends the pool run.
@@ -54,7 +72,9 @@ class GatePolicy(BaseModel):
     alpha: float = 0.05
     min_lift: float = 0.3
     # targeted: safety
-    max_drop: float = 0.02
+    max_drop: float | None = None      # optional point-drop cap (miscalibrated at ~90% baselines)
+    confirm_k: int = 2                 # re-runs per flipped task, per version
+    max_confirmed_regressions: int = 1
     # superiority
     min_delta: float = 0.0
     # both
@@ -90,6 +110,9 @@ class GateVerdict(BaseModel):
     improvements: list[int]
     episodes: int
     stopped_early: bool = False
+    confirmed_regressions: list[int] = []
+    confirmed_fixes: list[int] = []
+    confirm_episodes: int = 0
     rows_path: str
 
 
@@ -147,13 +170,25 @@ def _verdict(**kw) -> GateVerdict:
 async def gate(candidate: ContextVersion, incumbent_rows: list[dict], pool: list[int], *,
                split: str, out: str | Path, provider: Any, user_llm: Any, store: Any,
                policy: GatePolicy = GatePolicy(), targets: list[tuple[int, str, int, int]] = (),
-               concurrency: int = 4, log: Callable[[str], None] = print) -> GateVerdict:
+               concurrency: int = 4, log: Callable[[str], None] = print,
+               incumbent: ContextVersion | None = None,
+               prior_efficacy: Efficacy | None = None) -> GateVerdict:
+    """`incumbent` enables flip confirmation (re-runs under the incumbent);
+    `prior_efficacy` reuses an efficacy result instead of re-running it
+    (re-gating a candidate under a revised policy)."""
     if candidate.token_size() > policy.max_ctx_tokens:
         return _verdict(accepted=False, mode=policy.mode, rows_path=str(out),
                         reason=f"context too large ({candidate.token_size()} tokens)")
     episodes = 0
     eff = None
-    if policy.mode == "targeted":
+    if policy.mode == "targeted" and prior_efficacy is not None:
+        eff = prior_efficacy
+        log(f"  efficacy (reused): {eff.cand_passes}/{eff.cand_n} vs null {eff.null_passes}/{eff.null_n}, "
+            f"p = {eff.p_value:.4f}")
+        if not eff.passed:
+            return _verdict(accepted=False, mode=policy.mode, efficacy=eff, rows_path=str(out),
+                            reason="no proven effect on held-out targets (reused result)")
+    elif policy.mode == "targeted":
         if not targets:
             return _verdict(accepted=False, mode=policy.mode, rows_path=str(out),
                             reason="targeted gate needs held-out target tasks")
@@ -189,22 +224,66 @@ async def gate(candidate: ContextVersion, incumbent_rows: list[dict], pool: list
     common, delta, ci, regs, imps = _compare(inc, cand, [t for t in pool if t in cand], policy)
     episodes += sum(len(cand[t]) for t in common)
 
-    if stopped or ci[1] < 0:
+    conf_regs: list[int] = []
+    conf_fixes: list[int] = []
+    conf_eps = 0
+    harmful = stopped or ci[1] < 0
+    if not harmful and incumbent is not None and policy.confirm_k > 0 and (regs or imps):
+        conf_regs, conf_fixes, conf_eps = await confirm_flips(
+            candidate, incumbent, regs, imps, split=split, out=Path(out), k=policy.confirm_k,
+            provider=provider, user_llm=user_llm, store=store, concurrency=concurrency, log=log)
+        episodes += conf_eps
+        log(f"  confirmation: {len(conf_regs)}/{len(regs)} regressions and "
+            f"{len(conf_fixes)}/{len(imps)} fixes reproduce")
+
+    if harmful:
         ok, why = False, f"significantly worse on the pool: CI upper bound {ci[1]:+.3f} < 0"
     elif policy.regression_budget is not None and len(regs) > policy.regression_budget:
         ok, why = False, f"{len(regs)} regressions > budget {policy.regression_budget}"
-    elif policy.mode == "targeted" and delta < -policy.max_drop:
+    elif policy.max_drop is not None and policy.mode == "targeted" and delta < -policy.max_drop:
         ok, why = False, f"pool drop {delta:+.3f} exceeds {policy.max_drop:.2f}"
+    elif len(conf_regs) > policy.max_confirmed_regressions:
+        ok, why = False, (f"{len(conf_regs)} confirmed regressions (tasks {conf_regs}) > "
+                          f"{policy.max_confirmed_regressions}: the breakage reproduces")
     elif policy.mode == "superiority" and ci[0] <= policy.min_delta:
         ok, why = False, f"CI lower bound {ci[0]:+.3f} <= {policy.min_delta:+.3f}"
     else:
         ok = True
+        conf = (f"; {len(conf_regs)} of {len(regs)} regressions reproduce"
+                if incumbent is not None and policy.confirm_k > 0 and regs else "")
         why = (f"targets {eff.cand_passes}/{eff.cand_n} vs null {eff.null_passes}/{eff.null_n} "
-               f"(p = {eff.p_value:.3f}); pool delta {delta:+.3f}, CI [{ci[0]:+.3f}, {ci[1]:+.3f}]"
-               if eff else f"pool delta {delta:+.3f}, CI [{ci[0]:+.3f}, {ci[1]:+.3f}]")
+               f"(p = {eff.p_value:.3f}); pool delta {delta:+.3f}, CI [{ci[0]:+.3f}, {ci[1]:+.3f}]{conf}"
+               if eff else f"pool delta {delta:+.3f}, CI [{ci[0]:+.3f}, {ci[1]:+.3f}]{conf}")
     sub_inc = {t: inc[t] for t in common}
     sub_cand = {t: cand[t] for t in common}
     return _verdict(accepted=ok, reason=why, mode=policy.mode, efficacy=eff, n_tasks=len(common),
                     delta=delta, ci=ci, incumbent_pass1=pooled_pass1(sub_inc)[0],
                     candidate_pass1=pooled_pass1(sub_cand)[0], regressions=regs, improvements=imps,
-                    episodes=episodes, stopped_early=stopped, rows_path=str(out))
+                    episodes=episodes, stopped_early=stopped, confirmed_regressions=conf_regs,
+                    confirmed_fixes=conf_fixes, confirm_episodes=conf_eps, rows_path=str(out))
+
+
+def confirm_paths(out: Path) -> tuple[Path, Path]:
+    """Separate files, so the gate's own rows stay one trial per task (they
+    become the next version's incumbent rows)."""
+    return (out.with_name(out.stem + "_confirm_candidate.json"),
+            out.with_name(out.stem + "_confirm_incumbent.json"))
+
+
+async def confirm_flips(candidate: ContextVersion, incumbent: ContextVersion, regs: list[int],
+                        imps: list[int], *, split: str, out: Path, k: int, provider: Any,
+                        user_llm: Any, store: Any, concurrency: int = 4,
+                        log: Callable[[str], None] = print) -> tuple[list[int], list[int], int]:
+    flips = sorted(set(regs) | set(imps))
+    c_out, i_out = confirm_paths(out)
+    c_rows = await run_batch(split, flips, k, c_out, ctx=candidate, provider=provider, user_llm=user_llm,
+                             store=store, concurrency=concurrency, log=log, trial_offset=1)
+    i_rows = await run_batch(split, flips, k, i_out, ctx=incumbent, provider=provider, user_llm=user_llm,
+                             store=store, concurrency=concurrency, log=log, trial_offset=1)
+    c, i = per_task_rewards(c_rows), per_task_rewards(i_rows)
+    passed = lambda v: [r >= 1.0 for r in v]  # noqa: E731
+    conf_regs = [t for t in regs if c.get(t) and i.get(t)
+                 and not any(passed(c[t])) and all(passed(i[t]))]
+    conf_fixes = [t for t in imps if c.get(t) and i.get(t)
+                  and all(passed(c[t])) and not any(passed(i[t]))]
+    return conf_regs, conf_fixes, sum(len(v) for v in c.values()) + sum(len(v) for v in i.values())

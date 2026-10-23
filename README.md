@@ -37,7 +37,8 @@ Most agent frameworks make it easy to *run* an agent and hard to answer the ques
 | **Same benchmark inside rewind** — τ-bench test, 3 trials, rewind loop vs τ-bench's own `run.py` | pass^1 73.3% vs 72.2%, 95% CI [−3.5%, +5.8%]: indistinguishable (two `run.py` runs differ by [−8.4%, +5.5%]) |
 | **Fork fidelity** — replay each fork with the parent's recorded model and user replies, hash-check every request | 391/391 fork points byte-identical on 40 τ-bench tasks (offline scripted episodes; the same check runs on real traces via `scripts/taubench_fork_fidelity.py`) — after fixing a bug where restored DB records came back with sorted keys and forked agents saw different tool output |
 | **Null-fork calibration** — 20 parents × 4 fork points × 5 continuations | passing parents re-pass 86–96%; failing parents split into *stable* failures (≤1/5 pass) and *flaky* ones (mostly pass) — only stable ones are worth an edit |
-| **Evolve, first real edit** — LLM-written rule on train (v0 pass^1 89.5%) | proven effect on 3 held-out stable failures (0/15 → 6/15, Fisher p = 0.008) but **rejected by the safety gate**: 188 unseen tasks, −3.7 pt, 12 broken — all 12 on the item-changing tools the rule touches (0.5% chance if random) |
+| **Evolve, first real edit** — LLM-written rule on train (v0 pass^1 89.5%) | proven effect on 3 held-out stable failures (0/15 → 6/15, Fisher p = 0.008); rejected by the original safety rule (188 unseen tasks, −3.7 pt, 12 broken vs 5 fixed). A later audit showed that rule was miscalibrated (next row), so the harm is **unresolved**: sign test p = 0.07, CI [−8.0, +0.5] pt |
+| **Gate audit** — simulated harmless edits, per-task flakiness fitted to the null-fork data | the "≤ 2 pt drop" rule rejected 18–24% of harmless edits. Replaced by flip confirmation (re-run flipped tasks under both versions): ~3% false rejections, ~99% power against 5 truly broken tasks |
 
 The τ-bench evaluation and the Evolve gate are the parts I would point to first: the obvious single-run story ("my patch improved pass^1 by 2 points") turned out not to hold up once the noise floor was measured. The full write-up is in the [dev log](docs/DEVLOG.zh-CN.md).
 
@@ -103,10 +104,10 @@ One round, run with `scripts/run_evolve.py` (`plan`, `round`, `gate-pending`, `s
 6. **Offline checks** reject case-specific text (order ids, emails, …), unknown tools, oversize context.
 7. **Fork screen** on B against each task's own null-fork rate.
 8. **Gate, efficacy**: fresh forks of B under the candidate vs their null passes, one-sided Fisher test.
-9. **Gate, safety**: all never-shown tasks, paired with the incumbent; not significantly worse and not more than 2 pt down.
-10. **Commit** to a SQLite ledger (versions, every decision and its numbers) or reject with the reason.
+9. **Gate, safety**: all never-shown tasks, paired with the incumbent: not significantly worse; then every task that flipped is re-run twice under both versions, and an edit is rejected if more than one breakage reproduces (incumbent passes every re-run, candidate fails every re-run).
+10. **Commit** to a SQLite ledger (versions, every decision and its numbers) or reject with the reason. A rejection carries feedback — where the broken tasks concentrate and one before/after example — that the proposer sees on its next attempt at the same cluster (`retry`).
 
-Every phase checks a worst-case episode budget before spending; `plan` prints the cost of a round without calling any API. The first real round is written up in the dev log: the gate stopped an edit that genuinely fixed its target failures but broke 12 tasks of the same kind.
+Every phase checks a worst-case episode budget before spending; `plan` prints the cost of a round without calling any API. `viewer/index.html` (no server, no network) shows every round's decisions and lets you open any task the gate saw flip, side by side under the old and new context, with the first differing tool call highlighted. The first real round is written up in the dev log: the gate stopped an edit that genuinely fixed its target failures but broke 12 tasks of the same kind.
 
 ## Quickstart
 
@@ -164,6 +165,9 @@ python scripts/run_evolve.py plan  --base runs/p1/train_base.json     # free: cl
 python scripts/run_evolve.py round --base runs/p1/train_base.json --budget 260
 python scripts/run_evolve.py status                                    # free: versions and decisions
 python scripts/evolve_gate_report.py                                   # free: explain the last gate decision
+python scripts/run_evolve.py retry                                     # re-propose for a cluster, with feedback
+python scripts/run_evolve.py regate                                    # re-decide old rejections under the current gate
+python scripts/export_viewer.py --run-dir runs/p1                      # free: then open viewer/index.html
 ```
 
 ### Running the infrastructure tests
@@ -200,7 +204,9 @@ Connection strings can be overridden with `REWIND_PG_DSN` and `REWIND_REDIS_URL`
 - **Measure the noise floor before claiming an improvement.** All τ-bench comparisons use the same protocol, report flips in both directions, and use multi-trial paired bootstrap confidence intervals.
 - **Check that a fork sees exactly what its parent saw, not just that it grades the same.** The key-order bug passed every outcome-level test (the grader hashes order-insensitively) and was only caught by null-fork calibration; the fidelity check now hash-verifies every model request of a forked continuation, for free.
 - **Only optimise failures that reproduce.** Half the failed parents in calibration passed most null forks. Writing rules for those would "fix" randomness and fool the screen.
-- **A targeted gate, not a whole-pool superiority test.** At a ~90% baseline a 9-task cluster moves pass^1 by ~2.5 pt — below what one trial over ~190 tasks can resolve — and a no-op re-run already "breaks" several passing tasks. So the gate asks two separate questions: is there an effect on held-out targets (Fisher test), and is there no significant harm elsewhere (paired CI)? Raw regression counts are reported but not a veto.
+- **A targeted gate, not a whole-pool superiority test.** At a ~90% baseline a 9-task cluster moves pass^1 by ~2.5 pt — below what one trial over ~190 tasks can resolve — and a no-op re-run already "breaks" several passing tasks. So the gate asks separate questions: is there an effect on held-out targets (Fisher test), and is there no harm elsewhere?
+- **Calibrate the gate against noise before trusting its verdicts.** My first safety rule ("drop ≤ 2 pt") looked reasonable and rejected the first real edit; simulating harmless edits showed it rejects ~1 in 5 of them. The replacement re-runs only the flipped tasks and asks whether the breakage reproduces — the same stable-vs-flaky idea as the stability filter. A first version of that rule was itself miscalibrated (13% false rejections on coin-flip tasks) and was tightened after simulation.
+- **Rules must say when they apply.** Every learned rule carries a trigger and is written as "When …: …"; a rule about one tool must be a note on that tool. Blanket instructions are refused before any episode is spent.
 
 ## Project layout
 
@@ -213,7 +219,8 @@ src/rewind/
   dist/                               Postgres coordinator, Redis gateway and event stream, Toxiproxy, invariants
   flywheel/                           failure classification, attribution, data flywheel, τ-bench failure analysis
   env/                                offline toy retail env, τ-bench adapter, real multi-turn τ-bench episodes
-  evolve/                             self-improvement: surface, prevalence, stability, proposer, screen, gate, ledger, loop
+  evolve/                             self-improvement: surface, prevalence, stability, proposer, screen, gate, feedback, ledger, loop
+viewer/index.html                     offline viewer: rounds, versions, gate decisions, side-by-side episode comparison
 scripts/                              experiments, τ-bench runs and comparisons, CI entry points
 tests/                                pytest + hypothesis; τ-bench and infra tiers skip themselves when unavailable
 docs/DEVLOG.zh-CN.md                  detailed design notes and experiment log (Chinese)
@@ -240,7 +247,7 @@ Module docstrings refer to the milestones the project was built in:
 I have tried to be explicit about what is and isn't demonstrated:
 
 - The W7 attribution accuracy (100%) uses **synthetic** ground truth. Real failures are non-monotonic and noisy, so real accuracy will be lower.
-- Evolve has run **one real round** so far, and its only gated edit was rejected. The safety check uses one trial over ~190 tasks, so it can only see harm of roughly 4–5 pt or more; the efficacy check has 2–3 target tasks, so only a strong effect can pass. Both are stated limits, not tuned away.
+- Evolve has run **one real round** so far; its only gated edit was rejected by a rule later shown to be miscalibrated, so whether that edit was harmful is open (`run_evolve.py regate` can settle it for ~70 episodes). The efficacy check has 2–3 target tasks, so only a strong effect can pass; flip confirmation catches reproducible breakage but not a diffuse small drop spread over many tasks.
 - Evolve edits only the agent's context (learned policy lines, tool notes). The proposer cannot write code, and model weights are never trained.
 - The W8 data flywheel runs on a **deterministic heuristic policy**, not a real LLM. It validates the mechanics (split → classify → cluster → gate → merge), and its candidate fixes come from a fixed lookup table.
 - Replay, fork, and checkpoint CLI commands work on the toy environment. The τ-bench adapter supports snapshot and restore but isn't wired into those commands yet.
