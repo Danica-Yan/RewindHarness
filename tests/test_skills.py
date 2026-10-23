@@ -140,6 +140,8 @@ def test_groups_and_induction_from_passing_episodes():
 
     async def llm(messages):
         assert "Successful conversation 1" in messages[1]["content"]
+        assert "=== The agent's policy ===" in messages[1]["content"]
+        assert "Exchange or modify order tools can only be called once" in messages[1]["content"]
         tool = messages[1]["content"].split("`")[1]
         return json.dumps({"name": f"do_{tool}"[:40], "description": f"The customer needs {tool} done for them.",
                            "steps": ["Authenticate the customer first.", f"Call {tool} after a yes."],

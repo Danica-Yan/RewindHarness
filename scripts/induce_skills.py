@@ -126,6 +126,8 @@ def main() -> None:
                 for i, s in enumerate(body.get("steps") or [], 1):
                     print(f"    {i}. {s}")
         cand_path.parent.mkdir(parents=True, exist_ok=True)
+        if cand_path.exists():  # keep the previous induction for comparison
+            cand_path.replace(cand_path.with_name("candidates.prev.json"))
         cand_path.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
         print(f"\nwrote {cand_path}; review it, edit or drop skills by hand if you like, then run `gate`")
         return
