@@ -161,12 +161,18 @@ function viewRounds() {
   return h || `<div class="empty">No decisions in this file.</div>`;
 }
 
+function guardText(d) {
+  return d.guard === "policy_check" ? `policy ${d.check}: ${d.action} — ${d.reason}` : d.guard;
+}
+
 function viewVersions() {
   let h = "";
   for (const v of S.data.versions) {
     h += `<div class="card"><b>v${v.version}</b> <span class="muted">${v.parent == null ? "baseline" : "from v" + v.parent}</span>`;
     const rows = [...Object.entries(v.rules).map(([k, t]) => [k, t]),
-                  ...Object.entries(v.tool_notes).map(([k, t]) => ["note on " + k, t])];
+                  ...Object.entries(v.tool_notes).map(([k, t]) => ["note on " + k, t]),
+                  ...Object.entries(v.checks || {}).map(([k, c]) => ["check " + k,
+                    `${c.condition} ${JSON.stringify(c.params)} on ${c.tools.join(", ")} — "${c.message}"`])];
     h += rows.length ? `<table class="rules">` + rows.map(([k, t]) => `<tr><td>${esc(k)}</td><td>${esc(t)}</td></tr>`).join("") + `</table>`
       : `<div class="muted">no learned rules — the benchmark's own context</div>`;
     h += `</div>`;
@@ -259,7 +265,7 @@ function traceToEpisode(text, name) {
       } else if (m.role === "tool") items.push({ ...base, kind: "result", text: String(m.content), error: !!m.is_error || /^(Error|ERROR)/.test(String(m.content)) });
       else if (m.role === "user") items.push({ ...base, kind: "user", text: m.content });
     } else if (e.type === "user_turn" && d.done) items.push({ ...base, kind: "stop" });
-    else if (e.type === "guard") items.push({ ...base, kind: "guard", text: d.guard });
+    else if (e.type === "guard") items.push({ ...base, kind: "guard", text: guardText(d) });
     else if (e.type === "run_end") items.push({ ...base, kind: "end", status: d.status, reason: d.reason });
   }
   return { run_id: lines[0]?.run_id || name, path: name, parent_run_id: start.parent_run_id, fork_step: start.fork_step, items };

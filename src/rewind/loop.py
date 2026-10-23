@@ -9,8 +9,9 @@ from __future__ import annotations
 import asyncio
 import copy
 import random
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from .events import Event
 from .providers import LLMResponse, MalformedOutput, ProviderError, ToolCall
@@ -74,7 +75,7 @@ class Checkpointer(Protocol):
     await network I/O here; the sqlite-backed one just returns immediately."""
 
     async def save(self, kind: str, step: int, trace: TraceWriter, env: Any,
-                   messages: list[dict], state: "LoopState",
+                   messages: list[dict], state: LoopState,
                    action: LLMResponse | None = None) -> None: ...
 
 
@@ -94,7 +95,7 @@ class LoopState:
         self.consecutive_invalid = self.consecutive_invalid + 1 if error_class in ARG_ERRORS else 0
 
     @classmethod
-    def from_events(cls, events: list[Event]) -> "LoopState":
+    def from_events(cls, events: list[Event]) -> LoopState:
         st = cls()
         for e in events:
             if e.type == "llm_call" and "response" in e.data:
@@ -356,7 +357,7 @@ class AgentRunner:
 
         if len(readonly) >= 2:
             results = await asyncio.gather(
-                *(self._tool_step(env, c, step, i, state, trace, rng) for i, c in readonly))
+                *(self._tool_step(env, c, step, i, state, trace, rng, pre_tool_messages) for i, c in readonly))
             for (i, _c), outcome in zip(readonly, results):
                 outcomes[i] = outcome
             self.debug_hook("after_readonly_batch", step)
@@ -365,14 +366,14 @@ class AgentRunner:
                                              action=resp)
         else:
             for i, c in readonly:
-                outcomes[i] = await self._tool_step(env, c, step, i, state, trace, rng)
+                outcomes[i] = await self._tool_step(env, c, step, i, state, trace, rng, pre_tool_messages)
                 if self.checkpointer is not None:
                     await self.checkpointer.save("tool", step, trace, env, pre_tool_messages, state,
                                                  action=resp)
                 self.debug_hook("after_tool_call", step)
 
         for i, c in mutating:
-            outcomes[i] = await self._tool_step(env, c, step, i, state, trace, rng)
+            outcomes[i] = await self._tool_step(env, c, step, i, state, trace, rng, pre_tool_messages)
             if self.checkpointer is not None:
                 await self.checkpointer.save("tool", step, trace, env, pre_tool_messages, state,
                                              action=resp)
@@ -380,8 +381,27 @@ class AgentRunner:
 
         return outcomes
 
+    def _policy_block(self, env, call: ToolCall, step: int, history: list[dict] | None,
+                      trace: TraceWriter) -> ToolOutcome | None:
+        """Run the registry's policy checks on a call. Returns the blocking
+        outcome (the call is then NOT executed), or None to proceed. Every
+        failing check is recorded as a guard event, including observe-only
+        checks and blocks waived because the check's per-episode budget ran
+        out, so a trace shows exactly what the policy did."""
+        policy = getattr(self.registry, "policy", None)
+        if not policy or history is None:
+            return None
+        blocked = None
+        for d in policy.evaluate(getattr(env, "data", {}) or {}, call.name, call.args, history,
+                                 self.registry.is_mutating):
+            trace.emit("guard", step, {"guard": "policy_check", "check": d.check_id,
+                                       "action": d.action, "reason": d.reason, "call_id": call.id})
+            if d.action == "block" and blocked is None:
+                blocked = ToolOutcome(False, d.message, "POLICY_BLOCKED")
+        return blocked
+
     async def _tool_step(self, env, call: ToolCall, step: int, idx: int, state: LoopState,
-                         trace: TraceWriter, rng) -> ToolOutcome:
+                         trace: TraceWriter, rng, history: list[dict] | None = None) -> ToolOutcome:
         cfg = self.cfg
         args_hash = sha(call.args)
         n = state.bump_call(call.name, args_hash)
@@ -402,6 +422,8 @@ class AgentRunner:
             outcome = ToolOutcome(
                 False, f"you have called {call.name} with identical arguments {n} times. "
                        "Change your approach or give a final answer.", "LOOP_DETECTED")
+        elif (blocked := self._policy_block(env, call, step, history, trace)) is not None:
+            outcome = blocked
         else:
             attempt = 0
             while True:

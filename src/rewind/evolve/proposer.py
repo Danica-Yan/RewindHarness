@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Awaitable, Callable, Protocol
+from collections.abc import Awaitable, Callable
+from typing import Protocol
 
 from ..env.taubench_dialogue import load_task
 from .surface import ContextVersion, Edit
@@ -27,14 +28,21 @@ SYSTEM = """You improve a retail customer-service agent by editing its context, 
 You see failures that share one pattern. Propose GENERAL policy fixes that would prevent this
 pattern on unseen customers and orders.
 
-You may propose two kinds of edits:
+You may propose three kinds of edits:
 - "tool_note": a note on ONE tool's description (target = the exact tool name). The agent sees it only
   when it considers that tool. PREFER THIS whenever the failure is about how one tool is used.
 - "rule": a policy line in the agent's instructions (target = a short snake_case id), only for
   behaviour that spans several tools or the whole conversation.
-Ops: "add", "replace" (an existing rule id / tool note), "delete".
+- "check": a policy enforced IN CODE before a tool call runs (target = a short snake_case id). Use it
+  when the failure is a WRONG ACTION that a mechanical condition would have stopped (a write without
+  the user's yes, acting before authenticating, mismatched arguments). The agent gets the check's
+  message as the tool error and can correct itself. It cannot help when the agent failed to act at all.
+  Its "text" is a JSON object: {"tools": [tool names it guards], "condition": <one of the conditions
+  below>, "params": {...}, "message": "<what the agent is told>"}; no "trigger" needed. Conditions:
+@CONDITIONS@
+Ops: "add", "replace" (an existing rule id / tool note / check id), "delete".
 
-Every edit has a "trigger": the specific situation it applies to ("the customer asks to change an
+Every rule and tool_note has a "trigger": the specific situation it applies to ("the customer asks to change an
 item's options to an empty set"). It is written as "When <trigger>: <text>". Make the trigger as
 NARROW as the evidence allows -- rules that change behaviour beyond their situation break other tasks.
 
@@ -46,6 +54,21 @@ Hard requirements:
 - If a previous edit for this pattern was rejected with feedback, address that feedback explicitly.
 Return JSON: {"edits": [{"kind": ..., "target": ..., "op": ..., "trigger": ..., "text": ...,
 "rationale": ...}]}"""
+
+CONDITION_DOCS = {
+    "user_confirmed": 'params {"max_writes": 1}: the latest user message is an explicit yes answering the '
+                      "agent's last words, used by at most max_writes successful writes",
+    "authenticated_owner": 'params {"auth_tools": [...], "owners": {"<arg>": ["<collection>", "<owner field>"] '
+                           "or null if the arg is the user id}}: exactly one user authenticated via auth_tools, "
+                           "and the object the call acts on is theirs",
+    "called_before": 'params {"tool": "<name>", "same_args": ["<arg>", ...]}: that tool succeeded earlier '
+                     "with the same values for those arguments",
+    "args_same_length": 'params {"a": "<list arg>", "b": "<list arg>"}: the two list arguments have equal length',
+    "arg_in": 'params {"arg": "<name>", "values": [...]}: the argument is one of the values',
+    "state_field_in": 'params {"collection": "orders|users|products", "key_arg": "<arg>", "field": "<field>", '
+                      '"values": [...]}: the record the argument points to has one of these values',
+}
+SYSTEM = SYSTEM.replace("@CONDITIONS@", "\n".join(f"  * {k}: {v}" for k, v in CONDITION_DOCS.items()))
 
 
 class Proposer(Protocol):
@@ -75,10 +98,12 @@ def _excerpt(traj: list[dict], max_msgs: int = 14, max_chars: int = 300) -> list
 def build_messages(cluster_key: str, evidence: list[dict], split: str, ctx: ContextVersion,
                    rejected: list[dict], n: int, tool_names: list[str]) -> list[dict]:
     parts = [f"Failure pattern: {cluster_key}", f"Tools: {', '.join(tool_names)}", ""]
-    if ctx.rules or ctx.tool_notes:
+    if ctx.rules or ctx.tool_notes or ctx.checks:
         parts.append("Current learned rules:")
         parts += [f"- [{k}] {v}" for k, v in ctx.rules.items()]
         parts += [f"- [tool_note {k}] {v}" for k, v in ctx.tool_notes.items()]
+        parts += [f"- [check {k}] " + json.dumps({x: c[x] for x in ("tools", "condition", "params", "message")})
+                  for k, c in ctx.checks.items()]
         parts.append("")
     if rejected:
         parts.append("Already tried and rejected (do not repeat):")
@@ -115,8 +140,11 @@ def parse_edits(text: str, cluster_key: str, evidence_tasks: list[int]) -> list[
     out = []
     for d in (data.get("edits") or []) if isinstance(data, dict) else []:
         try:
+            text = d.get("text")
+            if d.get("kind") == "check" and isinstance(text, dict):
+                text = json.dumps(text, ensure_ascii=False)
             out.append(Edit(kind=d["kind"], target=str(d["target"]).strip(), op=d.get("op", "add"),
-                            text=d.get("text"), trigger=d.get("trigger"),
+                            text=text, trigger=d.get("trigger"),
                             rationale=d.get("rationale", ""),
                             source_cluster=cluster_key, evidence_tasks=evidence_tasks))
         except Exception:  # malformed item: skip it, keep the rest

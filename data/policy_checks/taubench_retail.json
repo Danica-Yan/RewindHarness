@@ -1,0 +1,29 @@
+[
+  {
+    "id": "confirm_before_write",
+    "tools": ["cancel_pending_order", "exchange_delivered_order_items", "modify_pending_order_address",
+              "modify_pending_order_items", "modify_pending_order_payment", "modify_user_address",
+              "return_delivered_order_items"],
+    "condition": "user_confirmed",
+    "params": {"max_writes": 1},
+    "message": "Policy: before a consequential action, list the action details and get an explicit yes from the user, then call the tool."
+  },
+  {
+    "id": "act_for_authenticated_user",
+    "tools": ["cancel_pending_order", "exchange_delivered_order_items", "modify_pending_order_address",
+              "modify_pending_order_items", "modify_pending_order_payment", "modify_user_address",
+              "return_delivered_order_items", "get_order_details", "get_user_details"],
+    "condition": "authenticated_owner",
+    "params": {"auth_tools": ["find_user_id_by_email", "find_user_id_by_name_zip"],
+               "owners": {"order_id": ["orders", "user_id"], "user_id": null}},
+    "message": "Policy: authenticate the user first (email, or name + zip code), help only that one user, and only with their own orders."
+  },
+  {
+    "id": "check_order_before_write",
+    "tools": ["cancel_pending_order", "exchange_delivered_order_items", "modify_pending_order_address",
+              "modify_pending_order_items", "modify_pending_order_payment", "return_delivered_order_items"],
+    "condition": "called_before",
+    "params": {"tool": "get_order_details", "same_args": ["order_id"]},
+    "message": "Policy: look up the order's details (status, items, payment) before changing it."
+  }
+]

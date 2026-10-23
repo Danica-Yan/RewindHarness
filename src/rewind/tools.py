@@ -55,6 +55,10 @@ def _fmt_validation(e: ValidationError) -> str:
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
+        # Optional rewind.policy.PolicySet: checks the agent loop runs before
+        # executing a call (kept on the registry so every path that builds an
+        # agent -- run, fork, replay, the Evolve gate -- carries it along).
+        self.policy: Any = None
 
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool

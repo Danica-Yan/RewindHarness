@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from rewind.trace import load_trace  # noqa: E402
+from rewind.trace import load_trace
 
 LEARNED = "## Additional policies (learned)"
 
@@ -60,7 +60,10 @@ def compact_episode(trace_path: str, max_chars: int = 1500) -> dict | None:
         elif e.type == "user_turn" and d.get("done"):
             items.append({**base, "kind": "stop"})
         elif e.type == "guard":
-            items.append({**base, "kind": "guard", "text": d.get("guard")})
+            text = d.get("guard")
+            if text == "policy_check":
+                text = f"policy {d.get('check')}: {d.get('action')} -- {d.get('reason')}"
+            items.append({**base, "kind": "guard", "text": text})
         elif e.type == "llm_call" and d.get("error"):
             items.append({**base, "kind": "guard", "text": f"LLM error: {d['error'].get('class')}"})
         elif e.type == "run_end":
@@ -104,7 +107,8 @@ def main() -> None:
             "SELECT version, parent, ctx_json, edits_json, rows_path, verdict_json FROM versions ORDER BY version"):
         ctx = json.loads(cj)
         versions.append({"version": v, "parent": parent, "rules": ctx.get("rules", {}),
-                         "tool_notes": ctx.get("tool_notes", {}), "edits": json.loads(ej),
+                         "tool_notes": ctx.get("tool_notes", {}), "checks": ctx.get("checks", {}),
+                         "edits": json.loads(ej),
                          "rows_path": rows_path})
     rows_path = {v["version"]: v["rows_path"] for v in versions}
 
@@ -117,6 +121,9 @@ def main() -> None:
              "reason": reason, "cluster": cluster, "edit": json.loads(ej) if ej else None}
         if stage == "screen":
             d["screen"] = {"tasks": data.get("tasks", []), "forks": data.get("forks")}
+        if stage == "backtest":
+            d["backtest"] = {k: data.get(k) for k in ("fires_on_passing_calls", "false_fire_rate", "catches",
+                                                       "cluster_caught", "examples")}
         if stage == "stability":
             d["split"] = {"A": data.get("A"), "B": data.get("B")}
         if stage == "gate":

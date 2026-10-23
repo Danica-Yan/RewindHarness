@@ -12,8 +12,9 @@ reaches the gate per round (the gate is the expensive step).
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -23,7 +24,14 @@ from .prevalence import PrevalencePolicy, clusters, describe, eligible, evidence
 from .runner import load_rows, version_setup
 from .screen import ScreenPolicy, screen
 from .stability import assess_failures
-from .surface import validate_edit
+from .surface import parse_check, validate_edit
+
+
+class BacktestPolicy(BaseModel):
+    """Zero-cost filter for `check` edits, run on the incumbent's recorded
+    episodes before any screening fork is spent."""
+    max_false_fire_rate: float = 0.02   # fires / guarded calls, in episodes that passed
+    min_cluster_catches: int = 1        # this cluster's failed episodes with an off-gold fire
 
 
 class EvolveConfig(BaseModel):
@@ -39,6 +47,7 @@ class EvolveConfig(BaseModel):
     max_members_per_cluster: int = 10   # stability is assessed on at most this many
     budget_episodes: int = 300          # hard cap on episodes (runs + forks) per round
     concurrency: int = 4
+    backtest: BacktestPolicy = Field(default_factory=BacktestPolicy)
 
 
 class RoundReport(BaseModel):
@@ -210,6 +219,29 @@ def _record_gate(ledger: EditLedger, round_no: int, inc: Any, e: Any, v: Any, ro
     return did
 
 
+def backtest_edit(cfg: EvolveConfig, e: Any, rows: list[dict], store: Any,
+                  cluster_tasks: set[int]) -> tuple[bool, str, dict]:
+    """Replay a proposed check over the incumbent's recorded episodes (no API):
+    it must stay quiet where the agent succeeded and fire on at least one of
+    this cluster's failures, on a call the gold solution does not make."""
+    from ..policy import PolicySet
+    from .backtest import taubench_backtest
+    chk = parse_check(e).model_copy(update={"mode": "block"})
+    rep = taubench_backtest(PolicySet([chk]), rows, store=store, split=cfg.split)
+    s = rep.stats[chk.id]
+    caught = sorted({t for t, _ in s.episodes_failing_caught} & cluster_tasks)
+    data = {**s.summary(rep.n_pass, rep.n_fail), "cluster_caught": caught,
+            "skipped": len(rep.skipped), **rep.to_json(max_examples=3)}
+    if rep.n_pass + rep.n_fail < max(1, len(rows) // 2):
+        return False, f"only {rep.n_pass + rep.n_fail}/{len(rows)} episodes have traces + snapshots", data
+    p = cfg.backtest
+    why = (f"fires on {s.fires_passing}/{s.guarded_calls_passing} calls in passing episodes "
+           f"({s.false_fire_rate:.1%}, max {p.max_false_fire_rate:.0%}); catches {len(caught)} of this "
+           f"cluster's failures (need {p.min_cluster_catches}), {s.fires_failing_off_gold} off-gold calls "
+           f"overall")
+    return s.false_fire_rate <= p.max_false_fire_rate and len(caught) >= p.min_cluster_catches, why, data
+
+
 async def _try_edits(cfg: EvolveConfig, ledger: EditLedger, round_no: int, inc: Any, rows: list[dict],
                      pool_rows: list[dict], cluster_key: str, a: list, b: list, budget: Budget,
                      rep: RoundReport, *, provider: Any, user_llm: Any, store: Any, proposer: Any,
@@ -218,7 +250,7 @@ async def _try_edits(cfg: EvolveConfig, ledger: EditLedger, round_no: int, inc: 
     True if the round must stop (a candidate was gated, or one passed
     screening but the budget cannot cover its gate)."""
     _, inc_registry = version_setup(inc)
-    tools = set(inc_registry._tools)  # noqa: SLF001
+    tools = set(inc_registry._tools)
     a_rows = evidence_rows(rows, [r.task_id for r in a])
     edits = await proposer.propose(cluster_key, a_rows, cfg.split, inc,
                                    ledger.rejected_for_prompt(cluster_key), cfg.n_candidates)
@@ -233,6 +265,12 @@ async def _try_edits(cfg: EvolveConfig, ledger: EditLedger, round_no: int, inc: 
             ledger.record(round_no, inc.version, e, "invalid", False, why, cluster=cluster_key)
             note(f"  [invalid] {e.kind} {e.target}: {why}")
             continue
+        if e.kind == "check" and e.op != "delete":
+            ok, why, data = backtest_edit(cfg, e, rows, store, {r.task_id for r in a + b})
+            ledger.record(round_no, inc.version, e, "backtest", ok, why, data, cluster=cluster_key)
+            note(f"  backtest {e.target}: {'PASS' if ok else 'fail'} -- {why}")
+            if not ok:
+                continue
         cost = len(b_tasks) * cfg.screen.n
         if not budget.can(cost):
             note(f"budget: screening needs <= {cost}, {budget.left} left -- stop")
@@ -240,7 +278,8 @@ async def _try_edits(cfg: EvolveConfig, ledger: EditLedger, round_no: int, inc: 
         cand = inc.apply(e, known_tools=tools).model_copy(
             update={"version": ledger.next_version_number(), "parent": inc.version})
         cand_cfg, cand_reg = version_setup(cand)
-        note(f"  screening {e.kind} {e.target}: {cand.rules.get(e.target) or cand.tool_notes.get(e.target)!r}")
+        shown = cand.rules.get(e.target) or cand.tool_notes.get(e.target) or cand.checks.get(e.target)
+        note(f"  screening {e.kind} {e.target}: {shown!r}")
         sr = await screen([e.edit_id], b_tasks, system_prompt=cand_cfg.system_prompt,
                           registry=cand_reg, store=store, provider=provider, user_llm=user_llm,
                           policy=cfg.screen, log=log)
@@ -280,6 +319,7 @@ def retry_candidates(ledger: EditLedger, cfg: EvolveConfig) -> list[dict]:
     """Clusters at the current version whose A/B split exists and that have no
     accepted edit yet, with their attempt count (proposer batches so far)."""
     import re
+
     from .stability import load_records
     v = ledger.current().version
     stab = load_records(_paths(cfg)["stability"])
@@ -399,7 +439,7 @@ async def regate(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, user_l
             else _pool(rows, ledger.shown())
         e = c["edit"]
         _, reg = version_setup(inc)
-        cand = inc.apply(e, known_tools=set(reg._tools)).model_copy(  # noqa: SLF001
+        cand = inc.apply(e, known_tools=set(reg._tools)).model_copy(
             update={"version": ledger.next_version_number(), "parent": inc.version})
         log(f"re-gating {e.kind} {e.target} (decision {c['decision_id']}): was '{old['reason']}'")
         v = await gate(cand, rows, pool, split=cfg.split, out=Path(old["rows_path"]), provider=provider,
@@ -459,7 +499,7 @@ async def gate_pending(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, 
             log(f"budget: gate needs <= {cost}, {budget.left} left -- stop")
             break
         _, reg = version_setup(inc)
-        cand = inc.apply(e, known_tools=set(reg._tools)).model_copy(  # noqa: SLF001
+        cand = inc.apply(e, known_tools=set(reg._tools)).model_copy(
             update={"version": ledger.next_version_number(), "parent": inc.version})
         log(f"gating {e.kind} {e.target}: {e.text!r} on {len(p['targets'])} targets + {len(pool)} pool tasks")
         out = _paths(cfg)["gate"] / f"v{cand.version}_{e.edit_id}.json"

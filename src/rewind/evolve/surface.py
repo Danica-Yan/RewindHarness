@@ -7,6 +7,9 @@ benchmark's own agent context:
                   to the original wiki (the wiki text itself is never edited,
                   so every learned line is visible and attributable)
 * `tool_notes` -- one note appended to a tool's description
+* `checks`     -- policy checks run in code before a tool call
+                  (`rewind.policy`); an edit's `text` is the check as JSON,
+                  its `target` the check id
 
 Edits are data (`Edit`), applied functionally (`apply` returns a new
 version), so a version is reproducible from its lineage and any version can
@@ -22,9 +25,10 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from ..policy import Check, PolicySet
 from ..tools import Tool, ToolRegistry
 
-SurfaceKind = Literal["rule", "tool_note"]
+SurfaceKind = Literal["rule", "tool_note", "check"]
 EditOp = Literal["add", "replace", "delete"]
 
 LEARNED_HEADER = "## Additional policies (learned)"
@@ -53,7 +57,7 @@ class EditError(ValueError):
     pass
 
 
-def scoped_text(edit: "Edit") -> str:
+def scoped_text(edit: Edit) -> str:
     """What is actually written into the context: the policy prefixed by its
     trigger, so the agent reads a conditional rule, never a blanket one."""
     body = (edit.text or "").strip()
@@ -69,10 +73,14 @@ class ContextVersion(BaseModel):
     parent: int | None = None
     rules: dict[str, str] = Field(default_factory=dict)       # rule id -> text (insertion order kept)
     tool_notes: dict[str, str] = Field(default_factory=dict)  # tool name -> note
+    checks: dict[str, dict] = Field(default_factory=dict)     # check id -> Check fields
 
     # -- edits -----------------------------------------------------------------
-    def apply(self, edit: Edit, *, known_tools: set[str] | None = None) -> "ContextVersion":
-        rules, notes = dict(self.rules), dict(self.tool_notes)
+    def apply(self, edit: Edit, *, known_tools: set[str] | None = None) -> ContextVersion:
+        rules, notes, checks = dict(self.rules), dict(self.tool_notes), dict(self.checks)
+        if edit.kind == "check":
+            return self._apply_check(edit, checks, known_tools).model_copy(
+                update={"rules": rules, "tool_notes": notes})
         table = rules if edit.kind == "rule" else notes
         if edit.kind == "tool_note" and known_tools is not None and edit.target not in known_tools:
             raise EditError(f"unknown tool {edit.target!r}")
@@ -93,9 +101,29 @@ class ContextVersion(BaseModel):
                 raise EditError(f"{edit.kind} {edit.target!r} does not exist")
             del table[edit.target]
         return ContextVersion(version=self.version + 1, parent=self.version,
-                              rules=rules, tool_notes=notes)
+                              rules=rules, tool_notes=notes, checks=checks)
 
-    def apply_all(self, edits: list[Edit], **kw) -> "ContextVersion":
+    def _apply_check(self, edit: Edit, checks: dict[str, dict],
+                     known_tools: set[str] | None) -> ContextVersion:
+        if edit.op == "delete":
+            if edit.target not in checks:
+                raise EditError(f"check {edit.target!r} does not exist")
+            del checks[edit.target]
+        else:
+            if (edit.op == "add") == (edit.target in checks):
+                raise EditError(f"check {edit.target!r} " + ("already exists (use replace)"
+                                                               if edit.op == "add" else "does not exist"))
+            c = parse_check(edit)
+            unknown = sorted(set(c.tools) - known_tools) if known_tools is not None else []
+            if unknown:
+                raise EditError(f"check guards unknown tool(s) {unknown}")
+            checks[edit.target] = c.model_dump()
+        return ContextVersion(version=self.version + 1, parent=self.version, checks=checks)
+
+    def policy(self) -> PolicySet:
+        return PolicySet([Check.model_validate(c) for c in self.checks.values()])
+
+    def apply_all(self, edits: list[Edit], **kw) -> ContextVersion:
         v = self
         for e in edits:
             v = v.apply(e, **kw)
@@ -110,10 +138,11 @@ class ContextVersion(BaseModel):
         return f"{base.rstrip()}\n\n{LEARNED_HEADER}\n\n{lines}\n"
 
     def patch_registry(self, reg: ToolRegistry) -> ToolRegistry:
-        if not self.tool_notes:
+        if not self.tool_notes and not self.checks:
             return reg
         out = ToolRegistry()
-        for t in reg._tools.values():  # noqa: SLF001 -- same package family, read-only use
+        out.policy = self.policy() if self.checks else getattr(reg, "policy", None)
+        for t in reg._tools.values():
             note = self.tool_notes.get(t.name)
             out.register(t if note is None else Tool(
                 name=t.name, description=f"{t.description}\n\nNote: {note}", args_model=t.args_model,
@@ -127,7 +156,8 @@ class ContextVersion(BaseModel):
         return n // 4
 
     def fingerprint(self) -> str:
-        return hashlib.sha256(json.dumps([self.rules, self.tool_notes], ensure_ascii=False)
+        parts = [self.rules, self.tool_notes] + ([self.checks] if self.checks else [])
+        return hashlib.sha256(json.dumps(parts, ensure_ascii=False)
                               .encode()).hexdigest()[:16]
 
 
@@ -139,7 +169,7 @@ _LEAK_PATTERNS = [
     (re.compile(r"\b\d{10}\b"), "item/product id"),
     (re.compile(r"\b[a-z]+_[a-z]+_\d{4}\b"), "user id"),
     (re.compile(r"[\w.+-]+@[\w-]+\.\w+"), "email"),
-    (re.compile(r"\b(task|example)\s*#?\d+", re.I), "task reference"),
+    (re.compile(r"\b(task|example)\s*#?\d+", re.IGNORECASE), "task reference"),
 ]
 
 
@@ -154,6 +184,8 @@ def validate_edit(edit: Edit, ctx: ContextVersion, *, known_tools: set[str],
     """None if the edit may be tried, else the reason it is refused before
     spending any evaluation on it."""
     both = f"{edit.text or ''} {edit.trigger or ''}"
+    if edit.kind == "check":
+        return _validate_check(edit, ctx, known_tools)
     if leak_reasons(both):
         return "looks case-specific: " + ", ".join(leak_reasons(both))
     if edit.op != "delete":
@@ -175,4 +207,34 @@ def validate_edit(edit: Edit, ctx: ContextVersion, *, known_tools: set[str],
         return str(e)
     if edit.op == "add" and nxt.token_size() > max_tokens:
         return f"context budget exceeded ({nxt.token_size()} > {max_tokens} tokens): replace or delete instead"
+    return None
+
+
+def parse_check(edit: Edit) -> Check:
+    """The check an edit carries: `text` is its JSON; `target` is its id."""
+    try:
+        raw = json.loads(edit.text or "")
+    except json.JSONDecodeError as e:
+        raise EditError(f"check text is not JSON: {e}") from e
+    if not isinstance(raw, dict):
+        raise EditError("check text must be a JSON object")
+    raw["id"] = edit.target
+    try:
+        return Check.model_validate(raw)
+    except ValueError as e:
+        raise EditError(f"invalid check: {e}") from e
+
+
+def _validate_check(edit: Edit, ctx: ContextVersion, known_tools: set[str]) -> str | None:
+    if edit.op != "delete":
+        try:
+            c = parse_check(edit)
+        except EditError as e:
+            return str(e)
+        if leak_reasons(f"{c.message} {json.dumps(c.params)}"):
+            return "looks case-specific: " + ", ".join(leak_reasons(f"{c.message} {json.dumps(c.params)}"))
+    try:
+        ctx.apply(edit, known_tools=known_tools)
+    except EditError as e:
+        return str(e)
     return None

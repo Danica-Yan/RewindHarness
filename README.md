@@ -17,6 +17,7 @@ Most agent frameworks make it easy to *run* an agent and hard to answer the ques
 - **Evaluation on a real benchmark** — DeepSeek on the τ-bench retail domain, failure classification, a targeted patch, and multi-trial bootstrap analysis.
 - **Real multi-turn episodes inside the runtime** — τ-bench's LLM user simulator is part of the env snapshot, so real conversations can be replayed and forked like any other run.
 - **Gated self-improvement (Evolve)** — failures are clustered, filtered for reproducibility with null forks, an LLM proposes context edits, and an edit ships only after proving an effect on held-out failures *and* no harm on tasks it never saw. Model weights never change.
+- **Policy checks (rules → code)** — mechanical policies (explicit yes before a write, act only for the authenticated user, look an order up before changing it) run as declarative checks before a tool executes; a blocked call never runs and the agent gets the reason back. Checks are backtested on recorded traces with zero API calls before Evolve spends any episode on them.
 
 > The Python package is named `rewind`, so the CLI and imports use that name.
 
@@ -167,6 +168,7 @@ python scripts/run_evolve.py status                                    # free: v
 python scripts/evolve_gate_report.py                                   # free: explain the last gate decision
 python scripts/run_evolve.py retry                                     # re-propose for a cluster, with feedback
 python scripts/run_evolve.py regate                                    # re-decide old rejections under the current gate
+python scripts/backtest_checks.py --results runs/p1/train_base.json --store-dir runs/p1/snapshots  # where policy checks would fire (no API)
 python scripts/export_viewer.py --run-dir runs/p1                      # free: then open viewer/index.html
 ```
 
@@ -248,7 +250,8 @@ I have tried to be explicit about what is and isn't demonstrated:
 
 - The W7 attribution accuracy (100%) uses **synthetic** ground truth. Real failures are non-monotonic and noisy, so real accuracy will be lower.
 - Evolve has run **one real round** so far and accepted **one edit** (v1), on the train split. It has not yet been evaluated on the held-out test split. Its pool delta (−3.7 pt, CI [−8.5, +0.5] in the re-gate) includes zero but is not evidence of *no* small harm. The efficacy check has 2–3 target tasks, so only a strong effect can pass; flip confirmation catches reproducible breakage but not a diffuse small drop spread over many tasks.
-- Evolve edits only the agent's context (learned policy lines, tool notes). The proposer cannot write code, and model weights are never trained.
+- Evolve edits only the agent's context (learned policy lines, tool notes) and declarative policy checks composed from a fixed condition library. The proposer cannot write code, and model weights are never trained.
+- The hand-written policy checks are tested on scripted episodes; their false-fire rate on real DeepSeek traces has not been measured yet. A backtest says where a check *would fire*, not whether the agent recovers after a block.
 - The W8 data flywheel runs on a **deterministic heuristic policy**, not a real LLM. It validates the mechanics (split → classify → cluster → gate → merge), and its candidate fixes come from a fixed lookup table.
 - Replay, fork, and checkpoint CLI commands work on the toy environment. The τ-bench adapter supports snapshot and restore but isn't wired into those commands yet.
 - Chaos tests run two processes on a single machine. Multi-host network partitions are not covered.

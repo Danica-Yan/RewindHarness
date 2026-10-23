@@ -14,6 +14,7 @@ unless its system prompt contains a specific learned rule. So:
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from pathlib import Path
 
@@ -344,3 +345,28 @@ def test_rejection_feedback_reaches_the_proposer_on_retry(setup):
     seen = good.seen_rejected[0]
     assert seen[0]["target"] == "exchanges_only" and "broke" in seen[0]["feedback"]
     assert rep2.version_to == 1 and ledger.shown() == shown_before  # no new tasks spent
+
+
+def test_checks_are_backtested_offline_before_any_fork(setup):
+    """Two proposed checks die in the zero-cost backtest: one fires on the
+    writes of passing episodes (the fake agent never asks for a yes), one
+    cannot catch this cluster at all (its agent refuses -- there is no call to
+    block). Neither costs a screening fork."""
+    store, ledger, cfg = setup
+    writes = sorted(MUTATING_TOOLS)
+    confirm = Edit(kind="check", target="confirm_before_write", op="add", text=json.dumps(
+        {"tools": writes, "condition": "user_confirmed", "params": {"max_writes": 1},
+         "message": "Get an explicit yes first."}))
+    same_len = Edit(kind="check", target="same_item_count", op="add", text=json.dumps(
+        {"tools": ["exchange_delivered_order_items"], "condition": "args_same_length",
+         "params": {"a": "item_ids", "b": "new_item_ids"}, "message": "Item lists must match."}))
+    rep = asyncio.run(run_round(cfg, ledger, provider=FakeAgent(), user_llm=fake_user, store=store,
+                                proposer=FakeProposer([confirm, same_len]), log=lambda m: None))
+    bt = {d["edit_id"]: d for d in ledger.decisions() if d["stage"] == "backtest"}
+    assert len(bt) == 2 and not any(d["accepted"] for d in bt.values())
+    reasons = {d["reason"].split(" calls")[0] for d in bt.values()}
+    assert any(r.startswith("fires on 0/") for r in reasons)            # same_item_count: quiet...
+    assert any(not r.startswith("fires on 0/") for r in reasons)        # confirm: noisy
+    assert all("catches 0 of this cluster" in d["reason"] for d in bt.values())
+    assert not [d for d in ledger.decisions() if d["stage"] == "screen"]
+    assert rep.version_to is None
