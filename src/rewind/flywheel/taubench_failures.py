@@ -57,10 +57,11 @@ from typing import Any
 from ..env.taubench_adapter import MUTATING_TOOLS
 
 CATEGORIES = (
-    "TOOL_RUNTIME_ERROR",                   # a tool call in the trajectory came back "Error: ..."
+    "TOOL_RUNTIME_ERROR",                   # a tool call came back "Error: ..." and was never recovered
     "WRONG_OUTPUT",                         # required response text missing (r_outputs < 1.0)
     "ACTION_MISMATCH_DESPITE_RIGHT_OUTPUT",  # said the right thing; final state still wrong
     "WRONG_ACTION",                         # action-only task (no required output text); state wrong
+    "EPISODE_NOT_FINISHED",                 # hit the step/time budget before the conversation ended
     "UNKNOWN",                              # reward < 1.0 but none of the above signals fired
 )
 
@@ -75,11 +76,70 @@ class TauFailureRecord:
     gt_mutating_tools: list[str] = field(default_factory=list)
     agent_mutating_tools: list[str] = field(default_factory=list)
     missing_outputs: list[str] = field(default_factory=list)
+    last_tool_error_tool: str | None = None
+    recovered_tool_errors: list[str] = field(default_factory=list)  # errors the agent got past
+
+
+# A failed call counts as recovered if a later call to the same tool -- or to
+# a tool that serves the same purpose -- succeeded. Explicit and auditable:
+# in tau-bench retail the two user lookups are interchangeable (email not on
+# file -> agent asks for name + zip), and nothing else is.
+RECOVERY_EQUIVALENTS: dict[str, set[str]] = {
+    "find_user_id_by_email": {"find_user_id_by_name_zip"},
+    "find_user_id_by_name_zip": {"find_user_id_by_email"},
+}
+
+
+@dataclass
+class ToolResult:
+    index: int
+    tool: str | None
+    content: str
+    is_error: bool
+
+
+def _tool_results(traj: list[dict[str, Any]]) -> list[ToolResult]:
+    """Every tool result in order, with the tool's name resolved from the
+    message itself (run.py records it), else its tool_call_id, else the
+    assistant call right before it (rewind's own OpenAI-format export)."""
+    by_id: dict[str, str] = {}
+    last_call: str | None = None
+    out = []
+    for i, m in enumerate(traj):
+        role = m.get("role")
+        if role == "assistant":
+            calls = m.get("tool_calls") or []
+            for c in calls:
+                name = (c.get("function") or {}).get("name")
+                if c.get("id") and name:
+                    by_id[c["id"]] = name
+            last_call = (calls[0].get("function") or {}).get("name") if calls else None
+        elif role == "tool":
+            name = m.get("name") or by_id.get(m.get("tool_call_id") or "") or last_call
+            content = str(m.get("content", ""))
+            out.append(ToolResult(i, name, content, content.startswith("Error:")))
+    return out
+
+
+def tool_errors(traj: list[dict[str, Any]]) -> tuple[list[ToolResult], list[ToolResult]]:
+    """(unrecovered, recovered) tool errors. An error is recovered if a later
+    call to the same tool, or an equivalent one, succeeded."""
+    results = _tool_results(traj)
+    unrecovered, recovered = [], []
+    for j, r in enumerate(results):
+        if not r.is_error:
+            continue
+        ok_tools = {r.tool} | RECOVERY_EQUIVALENTS.get(r.tool or "", set())
+        if any(not later.is_error and later.tool in ok_tools for later in results[j + 1:]):
+            recovered.append(r)
+        else:
+            unrecovered.append(r)
+    return unrecovered, recovered
 
 
 def _tool_error_messages(traj: list[dict[str, Any]]) -> list[str]:
-    return [str(m.get("content", "")) for m in traj
-            if m.get("role") == "tool" and str(m.get("content", "")).startswith("Error:")]
+    """Unrecovered tool errors only (kept for callers of the old helper)."""
+    return [r.content for r in tool_errors(traj)[0]]
 
 
 def _agent_mutating_tool_calls(traj: list[dict[str, Any]]) -> list[str]:
@@ -105,14 +165,22 @@ def classify_taubench(result: dict[str, Any]) -> TauFailureRecord | None:
         return None
 
     traj = result.get("traj", [])
-    tool_errors = _tool_error_messages(traj)
+    unrecovered, recovered = tool_errors(traj)
     reward_info = (result.get("info") or {}).get("reward_info") or {}
     info = reward_info.get("info") or {}
     gt_actions = [a["name"] for a in reward_info.get("actions", []) if a["name"] in MUTATING_TOOLS]
     agent_actions = _agent_mutating_tool_calls(traj)
 
-    if tool_errors:
+    # Only an error the agent never got past explains the failure; a call that
+    # failed and was then retried successfully falls through to the outcome
+    # checks below (it is still recorded in `recovered_tool_errors`).
+    rewind_status = ((result.get("info") or {}).get("rewind") or {}).get("status")
+    if unrecovered:
         category = "TOOL_RUNTIME_ERROR"
+    elif not reward_info or (rewind_status is not None and rewind_status != "completed"):
+        # run.py never computes a reward when an episode runs out of steps;
+        # rewind grades it anyway but records why the loop stopped
+        category = "EPISODE_NOT_FINISHED"
     elif "r_outputs" in info and info["r_outputs"] < 1.0:
         category = "WRONG_OUTPUT"
     elif "r_outputs" in info:  # r_outputs == 1.0 but overall reward < 1.0
@@ -126,8 +194,10 @@ def classify_taubench(result: dict[str, Any]) -> TauFailureRecord | None:
 
     return TauFailureRecord(
         task_id=result["task_id"], trial=result.get("trial", 0), category=category,
-        reward=result["reward"], last_tool_error=tool_errors[-1] if tool_errors else None,
-        gt_mutating_tools=gt_actions, agent_mutating_tools=agent_actions, missing_outputs=missing)
+        reward=result["reward"], last_tool_error=unrecovered[-1].content if unrecovered else None,
+        gt_mutating_tools=gt_actions, agent_mutating_tools=agent_actions, missing_outputs=missing,
+        last_tool_error_tool=unrecovered[-1].tool if unrecovered else None,
+        recovered_tool_errors=[r.content for r in recovered])
 
 
 def summarize(results: list[dict[str, Any]]) -> tuple[list[TauFailureRecord], Counter]:

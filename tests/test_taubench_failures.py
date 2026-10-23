@@ -98,3 +98,65 @@ def test_action_shape_extra_unrequired_action():
     r = _result(8, 0.0, traj, {"r_actions": 0.0, "gt_data_hash": "x"}, actions=[])
     rec = classify_taubench(r)
     assert action_shape(rec) == "took a mutating action the task didn't call for"
+
+
+# --- recovered vs unrecovered tool errors ------------------------------------
+_ACTION_INFO = {"r_actions": False, "gt_data_hash": "x"}
+
+
+def test_error_retried_successfully_is_not_a_tool_error():
+    """Call fails, same tool then succeeds, task still fails: the failure is
+    explained by the outcome, not by the error the agent got past."""
+    traj = [_assistant_call("get_order_details"), _tool_msg("Error: order not found"),
+            _assistant_call("get_order_details"), _tool_msg('{"order_id": "#W1"}')]
+    rec = classify_taubench(_result(1, 0.0, traj, _ACTION_INFO))
+    assert rec.category == "WRONG_ACTION"
+    assert rec.last_tool_error is None
+    assert rec.recovered_tool_errors == ["Error: order not found"]
+
+
+def test_error_recovered_through_an_equivalent_tool():
+    """Email lookup fails, name+zip lookup succeeds: the user was found."""
+    traj = [_assistant_call("find_user_id_by_email"),
+            _tool_msg("Error: user not found", name="find_user_id_by_email"),
+            _assistant_call("find_user_id_by_name_zip"),
+            _tool_msg("yusuf_rossi_9620", name="find_user_id_by_name_zip")]
+    rec = classify_taubench(_result(2, 0.0, traj, _ACTION_INFO))
+    assert rec.category == "WRONG_ACTION" and len(rec.recovered_tool_errors) == 1
+
+
+def test_error_followed_only_by_other_tools_stays_a_tool_error():
+    """The exchange failed and was never redone; reading other data later
+    does not count as recovering it."""
+    traj = [_assistant_call("exchange_delivered_order_items"),
+            _tool_msg("Error: non-delivered order cannot be exchanged",
+                      name="exchange_delivered_order_items"),
+            _assistant_call("get_order_details"), _tool_msg('{"order_id": "#W1"}')]
+    rec = classify_taubench(_result(3, 0.0, traj, _ACTION_INFO))
+    assert rec.category == "TOOL_RUNTIME_ERROR"
+    assert rec.last_tool_error_tool == "exchange_delivered_order_items"
+
+
+def test_tool_name_resolved_from_tool_call_id_when_message_has_no_name():
+    """rewind's own export (to_openai_messages) has no `name` on tool messages."""
+    traj = [{"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "function": {"name": "cancel_pending_order", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "Error: order not found"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c2", "function": {"name": "cancel_pending_order", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c2", "content": '{"status": "cancelled"}'}]
+    rec = classify_taubench(_result(4, 0.0, traj, _ACTION_INFO))
+    assert rec.category == "WRONG_ACTION" and rec.recovered_tool_errors
+
+
+def test_episode_that_ran_out_of_steps_has_its_own_category():
+    traj = [_assistant_call("return_delivered_order_items"),
+            _tool_msg("Error: non-delivered order cannot be returned", name="return_delivered_order_items"),
+            _assistant_call("return_delivered_order_items"),
+            _tool_msg('{"status": "return requested"}', name="return_delivered_order_items")]
+    row = {"task_id": 5, "reward": 0.0, "trial": 0, "info": {"reward_info": None}, "traj": traj}
+    assert classify_taubench(row).category == "EPISODE_NOT_FINISHED"
+    row2 = {"task_id": 6, "reward": 0.0, "trial": 0, "traj": [],
+            "info": {"reward_info": {"reward": 0.0, "info": _ACTION_INFO, "actions": []},
+                     "rewind": {"status": "budget_exceeded"}}}
+    assert classify_taubench(row2).category == "EPISODE_NOT_FINISHED"

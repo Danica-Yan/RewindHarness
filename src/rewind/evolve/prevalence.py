@@ -71,18 +71,9 @@ def signature(row: dict, split: str) -> FailureSignature | None:
     rec = classify_taubench(row)
     if rec is None:
         return None
-    if rec.category == "TOOL_RUNTIME_ERROR":
-        errs = [m for m in row.get("traj", []) if m.get("role") == "tool"
-                and str(m.get("content", "")).startswith("Error:")]
-        # the tool that errored: the assistant call right before the error
-        tool = None
-        traj = row.get("traj", [])
-        for i, m in enumerate(traj):
-            if m is errs[-1] and i > 0:
-                calls = traj[i - 1].get("tool_calls") or []
-                tool = (calls[0].get("function") or {}).get("name") if calls else None
-        return FailureSignature(category=rec.category, tool=tool,
-                                detail=_norm_error(str(errs[-1]["content"])))
+    if rec.category == "TOOL_RUNTIME_ERROR":  # only unrecovered errors land here
+        return FailureSignature(category=rec.category, tool=rec.last_tool_error_tool,
+                                detail=_norm_error(rec.last_tool_error or ""))
     if rec.category == "WRONG_OUTPUT":
         return FailureSignature(category=rec.category, detail="missing required output")
     # action failures: find the first mutating tool where agent and truth differ
