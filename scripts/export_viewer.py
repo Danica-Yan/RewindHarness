@@ -108,6 +108,7 @@ def main() -> None:
         ctx = json.loads(cj)
         versions.append({"version": v, "parent": parent, "rules": ctx.get("rules", {}),
                          "tool_notes": ctx.get("tool_notes", {}), "checks": ctx.get("checks", {}),
+                         "skills": ctx.get("skills", {}),
                          "edits": json.loads(ej),
                          "rows_path": rows_path})
     rows_path = {v["version"]: v["rows_path"] for v in versions}

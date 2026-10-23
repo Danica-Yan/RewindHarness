@@ -7,6 +7,9 @@ benchmark's own agent context:
                   to the original wiki (the wiki text itself is never edited,
                   so every learned line is visible and attributable)
 * `tool_notes` -- one note appended to a tool's description
+* `skills`     -- step-by-step procedures the agent loads on demand
+                  (`rewind.skills`); only name + description go in the
+                  prompt; an edit's `text` is {"description","steps","tools"}
 * `checks`     -- policy checks run in code before a tool call
                   (`rewind.policy`); an edit's `text` is the check as JSON,
                   its `target` the check id
@@ -26,9 +29,10 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from ..policy import Check, PolicySet
+from ..skills import LOAD_SKILL, MAX_SKILLS, Skill, load_skill_tool, skill_index
 from ..tools import Tool, ToolRegistry
 
-SurfaceKind = Literal["rule", "tool_note", "check"]
+SurfaceKind = Literal["rule", "tool_note", "check", "skill"]
 EditOp = Literal["add", "replace", "delete"]
 
 LEARNED_HEADER = "## Additional policies (learned)"
@@ -74,13 +78,15 @@ class ContextVersion(BaseModel):
     rules: dict[str, str] = Field(default_factory=dict)       # rule id -> text (insertion order kept)
     tool_notes: dict[str, str] = Field(default_factory=dict)  # tool name -> note
     checks: dict[str, dict] = Field(default_factory=dict)     # check id -> Check fields
+    skills: dict[str, dict] = Field(default_factory=dict)     # skill name -> Skill fields
 
     # -- edits -----------------------------------------------------------------
     def apply(self, edit: Edit, *, known_tools: set[str] | None = None) -> ContextVersion:
-        rules, notes, checks = dict(self.rules), dict(self.tool_notes), dict(self.checks)
-        if edit.kind == "check":
-            return self._apply_check(edit, checks, known_tools).model_copy(
-                update={"rules": rules, "tool_notes": notes})
+        if edit.kind in ("check", "skill"):
+            table = dict(self.checks if edit.kind == "check" else self.skills)
+            self._apply_structured(edit, table, known_tools)
+            return self._next(**{"checks" if edit.kind == "check" else "skills": table})
+        rules, notes = dict(self.rules), dict(self.tool_notes)
         table = rules if edit.kind == "rule" else notes
         if edit.kind == "tool_note" and known_tools is not None and edit.target not in known_tools:
             raise EditError(f"unknown tool {edit.target!r}")
@@ -100,28 +106,37 @@ class ContextVersion(BaseModel):
             if edit.target not in table:
                 raise EditError(f"{edit.kind} {edit.target!r} does not exist")
             del table[edit.target]
-        return ContextVersion(version=self.version + 1, parent=self.version,
-                              rules=rules, tool_notes=notes, checks=checks)
+        return self._next(rules=rules, tool_notes=notes)
 
-    def _apply_check(self, edit: Edit, checks: dict[str, dict],
-                     known_tools: set[str] | None) -> ContextVersion:
+    def _next(self, **update) -> ContextVersion:
+        """The successor version: everything carried over except `update`."""
+        return self.model_copy(deep=True, update={"version": self.version + 1, "parent": self.version,
+                                                  **update})
+
+    def _apply_structured(self, edit: Edit, table: dict[str, dict],
+                          known_tools: set[str] | None) -> None:
         if edit.op == "delete":
-            if edit.target not in checks:
-                raise EditError(f"check {edit.target!r} does not exist")
-            del checks[edit.target]
-        else:
-            if (edit.op == "add") == (edit.target in checks):
-                raise EditError(f"check {edit.target!r} " + ("already exists (use replace)"
-                                                               if edit.op == "add" else "does not exist"))
-            c = parse_check(edit)
-            unknown = sorted(set(c.tools) - known_tools) if known_tools is not None else []
-            if unknown:
-                raise EditError(f"check guards unknown tool(s) {unknown}")
-            checks[edit.target] = c.model_dump()
-        return ContextVersion(version=self.version + 1, parent=self.version, checks=checks)
+            if edit.target not in table:
+                raise EditError(f"{edit.kind} {edit.target!r} does not exist")
+            del table[edit.target]
+            return
+        if (edit.op == "add") == (edit.target in table):
+            raise EditError(f"{edit.kind} {edit.target!r} " + ("already exists (use replace)"
+                                                              if edit.op == "add" else "does not exist"))
+        obj = parse_check(edit) if edit.kind == "check" else parse_skill(edit)
+        known = (known_tools or set()) - {LOAD_SKILL}
+        unknown = sorted(set(obj.tools) - known) if known_tools is not None else []
+        if unknown:
+            raise EditError(f"{edit.kind} names unknown tool(s) {unknown}")
+        if edit.kind == "skill" and edit.op == "add" and len(table) >= MAX_SKILLS:
+            raise EditError(f"skill library is full ({MAX_SKILLS}): merge or delete one instead")
+        table[edit.target] = obj.model_dump()
 
     def policy(self) -> PolicySet:
         return PolicySet([Check.model_validate(c) for c in self.checks.values()])
+
+    def skill_objects(self) -> dict[str, Skill]:
+        return {k: Skill.model_validate(v) for k, v in self.skills.items()}
 
     def apply_all(self, edits: list[Edit], **kw) -> ContextVersion:
         v = self
@@ -132,13 +147,18 @@ class ContextVersion(BaseModel):
 
     # -- rendering ---------------------------------------------------------------
     def render_system_prompt(self, base: str) -> str:
-        if not self.rules:
+        if not self.rules and not self.skills:
             return base
-        lines = "\n".join(f"- {t}" for t in self.rules.values())
-        return f"{base.rstrip()}\n\n{LEARNED_HEADER}\n\n{lines}\n"
+        out = base.rstrip()
+        if self.rules:
+            lines = "\n".join(f"- {t}" for t in self.rules.values())
+            out += f"\n\n{LEARNED_HEADER}\n\n{lines}"
+        if self.skills:
+            out += "\n\n" + skill_index(self.skill_objects())
+        return out + "\n"
 
     def patch_registry(self, reg: ToolRegistry) -> ToolRegistry:
-        if not self.tool_notes and not self.checks:
+        if not self.tool_notes and not self.checks and not self.skills:
             return reg
         out = ToolRegistry()
         out.policy = self.policy() if self.checks else getattr(reg, "policy", None)
@@ -148,15 +168,19 @@ class ContextVersion(BaseModel):
                 name=t.name, description=f"{t.description}\n\nNote: {note}", args_model=t.args_model,
                 fn=t.fn, mutating=t.mutating, input_schema=copy.deepcopy(t.input_schema),
                 raw_text_result=t.raw_text_result))
+        if self.skills:
+            out.register(load_skill_tool(self.skill_objects()))
         return out
 
     def token_size(self) -> int:
         """Rough size of everything this version adds (~4 chars per token)."""
         n = sum(len(t) for t in self.rules.values()) + sum(len(t) for t in self.tool_notes.values())
+        n += sum(len(s["name"]) + len(s["description"]) + 4 for s in self.skills.values())  # steps load on demand
         return n // 4
 
     def fingerprint(self) -> str:
-        parts = [self.rules, self.tool_notes] + ([self.checks] if self.checks else [])
+        parts = [self.rules, self.tool_notes] + ([self.checks] if self.checks or self.skills else []) \
+            + ([self.skills] if self.skills else [])
         return hashlib.sha256(json.dumps(parts, ensure_ascii=False)
                               .encode()).hexdigest()[:16]
 
@@ -186,6 +210,8 @@ def validate_edit(edit: Edit, ctx: ContextVersion, *, known_tools: set[str],
     both = f"{edit.text or ''} {edit.trigger or ''}"
     if edit.kind == "check":
         return _validate_check(edit, ctx, known_tools)
+    if edit.kind == "skill":
+        return _validate_skill(edit, ctx, known_tools, max_tokens)
     if leak_reasons(both):
         return "looks case-specific: " + ", ".join(leak_reasons(both))
     if edit.op != "delete":
@@ -237,4 +263,38 @@ def _validate_check(edit: Edit, ctx: ContextVersion, known_tools: set[str]) -> s
         ctx.apply(edit, known_tools=known_tools)
     except EditError as e:
         return str(e)
+    return None
+
+
+def parse_skill(edit: Edit) -> Skill:
+    """The skill an edit carries: `text` is {"description", "steps", "tools"};
+    `target` is its name."""
+    try:
+        raw = json.loads(edit.text or "")
+    except json.JSONDecodeError as e:
+        raise EditError(f"skill text is not JSON: {e}") from e
+    if not isinstance(raw, dict):
+        raise EditError("skill text must be a JSON object")
+    raw["name"] = edit.target
+    try:
+        return Skill.model_validate(raw)
+    except ValueError as e:
+        raise EditError(f"invalid skill: {e}") from e
+
+
+def _validate_skill(edit: Edit, ctx: ContextVersion, known_tools: set[str], max_tokens: int) -> str | None:
+    if edit.op != "delete":
+        try:
+            sk = parse_skill(edit)
+        except EditError as e:
+            return str(e)
+        text = " ".join([sk.description, *sk.steps])
+        if leak_reasons(text):
+            return "looks case-specific: " + ", ".join(leak_reasons(text))
+    try:
+        nxt = ctx.apply(edit, known_tools=known_tools)
+    except EditError as e:
+        return str(e)
+    if edit.op == "add" and nxt.token_size() > max_tokens:
+        return f"context budget exceeded ({nxt.token_size()} > {max_tokens} tokens)"
     return None

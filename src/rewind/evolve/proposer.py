@@ -28,7 +28,7 @@ SYSTEM = """You improve a retail customer-service agent by editing its context, 
 You see failures that share one pattern. Propose GENERAL policy fixes that would prevent this
 pattern on unseen customers and orders.
 
-You may propose three kinds of edits:
+You may propose four kinds of edits:
 - "tool_note": a note on ONE tool's description (target = the exact tool name). The agent sees it only
   when it considers that tool. PREFER THIS whenever the failure is about how one tool is used.
 - "rule": a policy line in the agent's instructions (target = a short snake_case id), only for
@@ -40,7 +40,11 @@ You may propose three kinds of edits:
   Its "text" is a JSON object: {"tools": [tool names it guards], "condition": <one of the conditions
   below>, "params": {...}, "message": "<what the agent is told>"}; no "trigger" needed. Conditions:
 @CONDITIONS@
-Ops: "add", "replace" (an existing rule id / tool note / check id), "delete".
+- "skill": a step-by-step procedure the agent loads on demand (target = its snake_case name). If a
+  current skill covers the failing request, prefer "replace" with a corrected version of THAT skill
+  (fix the step that went wrong; keep the rest). Its "text" is a JSON object: {"description": "<one
+  line: when to use it>", "steps": ["...", ...], "tools": [tool names]}; no "trigger" needed.
+Ops: "add", "replace" (an existing rule id / tool note / check id / skill name), "delete".
 
 Every rule and tool_note has a "trigger": the specific situation it applies to ("the customer asks to change an
 item's options to an empty set"). It is written as "When <trigger>: <text>". Make the trigger as
@@ -98,12 +102,15 @@ def _excerpt(traj: list[dict], max_msgs: int = 14, max_chars: int = 300) -> list
 def build_messages(cluster_key: str, evidence: list[dict], split: str, ctx: ContextVersion,
                    rejected: list[dict], n: int, tool_names: list[str]) -> list[dict]:
     parts = [f"Failure pattern: {cluster_key}", f"Tools: {', '.join(tool_names)}", ""]
-    if ctx.rules or ctx.tool_notes or ctx.checks:
+    if ctx.rules or ctx.tool_notes or ctx.checks or ctx.skills:
         parts.append("Current learned rules:")
         parts += [f"- [{k}] {v}" for k, v in ctx.rules.items()]
         parts += [f"- [tool_note {k}] {v}" for k, v in ctx.tool_notes.items()]
         parts += [f"- [check {k}] " + json.dumps({x: c[x] for x in ("tools", "condition", "params", "message")})
                   for k, c in ctx.checks.items()]
+        for k, sk in ctx.skills.items():
+            parts.append(f"- [skill {k}] {sk['description']}")
+            parts += [f"    {i}. {st}" for i, st in enumerate(sk["steps"], 1)]
         parts.append("")
     if rejected:
         parts.append("Already tried and rejected (do not repeat):")
@@ -141,7 +148,7 @@ def parse_edits(text: str, cluster_key: str, evidence_tasks: list[int]) -> list[
     for d in (data.get("edits") or []) if isinstance(data, dict) else []:
         try:
             text = d.get("text")
-            if d.get("kind") == "check" and isinstance(text, dict):
+            if d.get("kind") in ("check", "skill") and isinstance(text, dict):
                 text = json.dumps(text, ensure_ascii=False)
             out.append(Edit(kind=d["kind"], target=str(d["target"]).strip(), op=d.get("op", "add"),
                             text=text, trigger=d.get("trigger"),
