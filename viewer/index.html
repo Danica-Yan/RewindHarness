@@ -172,7 +172,9 @@ function viewVersions() {
     const rows = [...Object.entries(v.rules).map(([k, t]) => [k, t]),
                   ...Object.entries(v.tool_notes).map(([k, t]) => ["note on " + k, t]),
                   ...Object.entries(v.checks || {}).map(([k, c]) => ["check " + k,
-                    `${c.condition} ${JSON.stringify(c.params)} on ${c.tools.join(", ")} — "${c.message}"`])];
+                    `${c.condition} ${JSON.stringify(c.params)} on ${c.tools.join(", ")} — "${c.message}"`]),
+                  ...Object.entries(v.skills || {}).map(([k, sk]) => ["skill " + k,
+                    sk.description + " — " + sk.steps.map((x, i) => `${i + 1}. ${x}`).join(" ")])];
     h += rows.length ? `<table class="rules">` + rows.map(([k, t]) => `<tr><td>${esc(k)}</td><td>${esc(t)}</td></tr>`).join("") + `</table>`
       : `<div class="muted">no learned rules — the benchmark's own context</div>`;
     h += `</div>`;

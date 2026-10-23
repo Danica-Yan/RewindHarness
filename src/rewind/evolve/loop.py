@@ -278,7 +278,8 @@ async def _try_edits(cfg: EvolveConfig, ledger: EditLedger, round_no: int, inc: 
         cand = inc.apply(e, known_tools=tools).model_copy(
             update={"version": ledger.next_version_number(), "parent": inc.version})
         cand_cfg, cand_reg = version_setup(cand)
-        shown = cand.rules.get(e.target) or cand.tool_notes.get(e.target) or cand.checks.get(e.target)
+        shown = cand.rules.get(e.target) or cand.tool_notes.get(e.target) or cand.checks.get(e.target) \
+            or cand.skills.get(e.target)
         note(f"  screening {e.kind} {e.target}: {shown!r}")
         sr = await screen([e.edit_id], b_tasks, system_prompt=cand_cfg.system_prompt,
                           registry=cand_reg, store=store, provider=provider, user_llm=user_llm,
@@ -521,3 +522,86 @@ def _save(paths: dict[str, Path], rep: RoundReport) -> None:
     paths["rounds"].mkdir(parents=True, exist_ok=True)
     (paths["rounds"] / f"round{rep.round:02d}.json").write_text(
         json.dumps(rep.model_dump(), indent=1, ensure_ascii=False, default=str), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# skill library: induced from successes, gated as one candidate version
+# ---------------------------------------------------------------------------
+def skill_targets(base_rows: list[dict], split: str, tools: set[str], max_targets: int = 8
+                  ) -> list[tuple[int, str, int, int]]:
+    """Failed baseline episodes whose task needs one of `tools` (with a trace
+    to fork from), one per task. Induction never saw failures, so all of
+    them are held out."""
+    from .skills import task_writes
+    out, seen = [], set()
+    for r in sorted(base_rows, key=lambda r: (r["task_id"], r["trial"])):
+        tr = ((r.get("info") or {}).get("rewind") or {}).get("trace")
+        if r["reward"] >= 1.0 or not tr or r["task_id"] in seen:
+            continue
+        if task_writes(split, r["task_id"]) & tools:
+            out.append((r["task_id"], tr, 0, 0))
+            seen.add(r["task_id"])
+    return out[:max_targets]
+
+
+def skill_gate_cost(cfg: EvolveConfig, pool: list[int], n_targets: int) -> int:
+    """Null forks under the incumbent + candidate forks + pool + confirmation."""
+    return n_targets * cfg.gate.efficacy_n + _gate_reserve(cfg, pool, n_targets)
+
+
+async def gate_skill_library(cfg: EvolveConfig, ledger: EditLedger, edits: list, base_rows: list[dict], *,
+                             provider: Any, user_llm: Any, store: Any,
+                             log: Callable[[str], None] = print) -> dict:
+    """Gate a set of induced skills as ONE candidate version.
+
+    Efficacy: the incumbent's own null rate on the held-out failures is
+    measured fresh (forks from step 1 under the incumbent's context), because
+    the stability cache was recorded under an older version; the candidate
+    is forked on the same tasks and compared with a one-sided Fisher test.
+    Safety: the usual pool run + flip confirmation, excluding every task
+    whose episode was shown to the inducer or used as a target."""
+    from .gate import Efficacy, efficacy, fisher_greater
+    from .skills import library_version
+    inc = ledger.current()
+    inc_rows = load_rows(ledger.rows_path(inc.version))
+    _, reg = version_setup(inc)
+    known = set(reg._tools)  # noqa: SLF001
+    cand = library_version(inc, edits, known).model_copy(update={"version": ledger.next_version_number()})
+    added = [e for e in edits if e.target in cand.skills and e.target not in inc.skills]
+    if not added:
+        return {"accepted": False, "reason": "no induced skill applies to the current version", "episodes": 0}
+    tools = {e.source_cluster.split(":", 1)[1] for e in added if e.source_cluster.startswith("skill:")}
+    targets = skill_targets(base_rows, cfg.split, tools)
+    evidence = {t for e in added for t in e.evidence_tasks}
+    pool = _pool(inc_rows, ledger.shown() | evidence | {t[0] for t in targets})
+    round_no = ledger.bump_round()
+    ledger.mark_shown(sorted(evidence), round_no, "skill_evidence")
+    log(f"skill library: {len(added)} skills ({', '.join(e.target for e in added)}), "
+        f"{len(targets)} held-out failures, pool {len(pool)}")
+    if not targets:
+        return {"accepted": False, "reason": "no held-out failure of the covered task types", "episodes": 0}
+
+    null, n_null = await efficacy(inc, targets, policy=cfg.gate, provider=provider, user_llm=user_llm,
+                                  store=store, log=lambda m: log("  [incumbent]" + m))
+    cnd, n_cand = await efficacy(cand, targets, policy=cfg.gate, provider=provider, user_llm=user_llm,
+                                 store=store, log=lambda m: log("  [skills]" + m))
+    p = fisher_greater(cnd.cand_passes, cnd.cand_n, null.cand_passes, null.cand_n)
+    lift = cnd.cand_passes / cnd.cand_n - null.cand_passes / null.cand_n
+    eff = Efficacy(tasks=[t[0] for t in targets], cand_passes=cnd.cand_passes, cand_n=cnd.cand_n,
+                   null_passes=null.cand_passes, null_n=null.cand_n, p_value=p, lift=lift,
+                   passed=p < cfg.gate.alpha and lift >= cfg.gate.min_lift)
+    log(f"  efficacy: skills {eff.cand_passes}/{eff.cand_n} vs incumbent {eff.null_passes}/{eff.null_n}, "
+        f"p = {p:.4f}")
+    out = _paths(cfg)["gate"] / f"v{cand.version}_skills.json"
+    v = await gate(cand, inc_rows, pool, split=cfg.split, out=out, provider=provider, user_llm=user_llm,
+                   store=store, policy=cfg.gate, concurrency=cfg.concurrency, log=log, incumbent=inc,
+                   prior_efficacy=eff)
+    v = v.model_copy(update={"episodes": v.episodes + n_null + n_cand})
+    data = v.model_dump()
+    for e in added:
+        ledger.record(round_no, inc.version, e, "gate", v.accepted, v.reason, data, cluster=e.source_cluster)
+    if v.accepted:
+        ledger.commit(cand, added, str(out), data)
+        log(f"  committed v{cand.version}")
+    return {"accepted": v.accepted, "reason": v.reason, "episodes": v.episodes,
+            "version": cand.version if v.accepted else None, "skills": [e.target for e in added]}
