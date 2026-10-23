@@ -37,7 +37,11 @@ Requirements:
 - Steps are short imperative sentences, in order, 3-10 of them. Include the checks and the moment
   to ask the user for explicit confirmation, and how to call the write tool (e.g. once, with all items).
 - No order ids, item ids, user ids, emails, names, amounts or other case details.
-- Do not invent policy: only what the successful conversations and the agent's instructions support.
+- The agent's policy is given below. Include EVERY requirement of it that applies to this kind of
+  request (status checks, reminders, allowed values, payment constraints), in the step where it
+  applies -- the conversations may not show all of them.
+- Never add a requirement the policy does not state, and do not narrow one it does (e.g. a balance
+  check the policy only demands for gift cards must not be applied to every payment method).
 - "description" is ONE line saying when to use the skill (the agent decides from it whether to load it).
 Return JSON: {"name": "<snake_case>", "description": "...", "steps": ["...", ...],
 "tools": ["<tool names the procedure uses>"]}"""
@@ -86,8 +90,12 @@ def skill_groups(rows: list[dict], split: str, *, min_passing: int = 5, k: int =
 
 
 def induce_messages(group: SkillGroup, rows: list[dict], split: str, ctx: ContextVersion,
-                    tool_names: list[str]) -> list[dict]:
-    parts = [f"Kind of request: tasks that need `{group.tool}`.", f"Tools: {', '.join(tool_names)}", ""]
+                    tool_names: list[str], policy: str | None = None) -> list[dict]:
+    if policy is None:
+        from ..env.taubench_dialogue import wiki
+        policy = wiki()
+    parts = [f"Kind of request: tasks that need `{group.tool}`.", f"Tools: {', '.join(tool_names)}", "",
+             "=== The agent's policy ===", policy.strip(), ""]
     if ctx.skills:
         parts.append("Skills that already exist (do not duplicate):")
         parts += [f"- {k}: {v['description']}" for k, v in ctx.skills.items()]
@@ -123,11 +131,12 @@ def parse_skill_edit(text: str, group: SkillGroup, rows: list[dict]) -> Edit | N
 
 
 async def induce(groups: list[SkillGroup], rows: list[dict], split: str, ctx: ContextVersion,
-                 llm: JsonLLM, tool_names: list[str]) -> list[tuple[SkillGroup, Edit | None, str]]:
+                 llm: JsonLLM, tool_names: list[str], policy: str | None = None
+                 ) -> list[tuple[SkillGroup, Edit | None, str]]:
     """One LLM call per group. Returns (group, edit or None, raw text)."""
     out = []
     for g in groups:
-        text = await llm(induce_messages(g, rows, split, ctx, tool_names))
+        text = await llm(induce_messages(g, rows, split, ctx, tool_names, policy))
         out.append((g, parse_skill_edit(text, g, rows), text))
     return out
 
