@@ -208,7 +208,9 @@ def test_contrast_groups_show_only_a_half_failures_and_targets_must_be_stable(tm
     shown = [rows[i]["task_id"] for g in groups for i in g.failing_examples]
     assert shown and all(failure_half(t) == "A" and rows[t]["reward"] == 0.0 for t in shown)
     g = next(g for g in groups if g.failing_examples)
-    msgs = induce_messages(g, rows, "train", ContextVersion(), sorted(TOOLS), policy="POLICY")
+    msgs = induce_messages(g, rows, "train", ContextVersion(rules={"r": "When options are empty: swap the item for itself."}),
+                           sorted(TOOLS), policy="POLICY")
+    assert "never contradict" in msgs[1]["content"] and "swap the item for itself" in msgs[1]["content"]
     assert "FAILED conversation 1" in msgs[1]["content"] and "Correct actions would have been" in msgs[1]["content"]
     assert "restates it adds nothing" in msgs[0]["content"]
     e = parse_skill_edit(json.dumps({"name": "abc", **EXCHANGE}), g, rows)
