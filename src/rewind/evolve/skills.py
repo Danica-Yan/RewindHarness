@@ -14,6 +14,7 @@ chooses when to load, so the comparison is a diagnostic, not the gate).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import defaultdict
 from typing import Any, Awaitable, Callable
@@ -46,12 +47,29 @@ Requirements:
 Return JSON: {"name": "<snake_case>", "description": "...", "steps": ["...", ...],
 "tools": ["<tool names the procedure uses>"]}"""
 
+CONTRAST_ADDENDUM = """
+You ALSO see failed conversations of the same kind of request, with the actions that would have
+been correct. The agent already has the policy above in its instructions, so a skill that only
+restates it adds nothing. Find what the successful conversations did that the failed ones did NOT
+(how they found the right item or variant, what they asked before acting, how they handled an
+unusual request), and make those concrete practices the core of the steps. Keep policy steps only
+where a failure violated them."""
+
 
 class SkillGroup(BaseModel):
     tool: str                       # the write tool that defines the group
     passing: list[int]              # row indices of passing episodes whose task uses `tool`
     examples: list[int]             # row indices chosen as evidence
     task_ids: list[int]
+    failing_examples: list[int] = []   # contrast mode: A-half failures shown to the inducer
+
+
+def failure_half(task_id: int) -> str:
+    """Fixed A/B split of tasks for skill work: only failures of A tasks are
+    ever shown to the inducer (contrast mode), so B failures always stay
+    available as gate targets (the gate also excludes every shown task).
+    Deterministic, so `plan`, `induce` and `gate` agree without state."""
+    return "A" if hashlib.sha256(f"skill-split-{task_id}".encode()).digest()[0] % 2 == 0 else "B"
 
 
 def task_writes(split: str, task_id: int) -> set[str]:
@@ -59,10 +77,12 @@ def task_writes(split: str, task_id: int) -> set[str]:
 
 
 def skill_groups(rows: list[dict], split: str, *, min_passing: int = 5, k: int = 4,
-                 skip_tools: set[str] = frozenset()) -> list[SkillGroup]:
+                 skip_tools: set[str] = frozenset(), contrast: bool = False,
+                 fail_k: int = 2) -> list[SkillGroup]:
     """One group per write tool with at least `min_passing` passing episodes.
     Examples: episodes whose task needs ONLY that write first (cleanest
-    signal), then the shortest conversations, one per task."""
+    signal), then the shortest conversations, one per task. With `contrast`,
+    also up to `fail_k` failed episodes of the type from A-half tasks."""
     by_tool: dict[str, list[int]] = defaultdict(list)
     writes = {}
     for i, r in enumerate(rows):
@@ -84,8 +104,20 @@ def skill_groups(rows: list[dict], split: str, *, min_passing: int = 5, k: int =
                 seen.add(rows[i]["task_id"])
             if len(ex) == k:
                 break
+        fails: list[int] = []
+        if contrast:
+            seen_f: set[int] = set()
+            for i, rr in enumerate(rows):
+                t = rr["task_id"]
+                if rr["reward"] >= 1.0 or t in seen_f or failure_half(t) != "A":
+                    continue
+                if tool in writes.setdefault(t, task_writes(split, t)):
+                    fails.append(i)
+                    seen_f.add(t)
+                if len(fails) == fail_k:
+                    break
         out.append(SkillGroup(tool=tool, passing=idx, examples=ex,
-                              task_ids=sorted({rows[i]["task_id"] for i in idx})))
+                              task_ids=sorted({rows[i]["task_id"] for i in idx}), failing_examples=fails))
     return out
 
 
@@ -106,7 +138,18 @@ def induce_messages(group: SkillGroup, rows: list[dict], split: str, ctx: Contex
         parts.append(f"Customer goal: {load_task(split, r['task_id']).instruction}")
         parts += _excerpt(r.get("traj", []), max_msgs=24, max_chars=220)
         parts.append("")
-    return [{"role": "system", "content": INDUCE_SYSTEM}, {"role": "user", "content": "\n".join(parts)}]
+    for n, i in enumerate(group.failing_examples, 1):
+        r = rows[i]
+        task = load_task(split, r["task_id"])
+        gold = [f"{a.name}({json.dumps(a.kwargs, ensure_ascii=False)})" for a in task.actions
+                if a.name != "respond"]
+        parts.append(f"=== FAILED conversation {n} (same kind of request) ===")
+        parts.append(f"Customer goal: {task.instruction}")
+        parts.append("Correct actions would have been: " + "; ".join(gold))
+        parts += _excerpt(r.get("traj", []), max_msgs=24, max_chars=220)
+        parts.append("")
+    system = INDUCE_SYSTEM + (CONTRAST_ADDENDUM if group.failing_examples else "")
+    return [{"role": "system", "content": system}, {"role": "user", "content": "\n".join(parts)}]
 
 
 def parse_skill_edit(text: str, group: SkillGroup, rows: list[dict]) -> Edit | None:
@@ -125,9 +168,11 @@ def parse_skill_edit(text: str, group: SkillGroup, rows: list[dict]) -> Edit | N
     body = {k: d.get(k) for k in ("description", "steps", "tools")}
     return Edit(kind="skill", target=str(d["name"]).strip(), op="add",
                 text=json.dumps(body, ensure_ascii=False),
-                rationale=f"induced from {len(group.examples)} successful `{group.tool}` episodes",
+                rationale=f"induced from {len(group.examples)} successful"
+                          + (f" and {len(group.failing_examples)} failed" if group.failing_examples else "")
+                          + f" `{group.tool}` episodes",
                 source_cluster=f"skill:{group.tool}",
-                evidence_tasks=[rows[i]["task_id"] for i in group.examples])
+                evidence_tasks=[rows[i]["task_id"] for i in group.examples + group.failing_examples])
 
 
 async def induce(groups: list[SkillGroup], rows: list[dict], split: str, ctx: ContextVersion,

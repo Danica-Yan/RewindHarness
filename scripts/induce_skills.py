@@ -2,20 +2,22 @@
 """Skill library: induce procedures from successful episodes, gate them, read usage.
 
   plan    groups of passing episodes per write tool, the examples each skill
-          would be induced from, and the API cost of induce + gate -- NO API
+          would be induced from, which failures can be gate targets (stable,
+          never shown), and the API cost of induce + gate -- NO API
   induce  one LLM call per group -> <run-dir>/skills/candidates.json (validated)
   gate    gate all valid candidates as ONE new version (asks first)
   usage   which skills episodes loaded, and pass rates loaded vs not -- NO API
 
-Induction only reads PASSING train episodes; the gate's targets are the
-FAILED ones of the same task types, so evidence and evaluation never overlap.
+Induction reads PASSING train episodes (and with --contrast also failures of
+"A"-half tasks); the gate's targets are STABLE failures the inducer never saw,
+so evidence and evaluation never overlap.
 
 Usage:
   export DEEPSEEK_API_KEY=sk-... REWIND_TAUBENCH_SRC=../tau-bench
   python scripts/induce_skills.py plan   --base runs/p1/train_base.json
   python scripts/induce_skills.py induce --base runs/p1/train_base.json
   python scripts/induce_skills.py gate   --base runs/p1/train_base.json --store-dir runs/p1/snapshots
-  python scripts/induce_skills.py usage  --results runs/p1/gate/v2_skills.json
+  python scripts/induce_skills.py usage  --results runs/p1/gate/v2_skills_eff_candidate.json
 """
 from __future__ import annotations
 
@@ -29,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from rewind.evolve.ledger import EditLedger  # noqa: E402
 from rewind.evolve.loop import (  # noqa: E402
-    EvolveConfig, _pool, gate_skill_library, skill_gate_cost, skill_targets,
+    EvolveConfig, _pool, gate_skill_library, skill_gate_cost, skill_target_plan,
 )
 from rewind.evolve.runner import load_rows, version_setup  # noqa: E402
 from rewind.evolve.skills import (  # noqa: E402
@@ -48,6 +50,8 @@ def main() -> None:
     ap.add_argument("--min-passing", type=int, default=5, help="min distinct passing tasks per group")
     ap.add_argument("--examples", type=int, default=4, help="episodes shown per induction call")
     ap.add_argument("--max-targets", type=int, default=8)
+    ap.add_argument("--contrast", action="store_true",
+                    help="show failed episodes (A-half tasks) next to the successes when inducing")
     ap.add_argument("--efficacy-n", type=int, default=5)
     ap.add_argument("--results", action="append", help="usage: results json(s)")
     ap.add_argument("--model", default="deepseek-chat")
@@ -82,25 +86,34 @@ def main() -> None:
     tools = sorted(reg._tools)  # noqa: SLF001
     covered = {e["source_cluster"].split(":", 1)[1] for _v, es in led.lineage(inc.version) for e in es
                if e.get("kind") == "skill" and str(e.get("source_cluster", "")).startswith("skill:")}
-    groups = skill_groups(base_rows, a.split, min_passing=a.min_passing, k=a.examples, skip_tools=covered)
+    groups = skill_groups(base_rows, a.split, min_passing=a.min_passing, k=a.examples, skip_tools=covered,
+                          contrast=a.contrast)
+
+    def target_summary(tp: dict, n_targets: int, pool: list[int]) -> str:
+        return (f"  targets: {len(tp['failures'])} unseen failures of these types, "
+                f"{len(tp['stable'])} known stable, {len(tp['missing'])} not yet assessed "
+                f"(<= {tp['assess_cost']} null forks to assess)\n"
+                f"  gate:    <= {tp['assess_cost'] + skill_gate_cost(cfg, pool, n_targets)} episodes in total "
+                f"(up to {n_targets} targets x {a.efficacy_n} forks x 2 versions, {len(pool)} pool tasks, "
+                f"flip confirmation)")
 
     if a.cmd == "plan":
         print(f"current version v{inc.version}; {len(base_rows)} baseline episodes "
               f"({sum(r['reward'] >= 1 for r in base_rows)} passed)\n")
         for g in groups:
             ex = [base_rows[i]["task_id"] for i in g.examples]
-            fails = skill_targets(base_rows, a.split, {g.tool}, max_targets=10_000)
-            print(f"  {g.tool:32s} {len(g.task_ids):3d} passing tasks; examples {ex}; "
-                  f"{len(fails)} failed tasks of this type")
+            fx = [base_rows[i]["task_id"] for i in g.failing_examples]
+            print(f"  {g.tool:32s} {len(g.task_ids):3d} passing tasks; examples {ex}"
+                  + (f"; failures shown {fx}" if a.contrast else ""))
         prompt_chars = sum(len(m["content"]) for g in groups
                            for m in induce_messages(g, base_rows, a.split, inc, tools))
-        targets = skill_targets(base_rows, a.split, {g.tool for g in groups}, a.max_targets)
-        evidence = {base_rows[i]["task_id"] for g in groups for i in g.examples}
-        pool = _pool(load_rows(led.rows_path(inc.version)), led.shown() | evidence | {t[0] for t in targets})
+        evidence = {base_rows[i]["task_id"] for g in groups for i in g.examples + g.failing_examples}
+        tp = skill_target_plan(cfg, base_rows, {g.tool for g in groups}, evidence)
+        n_t = min(a.max_targets, len(tp["stable"]) + len(tp["missing"]))
+        pool = _pool(load_rows(led.rows_path(inc.version)), led.shown() | evidence
+                     | {r["task_id"] for r in tp["failures"]})
         print(f"\ninduce: {len(groups)} LLM calls (~{prompt_chars // 4} prompt tokens in total), no episodes")
-        print(f"gate:   <= {skill_gate_cost(cfg, pool, len(targets))} episodes "
-              f"({len(targets)} targets x {a.efficacy_n} forks x 2 versions, {len(pool)} pool tasks, "
-              f"flip confirmation)")
+        print(target_summary(tp, n_t, pool))
         return
 
     if a.cmd == "induce":
@@ -138,18 +151,20 @@ def main() -> None:
     edits = [Edit.model_validate(c["edit"]) for c in json.loads(cand_path.read_text(encoding="utf-8"))
              if c.get("valid") and c.get("edit")]
     tools_cov = {e.source_cluster.split(":", 1)[1] for e in edits}
-    targets = skill_targets(base_rows, a.split, tools_cov, a.max_targets)
     evidence = {t for e in edits for t in e.evidence_tasks}
-    pool = _pool(load_rows(led.rows_path(inc.version)), led.shown() | evidence | {t[0] for t in targets})
+    tp = skill_target_plan(cfg, base_rows, tools_cov, evidence)
+    n_t = min(a.max_targets, len(tp["stable"]) + len(tp["missing"]))
+    pool = _pool(load_rows(led.rows_path(inc.version)), led.shown() | evidence
+                 | {r["task_id"] for r in tp["failures"]})
     print(f"gate {len(edits)} skills as one version on top of v{inc.version}: {[e.target for e in edits]}\n"
-          f"  targets {[t[0] for t in targets]}; pool {len(pool)} tasks\n"
-          f"  cost <= {skill_gate_cost(cfg, pool, len(targets))} episodes")
+          f"  known stable targets: {[r['task_id'] for r in tp['stable']]}\n" + target_summary(tp, n_t, pool))
     if not (a.yes or input("gate now? [y/N] ").strip().lower() == "y"):
         return
     from rewind.env.taubench_dialogue import litellm_user_llm
     from rewind.providers import DeepSeekProvider
     from rewind.snapshot import SnapshotStore
-    res = asyncio.run(gate_skill_library(cfg, led, edits, base_rows, provider=DeepSeekProvider(model=a.model),
+    res = asyncio.run(gate_skill_library(cfg, led, edits, base_rows, max_targets=a.max_targets,
+                                         provider=DeepSeekProvider(model=a.model),
                                          user_llm=litellm_user_llm(model=a.model, provider="deepseek"),
                                          store=SnapshotStore(a.store_dir), log=lambda m: print(m, flush=True)))
     print(json.dumps(res, indent=1, ensure_ascii=False))

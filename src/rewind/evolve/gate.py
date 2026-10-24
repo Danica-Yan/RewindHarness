@@ -126,10 +126,16 @@ def fisher_greater(k1: int, n1: int, k0: int, n0: int) -> float:
 
 async def efficacy(candidate: ContextVersion, targets: list[tuple[int, str, int, int]], *,
                    policy: GatePolicy, provider: Any, user_llm: Any, store: Any,
-                   log: Callable[[str], None] = print) -> tuple[Efficacy, int]:
-    """`targets`: (task_id, parent trace, null passes, null forks)."""
+                   log: Callable[[str], None] = print,
+                   rows_out: str | Path | None = None) -> tuple[Efficacy, int]:
+    """`targets`: (task_id, parent trace, null passes, null forks).
+    `rows_out`: also write every fork as a results row (with its
+    conversation), e.g. to see which skills the agent loaded."""
+    from ..env.taubench_dialogue import result_record
+    from .runner import write_rows
     cfg, reg = version_setup(candidate)
     k1 = n1 = 0
+    rows: list[dict] = []
     for task_id, trace, _, _ in targets:
         events = load_trace(trace)
         passes = 0
@@ -138,6 +144,12 @@ async def efficacy(candidate: ContextVersion, targets: list[tuple[int, str, int,
                                     registry=reg, system_prompt=cfg.system_prompt,
                                     run_id=f"{events[0].run_id}~eff{candidate.version}-{i}")
             passes += ep.reward.reward >= 1.0
+            if rows_out is not None:
+                row = result_record(ep.env, ep.result, i, None, ep.events)
+                row["info"]["rewind"]["ctx_version"] = candidate.version
+                rows.append(row)
+        if rows_out is not None:
+            write_rows(rows_out, rows)
         k1 += passes
         n1 += policy.efficacy_n
         log(f"    efficacy task {task_id:3d}: {passes}/{policy.efficacy_n} pass")
