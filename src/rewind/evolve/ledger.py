@@ -112,12 +112,13 @@ class EditLedger:
     def rejected_for_prompt(self, cluster: str | None = None, limit: int = 12) -> list[dict]:
         """Rejected edits for the proposer prompt: this cluster's first (with the
         full gate feedback, if any), then others, newest first."""
-        rows = self.db.execute(
-            "SELECT edit_json, stage, reason, data_json, cluster FROM decisions "
+        rows = [r for r in self.db.execute(
+            "SELECT edit_json, stage, reason, data_json, cluster, id FROM decisions "
             "WHERE accepted=0 AND edit_json IS NOT NULL AND stage != 'ablation' ORDER BY id DESC").fetchall()
+            if r[5] not in self.overturned()]
         rows.sort(key=lambda r: r[4] != cluster)  # stable: same cluster first, newest first within
         out = []
-        for ej, stage, reason, dj, cl in rows[:limit]:
+        for ej, stage, reason, dj, cl, _id in rows[:limit]:
             e = json.loads(ej)
             fb = ((json.loads(dj) if dj else {}) or {}).get("feedback") or {}
             out.append({"kind": e["kind"], "target": e["target"], "text": e.get("text"),
@@ -140,6 +141,15 @@ class EditLedger:
         self.db.execute("UPDATE decisions SET data_json=? WHERE id=?", (json.dumps(data, default=str),
                                                                         decision_id))
         self.db.commit()
+
+    def overturned(self) -> set[int]:
+        """Gate rejections that a later re-gate reversed (the edit was accepted)."""
+        out = set()
+        for dj, acc in self.db.execute("SELECT data_json, accepted FROM decisions WHERE stage='gate'"):
+            d = json.loads(dj) if dj else {}
+            if acc and d.get("regate_of") is not None:
+                out.add(int(d["regate_of"]))
+        return out
 
     def gate_rejections_without_feedback(self) -> list[tuple[int, int, dict]]:
         """(decision id, version_from, verdict) of rejected gate decisions that

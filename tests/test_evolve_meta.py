@@ -146,3 +146,23 @@ def test_meta_eval_adopts_lessons_only_when_they_win(setup):
     res2 = asyncio.run(meta.meta_eval(cfg, ledger, worse, clusters[:1], llm=proposer_llm, tool_names=[],
                                       provider=FakeAgent(), user_llm=fake_user, store=store, log=lambda m: None))
     assert not res2["adopted"] and meta.lessons(ledger) == new
+
+
+def test_overturned_rejections_teach_nothing(setup):
+    """A gate rejection later reversed by a re-gate: the proposer no longer
+    sees it as a rejected idea, and reflect sees it marked OVERTURNED
+    without its (noise-based) feedback."""
+    from rewind.evolve import meta
+    from rewind.evolve.surface import Edit
+    store, ledger, cfg = setup
+    e = rule("exchange_confirm", GOOD)
+    did = ledger.record(1, 0, e, "gate", False, "pool drop -0.037 exceeds 0.02",
+                        {"feedback": {"text": "narrow the trigger"}}, cluster="c1")
+    assert any(r["target"] == "exchange_confirm" for r in ledger.rejected_for_prompt("c1"))
+    ledger.record(2, 0, e, "gate", True, "0 of 12 regressions reproduce", {"regate_of": did}, cluster="c1")
+    assert ledger.overturned() == {did}
+    assert not any(r["target"] == "exchange_confirm" for r in ledger.rejected_for_prompt("c1"))
+    exp = meta.experience(ledger)
+    first = next(x for x in exp if x["reason"].startswith("OVERTURNED"))
+    assert first["feedback"] == "" and "did not reproduce" in first["reason"]
+    assert "OVERTURNED" in meta.reflect_messages(exp, [])[0]["content"]
