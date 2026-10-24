@@ -4,7 +4,7 @@ These are the "real infra" tier: unlike tests/test_checkpoint.py (which
 exhaustively crashes at every single checkpoint hook against sqlite, cheaply,
 in-process), these exercise the SAME worker.py/StepCheckpointer code path
 against actual network round-trips and real row-level locking, to prove the
-sqlite-vs-Postgres duck-typing (`_await.maybe_await`) actually works and that
+two backends really are interchangeable behind the `CoordinatorStore` port and that
 `FOR UPDATE SKIP LOCKED` behaves as claimed. A couple of representative crash
 points, not all seven — that exhaustiveness is what the sqlite tier is for.
 

@@ -14,11 +14,12 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
 
-from ._await import maybe_await
-from .checkpoint import Coordinator, JobSpec, StepCheckpointer
-from .loop import AgentConfig, AgentRunner, LoopState, RunResult
+from .checkpoint import StepCheckpointer
+from .coordination import CoordinatorStore, JobSpec
+from .loop import AgentConfig, AgentRunner, RunResult
 from .providers import LLMResponse
 from .snapshot import SnapshotStore
+from .state import LoopState
 from .tools import ToolRegistry
 from .trace import TraceWriter
 
@@ -30,25 +31,19 @@ class SimulatedCrash(Exception):
     way out of run_worker_step uncaught, exactly like a real process death."""
 
 
-def submit_job(coordinator: Coordinator, snapshots: SnapshotStore, run_id: str, task: str,
-               cfg: AgentConfig, initial_env: dict[str, Any], priority: int = 0) -> str:
-    """Sync convenience wrapper for the sqlite `Coordinator` (submit is fast
-    and local, so no reason to force callers through `asyncio.run` for it).
-    For `PgCoordinator`, call `submit_job_async` or `coordinator.submit`
-    directly with `await`."""
+async def submit_job(coordinator: CoordinatorStore, snapshots: SnapshotStore, run_id: str, task: str,
+                     cfg: AgentConfig, initial_env: dict[str, Any], priority: int = 0) -> str:
     ref = snapshots.put(initial_env)
     spec = JobSpec(run_id=run_id, task=task, cfg=asdict(cfg), initial_env_ref=ref)
-    return coordinator.submit(spec, priority=priority)
+    return await coordinator.submit(spec, priority=priority)
 
 
-async def submit_job_async(coordinator: Any, snapshots: SnapshotStore, run_id: str, task: str,
-                           cfg: AgentConfig, initial_env: dict[str, Any], priority: int = 0) -> str:
-    ref = snapshots.put(initial_env)
-    spec = JobSpec(run_id=run_id, task=task, cfg=asdict(cfg), initial_env_ref=ref)
-    return await maybe_await(coordinator.submit(spec, priority=priority))
+# Historical name from when the sqlite backend was synchronous and needed a
+# separate sync wrapper; every backend is async now.
+submit_job_async = submit_job
 
 
-async def run_worker_step(coordinator: Coordinator, snapshots: SnapshotStore, blobs: SnapshotStore,
+async def run_worker_step(coordinator: CoordinatorStore, snapshots: SnapshotStore, blobs: SnapshotStore,
                           registry: ToolRegistry, provider, env_factory: Callable[[dict], Any],
                           trace_dir: str | Path, owner: str | None = None,
                           lease_seconds: float = 30, fallback=None, sleep=None, clock=None,
@@ -57,7 +52,7 @@ async def run_worker_step(coordinator: Coordinator, snapshots: SnapshotStore, bl
     """Claim and fully execute (or resume) one job. Returns (result, env) or
     None if no job is available to claim right now."""
     owner = owner or ("worker-" + uuid.uuid4().hex[:8])
-    job = await maybe_await(coordinator.claim(owner, lease_seconds=lease_seconds))
+    job = await coordinator.claim(owner, lease_seconds=lease_seconds)
     if job is None:
         return None
 
@@ -68,7 +63,7 @@ async def run_worker_step(coordinator: Coordinator, snapshots: SnapshotStore, bl
     runner = AgentRunner(provider, registry, cfg, snapshots, clock=clock, fallback=fallback,
                          sleep=sleep, checkpointer=checkpointer, debug_hook=debug_hook)
 
-    ckpt = await maybe_await(coordinator.latest_checkpoint(job.run_id))
+    ckpt = await coordinator.latest_checkpoint(job.run_id)
     if ckpt is None:
         env = env_factory(snapshots.get(job.spec.initial_env_ref))
         trace = TraceWriter(job.run_id, trace_path, clock=clock)
@@ -93,6 +88,6 @@ async def run_worker_step(coordinator: Coordinator, snapshots: SnapshotStore, bl
     trace.close()
 
     if result.status != "fenced_out":
-        await maybe_await(coordinator.complete(job.job_id, job.fencing_token, result.status,
-                                               {"steps": result.steps, "env_hash": result.env_hash}))
+        await coordinator.complete(job.job_id, job.fencing_token, result.status,
+                                   {"steps": result.steps, "env_hash": result.env_hash})
     return result, env

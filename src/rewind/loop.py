@@ -16,13 +16,13 @@ from typing import Any, Protocol
 from .events import Event
 from .providers import LLMResponse, MalformedOutput, ProviderError, ToolCall
 from .snapshot import SnapshotStore
+from .state import ARG_ERRORS, LoopState, RunAbort  # noqa: F401  (re-exported)
 from .tools import ToolOutcome, ToolRegistry
 from .trace import TraceWriter
 from .util import SystemClock, request_hash, sha
 
 REPAIR_PROMPT = ("Your previous output could not be parsed. Respond again with either a "
                  "valid tool call or a final answer.")
-ARG_ERRORS = ("TOOL_ARG_INVALID", "HALLUCINATED_TOOL")
 
 
 @dataclass
@@ -60,13 +60,6 @@ class RunResult:
     env_hash: str
 
 
-class RunAbort(Exception):
-    def __init__(self, status: str, reason: str | None = None) -> None:
-        super().__init__(f"{status}: {reason}")
-        self.status = status
-        self.reason = reason
-
-
 class Checkpointer(Protocol):
     """Durability seam. `save` must raise RunAbort("fenced_out", ...) itself
     when the write is rejected (a newer worker took over) rather than
@@ -77,34 +70,6 @@ class Checkpointer(Protocol):
     async def save(self, kind: str, step: int, trace: TraceWriter, env: Any,
                    messages: list[dict], state: LoopState,
                    action: LLMResponse | None = None) -> None: ...
-
-
-@dataclass
-class LoopState:
-    """Loop counters that must survive a fork/resume; rebuildable from events."""
-    tokens: int = 0
-    call_counts: dict[str, int] = field(default_factory=dict)
-    consecutive_invalid: int = 0
-
-    def bump_call(self, name: str, args_hash: str) -> int:
-        key = f"{name}|{args_hash}"
-        self.call_counts[key] = self.call_counts.get(key, 0) + 1
-        return self.call_counts[key]
-
-    def note_result(self, error_class: str | None) -> None:
-        self.consecutive_invalid = self.consecutive_invalid + 1 if error_class in ARG_ERRORS else 0
-
-    @classmethod
-    def from_events(cls, events: list[Event]) -> LoopState:
-        st = cls()
-        for e in events:
-            if e.type == "llm_call" and "response" in e.data:
-                u = e.data["response"].get("usage") or {}
-                st.tokens += u.get("input_tokens", 0) + u.get("output_tokens", 0)
-            elif e.type == "tool_call":
-                st.bump_call(e.data["name"], e.data["args_hash"])
-                st.note_result(e.data["error_class"])
-        return st
 
 
 class AgentRunner:

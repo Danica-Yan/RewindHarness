@@ -8,7 +8,7 @@ import json
 import uuid
 from pathlib import Path
 
-from .checkpoint import Coordinator
+from .coordination import SqliteCoordinator
 from .env import ToyRetailEnv, build_registry, grade
 from .flywheel import bisect_attribute, flip_rate_via_fork
 from .flywheel.eval_attribution import evaluate_attribution_accuracy
@@ -85,7 +85,7 @@ async def ckpt_demo(out: Path) -> None:
     """Submit a job, run a worker that crashes mid-step-2 (after the mutating
     tool call actually applied, before the step is confirmed), then run a
     second worker that resumes and finishes correctly with no double-cancel."""
-    coord = Coordinator()
+    coord = SqliteCoordinator()
     snaps, blobs = SnapshotStore(), SnapshotStore()
     registry = build_registry()
     cfg = AgentConfig(system_prompt=SYSTEM)
@@ -93,7 +93,7 @@ async def ckpt_demo(out: Path) -> None:
              _call("cancel_order", order_id="O1", reason="ordered_by_mistake"),
              _text("Done, your order is cancelled.")]
 
-    job_id = submit_job(coord, snaps, "ckpt-demo", TASK, cfg, ToyRetailEnv().state)
+    job_id = await submit_job(coord, snaps, "ckpt-demo", TASK, cfg, ToyRetailEnv().state)
     print(f"[submit] job={job_id}")
 
     def crash_after_step2_tool(tag: str, step: int) -> None:
@@ -105,10 +105,10 @@ async def ckpt_demo(out: Path) -> None:
                               ToyRetailEnv.restore, out, owner="worker-A",
                               debug_hook=crash_after_step2_tool)
     except SimulatedCrash as e:
-        ckpt = coord.latest_checkpoint("ckpt-demo")
+        ckpt = await coord.latest_checkpoint("ckpt-demo")
         print(f"[crash]  {e} (latest durable checkpoint: step={ckpt.step} kind={ckpt.kind})")
 
-    job = coord.get(job_id)
+    job = await coord.get(job_id)
     print(f"[job]    status={job.status} (still LEASED to the dead worker until its lease expires)")
 
     # In production a second worker slot would just try to claim; here we force
@@ -120,7 +120,7 @@ async def ckpt_demo(out: Path) -> None:
                                         ToyRetailEnv.restore, out, owner="worker-B")
     print(f"[resume] status={result.status} graded_ok={grade(env)} "
           f"O1_status={env.state['orders']['O1']['status']}")
-    print(f"[job]    status={coord.get(job_id).status}")
+    print(f"[job]    status={(await coord.get(job_id)).status}")
 
 
 async def attribute_demo(out: Path) -> None:

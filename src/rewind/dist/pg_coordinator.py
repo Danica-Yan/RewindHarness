@@ -1,11 +1,11 @@
-"""Postgres-backed Coordinator: the real-infra twin of `checkpoint.Coordinator`.
+"""Postgres implementation of the `CoordinatorStore` port (coordination/store.py).
 
 Same job-queue-with-lease-and-fencing-plus-checkpoint-log protocol as the
-sqlite version (see `checkpoint.py`'s module docstring for *why* it's built
-the way it is — intent/tool/step checkpoint granularity, fencing tokens,
-etc.), same method names, but implemented against real Postgres with
-`asyncpg`, so worker.py's `run_worker_step` runs unmodified against either
-backend (see `_await.maybe_await`).
+sqlite backend in coordination/sqlite.py (see `checkpoint.py`'s module
+docstring for *why* it's built the way it is — intent/tool/step checkpoint
+granularity, fencing tokens, etc.), same method names, but implemented against real Postgres with
+`asyncpg`. worker.py's `run_worker_step` depends only on the port, so it
+runs unmodified against either backend.
 
 The one thing sqlite genuinely could not give us: `claim()` here uses
 `SELECT ... FOR UPDATE SKIP LOCKED`, real row-level locking that is safe
@@ -26,7 +26,7 @@ from typing import Any
 
 import asyncpg
 
-from ..checkpoint import Checkpoint, Job, JobSpec
+from ..coordination.types import Checkpoint, Job, JobSpec
 
 DEFAULT_DSN = "postgresql://rewind:rewind@127.0.0.1:5432/rewind_test"
 

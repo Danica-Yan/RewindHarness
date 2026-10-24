@@ -59,7 +59,7 @@ async def _fresh_job(registry):
     coord = Coordinator(clock=clock)
     snaps, blobs = SnapshotStore(), SnapshotStore()
     tmp = tempfile.mkdtemp()
-    job_id = submit_job(coord, snaps, "r1", TASK, AgentConfig(system_prompt=SYS), ToyRetailEnv().state)
+    job_id = await submit_job(coord, snaps, "r1", TASK, AgentConfig(system_prompt=SYS), ToyRetailEnv().state)
     return coord, snaps, blobs, tmp, job_id, clock
 
 
@@ -74,9 +74,9 @@ def test_cold_run_completes_and_writes_checkpoints_for_both_mutating_steps():
         res, env = await run_worker_step(coord, snaps, blobs, registry, ScriptedProvider(list(SCRIPT)),
                                          ToyRetailEnv.restore, tmp, owner="A", clock=clock)
         assert res.status == "completed" and grade(env) and counter["n"] == 1
-        assert coord.get(job_id).status == "completed"
+        assert (await coord.get(job_id)).status == "completed"
         kinds = {(c.step, c.kind) for c in
-                 [coord.latest_checkpoint("r1")]}  # sanity: at least the last one is there
+                 [await coord.latest_checkpoint("r1")]}  # sanity: at least the last one is there
         assert kinds
     asyncio.run(go())
 
@@ -97,7 +97,7 @@ async def _collect_hook_points():
     registry, _ = counting_registry()
     snaps, blobs = SnapshotStore(), SnapshotStore()
     coord = Coordinator(clock=FakeClock())
-    job_id = submit_job(coord, snaps, "dry", TASK, AgentConfig(system_prompt=SYS), ToyRetailEnv().state)
+    job_id = await submit_job(coord, snaps, "dry", TASK, AgentConfig(system_prompt=SYS), ToyRetailEnv().state)
     points: list[tuple[str, int]] = []
     await run_worker_step(coord, snaps, blobs, registry, ScriptedProvider(list(SCRIPT)),
                           ToyRetailEnv.restore, tempfile.mkdtemp(), owner="dry",
@@ -126,7 +126,7 @@ def test_crash_at_every_point_recovers_to_correct_state(tag, step):
             await run_worker_step(coord, snaps, blobs, registry, ScriptedProvider(list(SCRIPT)),
                                   ToyRetailEnv.restore, tmp, owner="A", clock=clock,
                                   debug_hook=crash_hook, lease_seconds=30)
-        assert coord.get(job_id).status == "leased" or coord.get(job_id).status == "LEASED"
+        assert (await coord.get(job_id)).status in ("leased", "LEASED")
 
         clock.advance(31)  # let A's lease expire
         remaining = SCRIPT[step:]
@@ -136,7 +136,7 @@ def test_crash_at_every_point_recovers_to_correct_state(tag, step):
         assert res.status == "completed", (tag, step, res)
         assert grade(env), f"final state wrong after crash at {tag}@{step}"
         assert counter["n"] == 1, f"cancel_order ran {counter['n']} times after crash at {tag}@{step}"
-        assert coord.get(job_id).status == "completed"
+        assert (await coord.get(job_id)).status == "completed"
     asyncio.run(go())
 
 
@@ -166,7 +166,7 @@ def test_torn_trace_events_are_truncated_on_resume():
 
         trace_path = Path(tmp) / "r1.jsonl"
         torn = load_trace(trace_path)
-        ckpt = coord.latest_checkpoint("r1")
+        ckpt = await coord.latest_checkpoint("r1")
         assert ckpt.kind == "step" and ckpt.step == 1
         assert any(e.seq > ckpt.seq for e in torn), "test setup should have left torn events on disk"
         assert any(e.type == "step_start" and e.step == 2 for e in torn)
@@ -218,30 +218,34 @@ def test_crash_after_intent_replays_recorded_action_not_a_new_model_call():
 # ---------------------------------------------------------------------------
 
 def test_second_worker_cannot_claim_before_lease_expires():
-    clock = FakeClock()
-    coord = Coordinator(clock=clock)
-    snaps = SnapshotStore()
-    submit_job(coord, snaps, "r1", TASK, AgentConfig(system_prompt=SYS), ToyRetailEnv().state)
-    job_a = coord.claim("A", lease_seconds=30)
-    assert job_a is not None
-    clock.advance(10)
-    assert coord.claim("B", lease_seconds=30) is None       # A's lease still valid
-    clock.advance(21)
-    job_b = coord.claim("B", lease_seconds=30)
-    assert job_b is not None and job_b.fencing_token == job_a.fencing_token + 1
+    async def go():
+        clock = FakeClock()
+        coord = Coordinator(clock=clock)
+        snaps = SnapshotStore()
+        await submit_job(coord, snaps, "r1", TASK, AgentConfig(system_prompt=SYS), ToyRetailEnv().state)
+        job_a = await coord.claim("A", lease_seconds=30)
+        assert job_a is not None
+        clock.advance(10)
+        assert await coord.claim("B", lease_seconds=30) is None       # A's lease still valid
+        clock.advance(21)
+        job_b = await coord.claim("B", lease_seconds=30)
+        assert job_b is not None and job_b.fencing_token == job_a.fencing_token + 1
+    asyncio.run(go())
 
 
 def test_heartbeat_extends_lease_and_is_token_gated():
-    clock = FakeClock()
-    coord = Coordinator(clock=clock)
-    snaps = SnapshotStore()
-    submit_job(coord, snaps, "r1", TASK, AgentConfig(system_prompt=SYS), ToyRetailEnv().state)
-    job = coord.claim("A", lease_seconds=10)
-    clock.advance(8)
-    assert coord.heartbeat(job.job_id, job.fencing_token, lease_seconds=10) is True
-    clock.advance(8)                                          # would have expired without the heartbeat
-    assert coord.claim("B", lease_seconds=10) is None
-    assert coord.heartbeat(job.job_id, job.fencing_token - 1, lease_seconds=10) is False  # stale token
+    async def go():
+        clock = FakeClock()
+        coord = Coordinator(clock=clock)
+        snaps = SnapshotStore()
+        await submit_job(coord, snaps, "r1", TASK, AgentConfig(system_prompt=SYS), ToyRetailEnv().state)
+        job = await coord.claim("A", lease_seconds=10)
+        clock.advance(8)
+        assert await coord.heartbeat(job.job_id, job.fencing_token, lease_seconds=10) is True
+        clock.advance(8)                                          # would have expired without the heartbeat
+        assert await coord.claim("B", lease_seconds=10) is None
+        assert await coord.heartbeat(job.job_id, job.fencing_token - 1, lease_seconds=10) is False  # stale token
+    asyncio.run(go())
 
 
 def test_zombie_checkpoint_write_is_fenced_out():
@@ -249,10 +253,10 @@ def test_zombie_checkpoint_write_is_fenced_out():
         clock = FakeClock()
         coord = Coordinator(clock=clock)
         snaps, blobs = SnapshotStore(), SnapshotStore()
-        submit_job(coord, snaps, "r1", TASK, AgentConfig(system_prompt=SYS), ToyRetailEnv().state)
-        job = coord.claim("A", lease_seconds=10)
+        await submit_job(coord, snaps, "r1", TASK, AgentConfig(system_prompt=SYS), ToyRetailEnv().state)
+        job = await coord.claim("A", lease_seconds=10)
         clock.advance(11)
-        newer = coord.claim("B", lease_seconds=30)                # supersedes A
+        newer = await coord.claim("B", lease_seconds=30)                # supersedes A
         assert newer.fencing_token == job.fencing_token + 1
 
         zombie = StepCheckpointer(coord, job.job_id, "r1", job.fencing_token, snaps, blobs)
@@ -266,13 +270,15 @@ def test_zombie_checkpoint_write_is_fenced_out():
 
 
 def test_complete_is_token_gated():
-    clock = FakeClock()
-    coord = Coordinator(clock=clock)
-    snaps = SnapshotStore()
-    submit_job(coord, snaps, "r1", TASK, AgentConfig(system_prompt=SYS), ToyRetailEnv().state)
-    job = coord.claim("A", lease_seconds=10)
-    clock.advance(11)
-    coord.claim("B", lease_seconds=30)
-    assert coord.complete(job.job_id, job.fencing_token, "completed") is False  # A is stale
-    current = coord.get(job.job_id)
-    assert coord.complete(job.job_id, current.fencing_token, "completed") is True
+    async def go():
+        clock = FakeClock()
+        coord = Coordinator(clock=clock)
+        snaps = SnapshotStore()
+        await submit_job(coord, snaps, "r1", TASK, AgentConfig(system_prompt=SYS), ToyRetailEnv().state)
+        job = await coord.claim("A", lease_seconds=10)
+        clock.advance(11)
+        await coord.claim("B", lease_seconds=30)
+        assert await coord.complete(job.job_id, job.fencing_token, "completed") is False  # A is stale
+        current = await coord.get(job.job_id)
+        assert await coord.complete(job.job_id, current.fencing_token, "completed") is True
+    asyncio.run(go())

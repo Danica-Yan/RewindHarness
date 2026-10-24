@@ -11,7 +11,8 @@ from typing import Any, Callable, Literal
 from pydantic import BaseModel, Field
 
 from .events import Event
-from .loop import AgentRunner, LoopState, RunResult
+from .loop import AgentRunner, RunResult
+from .state import LoopState
 from .providers import LLMResponse, ToolCall
 from .snapshot import SnapshotStore
 from .trace import TraceWriter
