@@ -43,7 +43,10 @@ Requirements:
   applies -- the conversations may not show all of them.
 - Never add a requirement the policy does not state, and do not narrow one it does (e.g. a balance
   check the policy only demands for gift cards must not be applied to every payment method).
-- "description" is ONE line saying when to use the skill (the agent decides from it whether to load it).
+- The agent ALSO follows the learned rules and tool notes listed below (they were proven by tests).
+  A skill must never contradict them; where one applies, follow it in the relevant step.
+- "description" is ONE line of at most 200 characters saying when to use the skill (the agent
+  decides from it whether to load it).
 Return JSON: {"name": "<snake_case>", "description": "...", "steps": ["...", ...],
 "tools": ["<tool names the procedure uses>"]}"""
 
@@ -128,6 +131,11 @@ def induce_messages(group: SkillGroup, rows: list[dict], split: str, ctx: Contex
         policy = wiki()
     parts = [f"Kind of request: tasks that need `{group.tool}`.", f"Tools: {', '.join(tool_names)}", "",
              "=== The agent's policy ===", policy.strip(), ""]
+    if ctx.rules or ctx.tool_notes:
+        parts.append("=== Learned rules and tool notes the agent also follows (never contradict) ===")
+        parts += [f"- {v}" for v in ctx.rules.values()]
+        parts += [f"- note on {k}: {v}" for k, v in ctx.tool_notes.items()]
+        parts.append("")
     if ctx.skills:
         parts.append("Skills that already exist (do not duplicate):")
         parts += [f"- {k}: {v['description']}" for k, v in ctx.skills.items()]
