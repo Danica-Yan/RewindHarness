@@ -50,6 +50,9 @@ likely to actually fix failures without side effects. Lessons are about HOW to w
 of kind, scope of the trigger, wording, what kinds of fixes have worked or failed -- never about
 specific customers, orders, ids or task numbers, and never about the evaluation procedure itself.
 Keep lessons from the current list that the evidence still supports.
+Weigh evidence honestly: a decision marked OVERTURNED was a wrong verdict -- learn nothing from its
+original feedback. A pattern seen once is weak: phrase such a lesson as tentative ("in the one case
+so far...") or leave it out; do not turn a single success into a general rule.
 Return JSON: {"lessons": ["...", ...], "rationale": "<one paragraph: what the history shows>"}"""
 
 
@@ -97,13 +100,18 @@ def validate_lessons(xs: Any) -> tuple[list[str], str | None]:
 def experience(ledger: EditLedger, exclude_clusters: set[str] = frozenset()) -> list[dict]:
     """Every proposed edit and where it stopped, with gate feedback."""
     out = []
-    for cluster, ej, stage, acc, reason, dj in ledger.db.execute(
-            "SELECT cluster, edit_json, stage, accepted, reason, data_json FROM decisions "
+    overturned = ledger.overturned()
+    for did, cluster, ej, stage, acc, reason, dj in ledger.db.execute(
+            "SELECT id, cluster, edit_json, stage, accepted, reason, data_json FROM decisions "
             "WHERE edit_json IS NOT NULL ORDER BY id"):
         if cluster in exclude_clusters or stage in ("ablation", "meta", "meta_screen"):
             continue
         e = json.loads(ej)
         data = json.loads(dj) if dj else {}
+        if did in overturned:
+            reason = (f"OVERTURNED -- originally: {reason}. A later re-gate with confirmation re-runs found "
+                      f"the apparent regressions did not reproduce (noise); the edit was adopted.")
+            data = {}
         out.append({"cluster": cluster, "kind": e.get("kind"), "target": e.get("target"), "trigger": e.get("trigger"),
                     "text": (e.get("text") or "")[:400], "stage": stage, "accepted": bool(acc),
                     "reason": reason, "feedback": ((data.get("feedback") or {}).get("text") or "")[:600]})
