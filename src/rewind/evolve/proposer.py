@@ -100,7 +100,8 @@ def _excerpt(traj: list[dict], max_msgs: int = 14, max_chars: int = 300) -> list
 
 
 def build_messages(cluster_key: str, evidence: list[dict], split: str, ctx: ContextVersion,
-                   rejected: list[dict], n: int, tool_names: list[str]) -> list[dict]:
+                   rejected: list[dict], n: int, tool_names: list[str],
+                   lessons: list[str] | None = None) -> list[dict]:
     parts = [f"Failure pattern: {cluster_key}", f"Tools: {', '.join(tool_names)}", ""]
     if ctx.rules or ctx.tool_notes or ctx.checks or ctx.skills:
         parts.append("Current learned rules:")
@@ -130,7 +131,11 @@ def build_messages(cluster_key: str, evidence: list[dict], split: str, ctx: Cont
         parts += _excerpt(row.get("traj", []))
         parts.append("")
     parts.append(f"Propose up to {n} alternative edits (different ideas, not variants of one).")
-    return [{"role": "system", "content": SYSTEM}, {"role": "user", "content": "\n".join(parts)}]
+    system = SYSTEM
+    if lessons:
+        system += "\n\nLessons from earlier rounds (how proposals fared in testing -- follow them):\n" + \
+            "\n".join(f"- {x}" for x in lessons)
+    return [{"role": "system", "content": system}, {"role": "user", "content": "\n".join(parts)}]
 
 
 def parse_edits(text: str, cluster_key: str, evidence_tasks: list[int]) -> list[Edit]:
@@ -160,13 +165,14 @@ def parse_edits(text: str, cluster_key: str, evidence_tasks: list[int]) -> list[
 
 
 class LLMProposer:
-    def __init__(self, llm: JsonLLM, tool_names: list[str]) -> None:
+    def __init__(self, llm: JsonLLM, tool_names: list[str], lessons: list[str] | None = None) -> None:
         self.llm = llm
         self.tool_names = tool_names
+        self.lessons = list(lessons or [])
         self.calls = 0
 
     async def propose(self, cluster_key, evidence, split, ctx, rejected, n=3) -> list[Edit]:
-        msgs = build_messages(cluster_key, evidence, split, ctx, rejected, n, self.tool_names)
+        msgs = build_messages(cluster_key, evidence, split, ctx, rejected, n, self.tool_names, self.lessons)
         self.last_messages = msgs
         self.calls += 1
         text = await self.llm(msgs)

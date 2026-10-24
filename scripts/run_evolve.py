@@ -10,6 +10,16 @@
             rejection feedback shown to the proposer (no stability re-run)
   regate    re-decide an earlier gate rejection under the current policy
             (reuses efficacy + pool episodes; only flip confirmation is new)
+  consolidate  for each learned item, test the version without it on the
+            fixes it is remembered for; remove it if that costs nothing
+  reflect   one LLM call: rewrite the proposer's lessons from the ledger
+            history -> <run-dir>/meta/proposed_lessons.json (not adopted yet)
+  meta-eval old vs proposed lessons on recorded clusters (validation +
+            screening); adopts the proposed lessons only if they win
+
+Regression memory: every task an accepted version fixed is re-checked by
+every later gate; `status` lists them (versions from before it existed are
+backfilled automatically, no API).
 
 The ledger, stability cache, gate results, round reports and SFT data all
 live under --run-dir. First use registers the baseline results file as v0.
@@ -34,9 +44,11 @@ from rewind.env.taubench_dialogue import build_dialogue_registry, litellm_user_l
 from rewind.evolve.gate import GatePolicy  # noqa: E402
 from rewind.evolve.ledger import EditLedger  # noqa: E402
 from rewind.evolve.loop import (  # noqa: E402
-    EvolveConfig, _gate_reserve, backfill_feedback, gate_pending, pending_candidates, plan,
-    regate, regate_candidates, retry_candidates, retry_cluster, run_round,
+    EvolveConfig, _gate_reserve, backfill_feedback, backfill_memory, gate_pending, pending_candidates,
+    plan, regate, regate_candidates, retry_candidates, retry_cluster, run_round,
 )
+from rewind.evolve import consolidate as consol  # noqa: E402
+from rewind.evolve import meta  # noqa: E402
 from rewind.evolve.prevalence import PrevalencePolicy  # noqa: E402
 from rewind.evolve.proposer import LLMProposer, deepseek_json_llm  # noqa: E402
 from rewind.evolve.screen import ScreenPolicy  # noqa: E402
@@ -51,7 +63,7 @@ def make_cfg(a: argparse.Namespace) -> EvolveConfig:
         stability_n=a.stability_n, screen=ScreenPolicy(n=a.screen_n, tau=a.tau),
         gate=GatePolicy(mode=a.gate_mode, trials=a.gate_trials, efficacy_n=a.efficacy_n,
                         max_drop=a.max_drop, confirm_k=a.confirm_k,
-                        max_confirmed_regressions=a.max_confirmed_regressions,
+                        max_confirmed_regressions=a.max_confirmed_regressions, regression_k=a.regression_k,
                         regression_budget=a.regression_budget),
         n_candidates=a.candidates, max_clusters_per_round=a.max_clusters,
         max_members_per_cluster=a.max_members, budget_episodes=a.budget, concurrency=a.concurrency)
@@ -71,7 +83,7 @@ def open_ledger(a: argparse.Namespace) -> EditLedger:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["plan", "round", "status", "rollback", "gate-pending", "retry",
-                                    "regate"])
+                                    "regate", "consolidate", "reflect", "meta-eval"])
     ap.add_argument("--base", help="baseline results json (registered as v0 on first use)")
     ap.add_argument("--run-dir", default="runs/p1")
     ap.add_argument("--store-dir", default="runs/p1/snapshots")
@@ -93,6 +105,9 @@ def main() -> None:
     ap.add_argument("--max-confirmed-regressions", type=int, default=1)
     ap.add_argument("--cluster", help="retry: which cluster (default: the most recent one)")
     ap.add_argument("--max-attempts", type=int, default=3, help="retry: proposer batches per cluster")
+    ap.add_argument("--regression-k", type=int, default=3, help="forks per remembered fix, per version (0 = off)")
+    ap.add_argument("--item", help="consolidate: only this rule/note/check/skill")
+    ap.add_argument("--meta-clusters", type=int, default=2, help="meta-eval: clusters to compare on")
     ap.add_argument("--regression-budget", type=int, default=None,
                     help="optional hard cap on raw regressions (noisy at high baselines)")
     ap.add_argument("--candidates", type=int, default=3)
@@ -104,9 +119,15 @@ def main() -> None:
 
     led = open_ledger(a)
     cfg = make_cfg(a)
+    if (n := backfill_memory(led, cfg)):
+        print(f"regression memory: backfilled {n} fixed task(s) from earlier versions")
     if a.cmd == "status":
         cur = led.current()
         print(f"current version: v{cur.version}")
+        print(f"regression memory: {[t for t, _ in led.regression_suite()] or 'empty'}")
+        print("proposer lessons: " + ("none" if not meta.lessons(led) else ""))
+        for x in meta.lessons(led):
+            print(f"  - {x}")
         for v, edits in led.lineage(cur.version):
             for e in edits:
                 print(f"  v{v}: {e['kind']} {e['target']}: {e.get('text')}")
@@ -125,6 +146,63 @@ def main() -> None:
 
     def ask(prompt: str) -> bool:
         return a.yes or input(prompt).strip().lower() == "y"
+
+    if a.cmd == "consolidate":
+        items = [i for i in consol.plan(led, cfg.gate) if a.item in (None, i["target"])]
+        if not items:
+            print("nothing learned yet")
+            return
+        for i in items:
+            print(f"  {i['kind']} {i['target']}: remembered fixes {i['evidence'] or 'none (skipped)'}; "
+                  f"<= {i['cost']} episodes")
+        if not ask("\nablate now? [y/N] "):
+            return
+        prov, user, store = clients()
+        res = asyncio.run(consol.ablate(led, cfg.gate, provider=prov, user_llm=user, store=store, only=a.item,
+                                        log=lambda m: print(m, flush=True)))
+        print(json.dumps(res, indent=1, ensure_ascii=False))
+        return
+
+    if a.cmd == "reflect":
+        exp = meta.experience(led)
+        print(f"{len(exp)} proposals in the ledger; current lessons: {meta.lessons(led) or 'none'}")
+        if not exp:
+            return
+        if not ask("one LLM call to propose new lessons? [y/N] "):
+            return
+        new, why, err = asyncio.run(meta.reflect(led, deepseek_json_llm(model=a.model, temperature=0.3)))
+        if err:
+            print(f"refused: {err}")
+            return
+        out = Path(a.run_dir) / "meta" / "proposed_lessons.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"lessons": new, "rationale": why}, ensure_ascii=False, indent=1))
+        print("proposed lessons:\n" + "\n".join(f"  - {x}" for x in new) + f"\n\nrationale: {why}\n\n"
+              f"wrote {out}; `meta-eval` decides whether they are adopted")
+        return
+
+    if a.cmd == "meta-eval":
+        src = Path(a.run_dir) / "meta" / "proposed_lessons.json"
+        if not src.exists():
+            sys.exit("no proposed lessons: run `reflect` first")
+        new, err = meta.validate_lessons(json.loads(src.read_text())["lessons"])
+        if err:
+            sys.exit(f"proposed lessons invalid: {err}")
+        cl = meta.meta_clusters(led, cfg)[: a.meta_clusters]
+        if not cl:
+            print("no cluster with a recorded A/B split to compare on")
+            return
+        print(f"compare old vs proposed lessons on {[c['cluster'] for c in cl]}: "
+              f"{2 * len(cl)} proposer calls, <= {meta.meta_cost(cfg, cl)} screening forks")
+        if not ask("run? [y/N] "):
+            return
+        prov, user, store = clients()
+        registry = build_dialogue_registry()
+        res = asyncio.run(meta.meta_eval(cfg, led, new, cl, llm=deepseek_json_llm(model=a.model),
+                                         tool_names=sorted(registry._tools), provider=prov,  # noqa: SLF001
+                                         user_llm=user, store=store, log=lambda m: print(m, flush=True)))
+        print(json.dumps(res, indent=1, ensure_ascii=False))
+        return
 
     if a.cmd == "regate":
         n = backfill_feedback(led, cfg)
@@ -173,7 +251,8 @@ def main() -> None:
             return
         prov, user, store = clients()
         registry = build_dialogue_registry()
-        proposer = LLMProposer(deepseek_json_llm(model=a.model), sorted(registry._tools))  # noqa: SLF001
+        proposer = LLMProposer(deepseek_json_llm(model=a.model), sorted(registry._tools),  # noqa: SLF001
+                               lessons=meta.lessons(led))
         rep = asyncio.run(retry_cluster(cfg, led, provider=prov, user_llm=user, store=store,
                                         proposer=proposer, cluster_key=c["cluster"],
                                         max_attempts=a.max_attempts, log=lambda m: print(m, flush=True)))
@@ -212,7 +291,8 @@ def main() -> None:
     if not a.yes and input("\nrun this round? [y/N] ").strip().lower() != "y":
         return
     registry = build_dialogue_registry()
-    proposer = LLMProposer(deepseek_json_llm(model=a.model), sorted(registry._tools))  # noqa: SLF001
+    proposer = LLMProposer(deepseek_json_llm(model=a.model), sorted(registry._tools),  # noqa: SLF001
+                               lessons=meta.lessons(led))
     rep = asyncio.run(run_round(cfg, led, provider=DeepSeekProvider(model=a.model),
                                 user_llm=litellm_user_llm(model=a.model, provider="deepseek"),
                                 store=SnapshotStore(a.store_dir), proposer=proposer,

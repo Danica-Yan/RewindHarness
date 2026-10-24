@@ -116,13 +116,16 @@ def plan(cfg: EvolveConfig, ledger: EditLedger) -> str:
         worst += st + sc
         lines.append(f"cluster {c.key}: stability <= {st} forks, screening <= {sc} forks")
     pool_after = len(_pool(rows, shown)) - (min(len(elig[0].tasks), cfg.max_members_per_cluster) if elig else 0)
-    g = pool_after * cfg.gate.trials + 2 * cfg.gate.confirm_k * max(4, round(0.15 * pool_after))
+    n_reg = len(ledger.regression_suite())
+    g = pool_after * cfg.gate.trials + 2 * cfg.gate.confirm_k * max(4, round(0.15 * pool_after)) \
+        + 2 * cfg.gate.regression_k * n_reg
     eff = 0
     if cfg.gate.mode == "targeted" and elig:
         eff = (min(len(elig[0].tasks), cfg.max_members_per_cluster) // 2) * cfg.gate.efficacy_n
         lines.append(f"gate efficacy (held-out targets, runs first): <= {eff} forks")
     worst += g + eff
-    lines.append(f"gate pool + flip confirmation (only if efficacy passes): <= {g} episodes "
+    lines.append(f"gate pool + flip confirmation + regression memory ({n_reg} tasks) "
+                 f"(only if efficacy passes): <= {g} episodes "
                  f"({'about half if the candidate is clearly harmful' if cfg.gate.futility_stop else 'no early stop'})")
     if elig:
         m0 = min(len(elig[0].tasks), cfg.max_members_per_cluster)
@@ -200,12 +203,55 @@ async def run_round(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, use
 
 
 
-def _gate_reserve(cfg: EvolveConfig, pool: list[int], n_targets: int) -> int:
+def _gate_reserve(cfg: EvolveConfig, pool: list[int], n_targets: int, n_reg: int = 0) -> int:
     """Worst-case-ish gate cost: efficacy + pool + flip confirmation (flips
-    budgeted at 15% of the pool, both versions)."""
+    budgeted at 15% of the pool, both versions) + regression memory."""
     eff = n_targets * cfg.gate.efficacy_n if cfg.gate.mode == "targeted" else 0
     conf = 2 * cfg.gate.confirm_k * max(4, round(0.15 * len(pool)))
-    return eff + len(pool) * cfg.gate.trials + conf
+    return eff + len(pool) * cfg.gate.trials + conf + 2 * cfg.gate.regression_k * n_reg
+
+
+def trace_lookup(ledger: EditLedger, cfg: EvolveConfig) -> dict[int, str]:
+    """task -> a recorded trace to fork it from (stability cache first, then
+    the baseline results)."""
+    from .stability import load_records
+    out: dict[int, str] = {}
+    for r in load_rows(ledger.rows_path(0)):
+        tr = ((r.get("info") or {}).get("rewind") or {}).get("trace")
+        if tr and r["task_id"] not in out:
+            out[r["task_id"]] = tr
+    for rec in load_records(_paths(cfg)["stability"]).values():
+        out[rec.task_id] = rec.trace
+    return out
+
+
+def remember_fixes(ledger: EditLedger, version: int, verdict: Any, traces: dict[int, str],
+                   source: str) -> int:
+    """Regression memory: the held-out targets the new version solved (at
+    least once in its efficacy forks) and the pool fixes that reproduced."""
+    v = verdict if isinstance(verdict, dict) else verdict.model_dump()
+    eff = v.get("efficacy") or {}
+    per = eff.get("per_task") or {}
+    fixed = [int(t) for t in eff.get("tasks", []) if not per or per.get(t, per.get(str(t), 0)) >= 1]
+    fixed += list(v.get("confirmed_fixes") or [])
+    return ledger.remember([(t, traces[t]) for t in dict.fromkeys(fixed) if t in traces], version, source)
+
+
+def backfill_memory(ledger: EditLedger, cfg: EvolveConfig) -> int:
+    """Add regression memory for versions committed before it existed (no API)."""
+    have = {t for t, _ in ledger.regression_suite()}
+    traces = trace_lookup(ledger, cfg)
+    n = 0
+    for ver, ej, vj in ledger.db.execute(
+            "SELECT version, edits_json, verdict_json FROM versions WHERE version>0 ORDER BY version").fetchall():
+        if not vj or ver > ledger.current().version:
+            continue
+        v = json.loads(vj)
+        tasks = set((v.get("efficacy") or {}).get("tasks", [])) | set(v.get("confirmed_fixes") or [])
+        if tasks and not tasks <= have:
+            src = ",".join(e.get("target", "") for e in json.loads(ej))
+            n += remember_fixes(ledger, ver, v, traces, src)
+    return n
 
 
 def _record_gate(ledger: EditLedger, round_no: int, inc: Any, e: Any, v: Any, rows: list[dict],
@@ -293,7 +339,8 @@ async def _try_edits(cfg: EvolveConfig, ledger: EditLedger, round_no: int, inc: 
 
         pool = _pool(rows, ledger.shown())
         targets = [(r.task_id, r.trace, r.passes, r.n) for r in b]
-        cost = _gate_reserve(cfg, pool, len(targets))
+        suite = ledger.regression_suite()
+        cost = _gate_reserve(cfg, pool, len(targets), len(suite))
         if not budget.can(cost):
             note(f"budget: gate needs <= {cost} episodes, {budget.left} left -- "
                  f"edit passed screening but is NOT gated this round; "
@@ -302,13 +349,15 @@ async def _try_edits(cfg: EvolveConfig, ledger: EditLedger, round_no: int, inc: 
         out = _paths(cfg)["gate"] / f"v{cand.version}_{e.edit_id}.json"
         v = await gate(cand, rows, pool, split=cfg.split, out=out, provider=provider,
                        user_llm=user_llm, store=store, policy=cfg.gate, targets=targets,
-                       concurrency=cfg.concurrency, log=log, incumbent=inc)
+                       concurrency=cfg.concurrency, log=log, incumbent=inc, regression_suite=suite)
         budget.spend(v.episodes)
         rep.gate = v.model_dump()
         _record_gate(ledger, round_no, inc, e, v, rows, cfg.split)
         note(f"  gate: {'ACCEPT' if v.accepted else 'reject'} -- {v.reason}")
         if v.accepted:
             ledger.commit(cand, [e], str(out), v.model_dump())
+            remember_fixes(ledger, cand.version, v, {**trace_lookup(ledger, cfg), **{t[0]: t[1] for t in targets}},
+                           e.target)
             rep.version_to = cand.version
             rep.committed_edit = e.model_dump()
             note(f"  committed v{cand.version}")
@@ -445,7 +494,8 @@ async def regate(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, user_l
         log(f"re-gating {e.kind} {e.target} (decision {c['decision_id']}): was '{old['reason']}'")
         v = await gate(cand, rows, pool, split=cfg.split, out=Path(old["rows_path"]), provider=provider,
                        user_llm=user_llm, store=store, policy=cfg.gate, concurrency=cfg.concurrency,
-                       log=log, incumbent=inc, prior_efficacy=Efficacy(**old["efficacy"]))
+                       log=log, incumbent=inc, prior_efficacy=Efficacy(**old["efficacy"]),
+                       regression_suite=ledger.regression_suite())
         _record_gate(ledger, c["round"], inc, e, v, rows, cfg.split,
                      {"regate_of": c["decision_id"]})
         ledger.mark_regated(c["decision_id"])
@@ -453,6 +503,7 @@ async def regate(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, user_l
         results.append({"edit": e.model_dump(), "verdict": v.model_dump(), "was": old["reason"]})
         if v.accepted:
             ledger.commit(cand, [e], old["rows_path"], v.model_dump())
+            remember_fixes(ledger, cand.version, v, trace_lookup(ledger, cfg), e.target)
             log(f"  committed v{cand.version}")
             break
     return results
@@ -495,7 +546,8 @@ async def gate_pending(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, 
         rows = load_rows(ledger.rows_path(inc.version))
         pool = _pool(rows, ledger.shown())
         e = p["edit"]
-        cost = _gate_reserve(cfg, pool, len(p["targets"]))
+        suite = ledger.regression_suite()
+        cost = _gate_reserve(cfg, pool, len(p["targets"]), len(suite))
         if not budget.can(cost):
             log(f"budget: gate needs <= {cost}, {budget.left} left -- stop")
             break
@@ -506,13 +558,15 @@ async def gate_pending(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, 
         out = _paths(cfg)["gate"] / f"v{cand.version}_{e.edit_id}.json"
         v = await gate(cand, rows, pool, split=cfg.split, out=out, provider=provider, user_llm=user_llm,
                        store=store, policy=cfg.gate, targets=p["targets"],
-                       concurrency=cfg.concurrency, log=log, incumbent=inc)
+                       concurrency=cfg.concurrency, log=log, incumbent=inc, regression_suite=suite)
         budget.spend(v.episodes)
         _record_gate(ledger, p["round"], inc, e, v, rows, cfg.split)
         log(f"  gate: {'ACCEPT' if v.accepted else 'reject'} -- {v.reason}")
         results.append({"edit": e.model_dump(), "verdict": v.model_dump()})
         if v.accepted:
             ledger.commit(cand, [e], str(out), v.model_dump())
+            remember_fixes(ledger, cand.version, v,
+                           {**trace_lookup(ledger, cfg), **{t[0]: t[1] for t in p["targets"]}}, e.target)
             log(f"  committed v{cand.version}")
             break
     return results
@@ -570,9 +624,9 @@ def skill_target_plan(cfg: EvolveConfig, base_rows: list[dict], tools: set[str],
             "assess_cost": len(missing) * cfg.stability_n}
 
 
-def skill_gate_cost(cfg: EvolveConfig, pool: list[int], n_targets: int) -> int:
+def skill_gate_cost(cfg: EvolveConfig, pool: list[int], n_targets: int, n_reg: int = 0) -> int:
     """Null forks under the incumbent + candidate forks + pool + confirmation."""
-    return n_targets * cfg.gate.efficacy_n + _gate_reserve(cfg, pool, n_targets)
+    return n_targets * cfg.gate.efficacy_n + _gate_reserve(cfg, pool, n_targets, n_reg)
 
 
 async def gate_skill_library(cfg: EvolveConfig, ledger: EditLedger, edits: list, base_rows: list[dict], *,
@@ -638,13 +692,13 @@ async def gate_skill_library(cfg: EvolveConfig, ledger: EditLedger, edits: list,
     lift = cnd.cand_passes / cnd.cand_n - null.cand_passes / null.cand_n
     eff = Efficacy(tasks=[t[0] for t in targets], cand_passes=cnd.cand_passes, cand_n=cnd.cand_n,
                    null_passes=null.cand_passes, null_n=null.cand_n, p_value=p, lift=lift,
-                   passed=p < cfg.gate.alpha and lift >= cfg.gate.min_lift)
+                   passed=p < cfg.gate.alpha and lift >= cfg.gate.min_lift, per_task=cnd.per_task)
     log(f"  efficacy: skills {eff.cand_passes}/{eff.cand_n} vs incumbent {eff.null_passes}/{eff.null_n}, "
         f"p = {p:.4f}")
     out = gdir / f"v{cand.version}_skills.json"
     v = await gate(cand, inc_rows, pool, split=cfg.split, out=out, provider=provider, user_llm=user_llm,
                    store=store, policy=cfg.gate, concurrency=cfg.concurrency, log=log, incumbent=inc,
-                   prior_efficacy=eff)
+                   prior_efficacy=eff, regression_suite=ledger.regression_suite())
     v = v.model_copy(update={"episodes": v.episodes + used})
     data = v.model_dump()
     data["efficacy_rows"] = [str(gdir / f"v{cand.version}_skills_eff_{w}.json") for w in ("incumbent", "candidate")]
@@ -652,6 +706,7 @@ async def gate_skill_library(cfg: EvolveConfig, ledger: EditLedger, edits: list,
         ledger.record(round_no, inc.version, e, "gate", v.accepted, v.reason, data, cluster=e.source_cluster)
     if v.accepted:
         ledger.commit(cand, added, str(out), data)
+        remember_fixes(ledger, cand.version, data, {t[0]: t[1] for t in targets}, "skills")
         log(f"  committed v{cand.version}")
     return {"accepted": v.accepted, "reason": v.reason, "episodes": v.episodes,
             "version": cand.version if v.accepted else None, "skills": [e.target for e in added],

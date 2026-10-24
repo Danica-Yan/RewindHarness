@@ -10,6 +10,8 @@ reproducible.
                 proposer so it does not repeat them
 * shown      -- train tasks whose failures were shown to the proposer or used
                 for screening; they are excluded from the gate pool forever
+* regressions -- regression memory: tasks an accepted version fixed, with a
+                trace to fork them from; every later gate re-checks them
 """
 from __future__ import annotations
 
@@ -30,6 +32,8 @@ CREATE TABLE IF NOT EXISTS decisions(
   created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS shown(task_id INTEGER PRIMARY KEY, round INTEGER, role TEXT);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS regressions(task_id INTEGER PRIMARY KEY, trace TEXT NOT NULL,
+  version INTEGER, source TEXT, created_at REAL NOT NULL);
 """
 
 
@@ -78,6 +82,8 @@ class EditLedger:
     def rollback(self, to_version: int) -> ContextVersion:
         ctx = self.version(to_version)  # raises if unknown
         self._set("current", str(to_version))
+        # fixes made by versions after the target no longer hold
+        self.db.execute("DELETE FROM regressions WHERE version>?", (to_version,))
         self.db.commit()
         return ctx
 
@@ -108,7 +114,7 @@ class EditLedger:
         full gate feedback, if any), then others, newest first."""
         rows = self.db.execute(
             "SELECT edit_json, stage, reason, data_json, cluster FROM decisions "
-            "WHERE accepted=0 AND edit_json IS NOT NULL ORDER BY id DESC").fetchall()
+            "WHERE accepted=0 AND edit_json IS NOT NULL AND stage != 'ablation' ORDER BY id DESC").fetchall()
         rows.sort(key=lambda r: r[4] != cluster)  # stable: same cluster first, newest first within
         out = []
         for ej, stage, reason, dj, cl in rows[:limit]:
@@ -171,6 +177,26 @@ class EditLedger:
         self._set("round", str(n))
         self.db.commit()
         return n
+
+    # -- regression memory -------------------------------------------------------------
+    def remember(self, items: list[tuple[int, str]], version: int, source: str) -> int:
+        """Add fixed tasks (task_id, trace to fork from); returns how many were new."""
+        n = 0
+        for task_id, trace in items:
+            cur = self.db.execute("INSERT OR IGNORE INTO regressions VALUES(?,?,?,?,?)",
+                                  (task_id, trace, version, source, time.time()))
+            n += cur.rowcount
+        self.db.commit()
+        return n
+
+    def regression_suite(self) -> list[tuple[int, str]]:
+        return [(t, tr) for t, tr in self.db.execute(
+            "SELECT task_id, trace FROM regressions ORDER BY task_id")]
+
+    def forget(self, version: int) -> None:
+        """Drop the memories a version added (used when it is rolled back)."""
+        self.db.execute("DELETE FROM regressions WHERE version=?", (version,))
+        self.db.commit()
 
     # -- meta ------------------------------------------------------------------------
     def _get(self, k: str) -> str | None:

@@ -19,6 +19,7 @@ Most agent frameworks make it easy to *run* an agent and hard to answer the ques
 - **Gated self-improvement (Evolve)** — failures are clustered, filtered for reproducibility with null forks, an LLM proposes context edits, and an edit ships only after proving an effect on held-out failures *and* no harm on tasks it never saw. Model weights never change.
 - **Policy checks (rules → code)** — mechanical policies (explicit yes before a write, act only for the authenticated user, look an order up before changing it) run as declarative checks before a tool executes; a blocked call never runs and the agent gets the reason back. Checks are backtested on recorded traces with zero API calls before Evolve spends any episode on them.
 - **Skill library** — procedures induced from *successful* episodes (one LLM call per task type), shown to the agent as a one-line index and loaded on demand with `load_skill`, so the trace records when a skill was used. The whole library is gated as one version against the incumbent's freshly measured rate on held-out failures.
+- **Compounding without regressing** — regression memory (every task an accepted version fixed is re-checked by every later gate), consolidation by ablation (a learned item is removed when dropping it costs nothing on the fixes it is remembered for), and a meta level: the proposer's *lessons* are rewritten from the ledger history and adopted only if they produce more screened-in candidates than the old lessons on the same clusters. The gate itself is never editable by the loop.
 
 > The Python package is named `rewind`, so the CLI and imports use that name.
 
@@ -169,6 +170,9 @@ python scripts/run_evolve.py status                                    # free: v
 python scripts/evolve_gate_report.py                                   # free: explain the last gate decision
 python scripts/run_evolve.py retry                                     # re-propose for a cluster, with feedback
 python scripts/run_evolve.py regate                                    # re-decide old rejections under the current gate
+python scripts/run_evolve.py consolidate                               # does each learned item still earn its place?
+python scripts/run_evolve.py reflect                                   # 1 LLM call: proposed proposer lessons
+python scripts/run_evolve.py meta-eval                                 # adopt them only if they beat the old ones
 python scripts/backtest_checks.py --results runs/p1/train_base.json --store-dir runs/p1/snapshots  # where policy checks would fire (no API)
 python scripts/induce_skills.py plan --base runs/p1/train_base.json      # skill groups + cost of induce/gate (no API)
 python scripts/export_viewer.py --run-dir runs/p1                      # free: then open viewer/index.html
