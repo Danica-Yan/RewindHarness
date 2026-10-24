@@ -41,6 +41,7 @@ from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel
 
+from ..environment import TextTurn
 from ..events import Event
 from ..snapshot import SnapshotStore
 from ..tools import Tool, ToolError, ToolRegistry
@@ -131,12 +132,6 @@ def recorded_user_llm(events: list[Event]) -> UserLLM:
 # ---------------------------------------------------------------------------
 # env
 # ---------------------------------------------------------------------------
-@dataclass
-class TextTurn:
-    reply: str
-    done: bool
-
-
 class TauBenchDialogueEnv(TauBenchRetailEnv):
     def __init__(self, store: SnapshotStore, user: TauUserSim, split: str, task_index: int,
                  data: dict[str, Any] | None = None) -> None:

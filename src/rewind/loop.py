@@ -13,6 +13,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol
 
+from .environment import DataBackedEnv, DialogueEnv, Environment, TerminatingEnv
 from .events import Event
 from .providers import LLMResponse, MalformedOutput, ProviderError, ToolCall
 from .snapshot import SnapshotStore
@@ -91,7 +92,7 @@ class AgentRunner:
         self.debug_hook = debug_hook or (lambda tag, step: None)
 
     # ---- public entry points -------------------------------------------------
-    async def run(self, env, task: str, trace: TraceWriter) -> RunResult:
+    async def run(self, env: Environment, task: str, trace: TraceWriter) -> RunResult:
         messages = [{"role": "system", "content": self.cfg.system_prompt},
                     {"role": "user", "content": task}]
         trace.emit("run_start", 0, {
@@ -103,14 +104,14 @@ class AgentRunner:
             trace.emit("message", 0, {"message": m})
         return await self._loop(env, messages, LoopState(), 1, trace, None)
 
-    async def resume(self, env, messages: list[dict], state: LoopState, start_step: int,
+    async def resume(self, env: Environment, messages: list[dict], state: LoopState, start_step: int,
                      trace: TraceWriter, forced: LLMResponse | None = None) -> RunResult:
         """Continue from a reconstructed state (used by fork). `forced` replaces the
         first LLM call (counterfactual action)."""
         return await self._loop(env, messages, state, start_step, trace, forced)
 
     # ---- internals -------------------------------------------------------------
-    async def _loop(self, env, messages, state: LoopState, step: int, trace: TraceWriter,
+    async def _loop(self, env: Environment, messages, state: LoopState, step: int, trace: TraceWriter,
                     forced: LLMResponse | None) -> RunResult:
         cfg = self.cfg
         rng = random.Random(int(sha(trace.run_id)[7:19], 16))
@@ -168,11 +169,10 @@ class AgentRunner:
                     # replay serves back instead of calling the user model) and
                     # as an ordinary `message` (so fork's prefix rebuild and
                     # LoopState.from_events need no special case).
-                    on_text = getattr(env, "on_text_turn", None)
-                    if on_text is None:
+                    if not isinstance(env, DialogueEnv):
                         final_text = resp.text
                         break
-                    turn = await on_text(resp.text or "")
+                    turn = await env.on_text_turn(resp.text or "")
                     trace.emit("user_turn", step, {"reply": turn.reply, "done": turn.done})
                     if turn.done:
                         final_text = resp.text
@@ -202,7 +202,7 @@ class AgentRunner:
 
                 # Some envs end the episode from a tool (tau-bench's
                 # transfer_to_human_agents). The step is complete either way.
-                if getattr(env, "terminated", False):
+                if isinstance(env, TerminatingEnv) and env.terminated:
                     if self.checkpointer is not None:
                         await self.checkpointer.save("step", step, trace, env, messages, state)
                     break
@@ -353,12 +353,12 @@ class AgentRunner:
         failing check is recorded as a guard event, including observe-only
         checks and blocks waived because the check's per-episode budget ran
         out, so a trace shows exactly what the policy did."""
-        policy = getattr(self.registry, "policy", None)
+        policy = self.registry.policy
         if not policy or history is None:
             return None
+        data = (env.data if isinstance(env, DataBackedEnv) else None) or {}
         blocked = None
-        for d in policy.evaluate(getattr(env, "data", {}) or {}, call.name, call.args, history,
-                                 self.registry.is_mutating):
+        for d in policy.evaluate(data, call.name, call.args, history, self.registry.is_mutating):
             trace.emit("guard", step, {"guard": "policy_check", "check": d.check_id,
                                        "action": d.action, "reason": d.reason, "call_id": call.id})
             if d.action == "block" and blocked is None:

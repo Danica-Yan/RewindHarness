@@ -2,6 +2,8 @@
 from .checkpoint import StepCheckpointer
 from .coordination import (Checkpoint, Coordinator, CoordinatorStore, JobSpec, SqliteCoordinator,
                            StaleFencingToken)
+from .environment import (DataBackedEnv, DialogueEnv, EnvFactory, Environment, TerminatingEnv,
+                          TextTurn)
 from .events import Event
 from .flywheel import AttributionResult, bisect_attribute, flip_rate_via_fork
 from .flywheel.failures import (
@@ -21,7 +23,7 @@ from .providers import (
 from .replay import ReplayReport, replay_run
 from .snapshot import SnapshotStore
 from .state import LoopState, RunAbort
-from .tools import Tool, ToolError, ToolOutcome, ToolRegistry, TransientToolError
+from .tools import Tool, ToolError, ToolGate, ToolOutcome, ToolRegistry, TransientToolError
 from .trace import TraceWriter, load_trace
 from .worker import SimulatedCrash, run_worker_step, submit_job, submit_job_async
 

@@ -7,7 +7,7 @@ Contract for tool functions: a tool that raises must NOT have mutated the env
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from pydantic import BaseModel, ValidationError
 
@@ -52,13 +52,30 @@ def _fmt_validation(e: ValidationError) -> str:
     return "; ".join(parts)
 
 
+class GateDecision(Protocol):
+    check_id: str
+    action: str          # "block" stops the call; anything else is recorded only
+    reason: str
+    message: str         # what the agent sees as the tool error when blocked
+
+
+class ToolGate(Protocol):
+    """Pre-execution check on a tool call. Declared here, at the tool layer,
+    so the registry and the loop depend on this contract rather than on
+    rewind.policy; `PolicySet` satisfies it structurally."""
+
+    def evaluate(self, data: dict, tool: str, args: dict, history: list[dict],
+                 is_write: Callable[[str], bool]) -> list[GateDecision]: ...
+
+
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
-        # Optional rewind.policy.PolicySet: checks the agent loop runs before
-        # executing a call (kept on the registry so every path that builds an
-        # agent -- run, fork, replay, the Evolve gate -- carries it along).
-        self.policy: Any = None
+        # Optional gate the agent loop runs before executing a call (in
+        # practice a rewind.policy.PolicySet). Kept on the registry so every
+        # path that builds an agent -- run, fork, replay, the Evolve gate --
+        # carries it along with the tool surface it guards.
+        self.policy: ToolGate | None = None
 
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool

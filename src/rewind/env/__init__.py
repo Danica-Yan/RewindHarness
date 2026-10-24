@@ -2,9 +2,11 @@
 
 `env` is a package: this file is the toy env unchanged from W1-W7; the real
 tau-bench adapter (W1 followup, see taubench_adapter.py) lives alongside it.
-All the loop needs from an env is `snapshot()`, `restore()`, an `applied`
-dict for idempotency, and `db_hash()` for grading (bookkeeping fields are
-excluded from grading on purpose) -- both envs implement the same shape.
+What the loop needs from an env is the `Environment` protocol in
+rewind/environment.py (`snapshot()` + the `applied` idempotency ledger),
+plus whichever optional capabilities an env has; `restore()` is the
+`EnvFactory` resume/fork use, and `db_hash()` is for grading (bookkeeping
+fields are excluded from grading on purpose).
 """
 from __future__ import annotations
 
