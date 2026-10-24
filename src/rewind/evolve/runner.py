@@ -1,8 +1,8 @@
-"""Batch execution of real tau-bench episodes under a given ContextVersion.
+"""Batch execution of benchmark episodes under a given ContextVersion.
 
 Shared by scripts/run_taubench_rewind.py (baselines) and the evolution loop
-(gate runs, re-runs after a commit). Results are written in tau-bench's
-run.py format after every episode, and finished (task, trial) pairs are
+(gate runs, re-runs after a commit). Results are written in the
+benchmark's own row format (`Benchmark.result_record`) after every episode, and finished (task, trial) pairs are
 skipped on restart, so an interrupted batch resumes where it stopped.
 """
 from __future__ import annotations
@@ -13,17 +13,17 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from ..env.taubench_dialogue import (
-    build_dialogue_registry, faithful_config, result_record, run_episode, wiki,
-)
+from ..benchmark import Benchmark
+from ..experiment import run_episode
 from ..snapshot import SnapshotStore
 from .surface import ContextVersion
 
 
-def version_setup(ctx: ContextVersion):
-    """(AgentConfig, ToolRegistry) for episodes under `ctx`."""
-    cfg = faithful_config(system_prompt=ctx.render_system_prompt(wiki()))
-    return cfg, ctx.patch_registry(build_dialogue_registry())
+def version_setup(ctx: ContextVersion, *, bench: Benchmark):
+    """(AgentConfig, ToolRegistry) for episodes under `ctx`: the benchmark's
+    own config and tools with the version's edits layered on top."""
+    cfg = bench.agent_config(system_prompt=ctx.render_system_prompt(bench.policy_text()))
+    return cfg, ctx.patch_registry(bench.build_registry())
 
 
 def load_rows(path: str | Path) -> list[dict]:
@@ -41,7 +41,7 @@ def write_rows(path: str | Path, rows: list[dict]) -> None:
 
 
 async def run_batch(split: str, task_ids: list[int], trials: int, out: str | Path, *,
-                    ctx: ContextVersion, provider: Any, user_llm: Any, store: SnapshotStore,
+                    ctx: ContextVersion, bench: Benchmark, provider: Any, user_llm: Any, store: SnapshotStore,
                     trace_dir: str | Path | None = None, concurrency: int = 4,
                     log: Callable[[str], None] = print, trial_offset: int = 0) -> list[dict]:
     """Run `trials` trials (numbered from `trial_offset`) of each task; rows
@@ -53,7 +53,7 @@ async def run_batch(split: str, task_ids: list[int], trials: int, out: str | Pat
     jobs = [(t, i) for t in range(trial_offset, trial_offset + trials) for i in task_ids
             if (i, t) not in done]
     log(f"{out.name}: {len(jobs)} episodes to run ({len(done)} already done)")
-    cfg, registry = version_setup(ctx)
+    cfg, registry = version_setup(ctx, bench=bench)
     sem = asyncio.Semaphore(concurrency)
     lock = asyncio.Lock()
     t0 = time.time()
@@ -63,12 +63,12 @@ async def run_batch(split: str, task_ids: list[int], trials: int, out: str | Pat
             name = f"{split}-{idx}-t{trial}" + (f"-v{ctx.version}" if ctx.version else "")
             path = trace_dir / f"{name}.jsonl"
             try:
-                ep = await run_episode(split, idx, provider=provider, user_llm=user_llm, store=store,
+                ep = await run_episode(bench, split, idx, provider=provider, user_llm=user_llm, store=store,
                                        cfg=cfg, registry=registry, run_id=name, trace_path=str(path))
             except Exception as e:  # one broken episode must not kill the batch
                 log(f"[error] {name}: {type(e).__name__}: {e}")
                 return
-            row = result_record(ep.env, ep.result, trial, str(path), ep.events)
+            row = bench.result_record(ep.env, ep.result, trial, str(path), ep.events)
             row["info"]["rewind"]["ctx_version"] = ctx.version
             async with lock:
                 rows.append(row)

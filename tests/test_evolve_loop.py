@@ -21,6 +21,9 @@ from pathlib import Path
 import pytest
 
 from rewind.env.taubench_adapter import _ensure_importable
+from rewind.env.taubench_benchmark import TauBenchRetail
+
+TAU = TauBenchRetail()
 
 try:
     _ensure_importable()
@@ -120,7 +123,7 @@ def base_run(tmp_path_factory):
     store = SnapshotStore(d / "snaps")
     asyncio.run(run_batch("train", list(range(N_TASKS)), 1, d / "base.json", ctx=ContextVersion(),
                           provider=FakeAgent(), user_llm=fake_user, store=store,
-                          concurrency=8, log=lambda m: None))
+                          concurrency=8, log=lambda m: None, bench=TAU))
     return d
 
 
@@ -137,7 +140,7 @@ def _setup(tmp_path, base_run=None):
     if not base.exists():
         asyncio.run(run_batch("train", list(range(N_TASKS)), 1, base, ctx=ContextVersion(),
                               provider=FakeAgent(), user_llm=fake_user, store=store,
-                              concurrency=8, log=lambda m: None))
+                              concurrency=8, log=lambda m: None, bench=TAU))
     ledger = EditLedger(tmp_path / "ledger.sqlite")
     ledger.init_base(str(base))
     cfg = EvolveConfig(run_dir=str(tmp_path / "run"),
@@ -152,14 +155,14 @@ def test_good_rule_is_committed_and_bad_ones_are_stopped_at_screening(setup):
     base_rows = load_rows(ledger.rows_path(0))
     assert {r["task_id"] for r in base_rows if r["reward"] < 1} == HARD
 
-    text = plan(cfg, ledger)
+    text = plan(cfg, ledger, bench=TAU)
     assert "exchange_delivered_order_items" in text and "worst case" in text
 
     prop = FakeProposer([rule("poison", f"You must {POISON}."),
                          rule("leaky", "For #W1234567 do an exchange."),
                          rule("exchange_confirm", f"Before exchanging, {MAGIC} with the user.")])
     rep = asyncio.run(run_round(cfg, ledger, provider=FakeAgent(), user_llm=fake_user, store=store,
-                                proposer=prop, log=lambda m: None))
+                                proposer=prop, log=lambda m: None, bench=TAU))
     stages = [(d["stage"], d["accepted"]) for d in ledger.decisions()]
     assert ("invalid", 0) in stages                        # leaky id refused offline
     assert stages.count(("screen", 0)) == 1                 # poison died in screening
@@ -176,7 +179,7 @@ def test_good_rule_is_committed_and_bad_ones_are_stopped_at_screening(setup):
 
     # next round: the fixed cluster is gone from the new incumbent's failures
     rep2 = asyncio.run(run_round(cfg, ledger, provider=FakeAgent(), user_llm=fake_user, store=store,
-                                 proposer=FakeProposer([]), log=lambda m: None))
+                                 proposer=FakeProposer([]), log=lambda m: None, bench=TAU))
     assert rep2.version_to is None and "no eligible cluster" in rep2.events[0]
 
 
@@ -184,7 +187,7 @@ def test_rule_with_side_effects_is_rejected_by_the_gate(setup):
     store, ledger, cfg = setup
     prop = FakeProposer([rule("exchanges_only", f"{MAGIC.capitalize()}; {SIDE_EFFECT}.")])
     rep = asyncio.run(run_round(cfg, ledger, provider=FakeAgent(), user_llm=fake_user, store=store,
-                                proposer=prop, log=lambda m: None))
+                                proposer=prop, log=lambda m: None, bench=TAU))
     assert rep.version_to is None and ledger.current().version == 0
     assert rep.gate is not None and not rep.gate["accepted"]
     assert rep.gate["regressions"]
@@ -197,7 +200,7 @@ def test_budget_cap_stops_before_the_gate(setup):
     cfg = cfg.model_copy(update={"budget_episodes": 40})
     prop = FakeProposer([rule("exchange_confirm", f"Before exchanging, {MAGIC} with the user.")])
     rep = asyncio.run(run_round(cfg, ledger, provider=FakeAgent(), user_llm=fake_user, store=store,
-                                proposer=prop, log=lambda m: None))
+                                proposer=prop, log=lambda m: None, bench=TAU))
     assert rep.gate is None and rep.version_to is None
     assert any("NOT gated" in e for e in rep.events)
     assert rep.episodes_used <= 40
@@ -209,7 +212,7 @@ def test_budget_cap_stops_before_the_gate(setup):
     shown_before = ledger.shown()
     res = asyncio.run(gate_pending(cfg.model_copy(update={"budget_episodes": 200}), ledger,
                                    provider=FakeAgent(), user_llm=fake_user, store=store,
-                                   log=lambda m: None))
+                                   log=lambda m: None, bench=TAU))
     assert res[0]["verdict"]["accepted"] and ledger.current().version == 1
     assert ledger.shown() == shown_before and prop.calls == 1
     assert pending_candidates(ledger, cfg) == []
@@ -246,7 +249,7 @@ def test_targeted_gate_skips_the_pool_when_there_is_no_effect(setup, tmp_path):
     out = tmp_path / "noop_gate.json"
     v = asyncio.run(gate(noop, rows, [r["task_id"] for r in rows if r["task_id"] not in HARD],
                          split="train", out=out, provider=FakeAgent(), user_llm=fake_user, store=store,
-                         policy=GatePolicy(efficacy_n=5), targets=targets, log=lambda m: None))
+                         policy=GatePolicy(efficacy_n=5), targets=targets, log=lambda m: None, bench=TAU))
     assert not v.accepted and "no proven effect" in v.reason
     assert v.episodes == 15 and not out.exists()
 
@@ -281,7 +284,7 @@ def _gate_direct(setup, cand_text, *, noisy=frozenset(), policy=None):
     out = Path(cfg.run_dir) / "gate" / "direct.json"
     v = asyncio.run(gate(cand, rows, pool, split="train", out=out, provider=FakeAgent(noisy),
                          user_llm=fake_user, store=store, policy=policy or GatePolicy(),
-                         incumbent=ContextVersion(), prior_efficacy=eff, log=lambda m: None))
+                         incumbent=ContextVersion(), prior_efficacy=eff, log=lambda m: None, bench=TAU))
     return v, ledger, cfg, rows
 
 
@@ -315,12 +318,12 @@ def test_old_margin_rule_rejects_noise_and_regate_overturns_it(setup):
     v_old, ledger, cfg, rows = _gate_direct(setup, harmless, noisy=noisy, policy=old)
     assert not v_old.accepted and "exceeds" in v_old.reason and v_old.ci[1] >= 0
     e = rule("r", harmless)
-    _record_gate(ledger, 1, ContextVersion(), e, v_old, rows, "train")
+    _record_gate(ledger, 1, ContextVersion(), e, v_old, rows, "train", bench=TAU)
     assert len(regate_candidates(ledger)) == 1
     agent = FakeAgent(noisy)
     agent.episodes = {t: 1 for t in noisy}  # their one noisy episode already happened
     res = asyncio.run(regate(cfg, ledger, provider=agent, user_llm=fake_user, store=store,
-                             log=lambda m: None))
+                             log=lambda m: None, bench=TAU))
     assert res and res[0]["verdict"]["accepted"]
     assert res[0]["verdict"]["confirmed_regressions"] == []
     assert ledger.current().version == 1 and regate_candidates(ledger) == []
@@ -332,7 +335,7 @@ def test_rejection_feedback_reaches_the_proposer_on_retry(setup):
     store, ledger, cfg = setup
     bad = FakeProposer([rule("exchanges_only", f"{MAGIC.capitalize()}; {SIDE_EFFECT}.")])
     rep = asyncio.run(run_round(cfg, ledger, provider=FakeAgent(), user_llm=fake_user, store=store,
-                                proposer=bad, log=lambda m: None))
+                                proposer=bad, log=lambda m: None, bench=TAU))
     assert rep.gate is not None and not rep.gate["accepted"]
     fb = ledger.rejected_for_prompt(rep.clusters_considered[0])[0]["feedback"]
     assert "broke" in fb and "before (passed)" in fb
@@ -341,7 +344,7 @@ def test_rejection_feedback_reaches_the_proposer_on_retry(setup):
     shown_before = ledger.shown()
     good = FakeProposer([rule("exchange_confirm", f"Before exchanging, {MAGIC} with the user.")])
     rep2 = asyncio.run(retry_cluster(cfg, ledger, provider=FakeAgent(), user_llm=fake_user, store=store,
-                                     proposer=good, log=lambda m: None))
+                                     proposer=good, log=lambda m: None, bench=TAU))
     seen = good.seen_rejected[0]
     assert seen[0]["target"] == "exchanges_only" and "broke" in seen[0]["feedback"]
     assert rep2.version_to == 1 and ledger.shown() == shown_before  # no new tasks spent
@@ -361,7 +364,7 @@ def test_checks_are_backtested_offline_before_any_fork(setup):
         {"tools": ["exchange_delivered_order_items"], "condition": "args_same_length",
          "params": {"a": "item_ids", "b": "new_item_ids"}, "message": "Item lists must match."}))
     rep = asyncio.run(run_round(cfg, ledger, provider=FakeAgent(), user_llm=fake_user, store=store,
-                                proposer=FakeProposer([confirm, same_len]), log=lambda m: None))
+                                proposer=FakeProposer([confirm, same_len]), log=lambda m: None, bench=TAU))
     bt = {d["edit_id"]: d for d in ledger.decisions() if d["stage"] == "backtest"}
     assert len(bt) == 2 and not any(d["accepted"] for d in bt.values())
     reasons = {d["reason"].split(" calls")[0] for d in bt.values()}

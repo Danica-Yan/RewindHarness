@@ -35,7 +35,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from rewind.env.taubench_dialogue import fork_episode, litellm_user_llm  # noqa: E402
+from rewind.env.taubench_dialogue import litellm_user_llm  # noqa: E402
+from rewind.experiment import fork_episode  # noqa: E402
+from rewind.env.taubench_benchmark import TauBenchRetail  # noqa: E402
+TAU = TauBenchRetail()  # noqa: E402
 from rewind.providers import DeepSeekProvider  # noqa: E402
 from rewind.snapshot import SnapshotStore  # noqa: E402
 from rewind.trace import load_trace  # noqa: E402
@@ -74,7 +77,7 @@ async def main_async(args: argparse.Namespace) -> None:
         k = fork_step(events, frac)
         async with sem:
             try:
-                ep = await fork_episode(events, k, provider=provider, user_llm=user_llm,
+                ep = await fork_episode(TAU, events, k, provider=provider, user_llm=user_llm,
                                         store=store, run_id=f"{events[0].run_id}~null{k}-{i}")
             except Exception as e:
                 print(f"[error] task {row['task_id']} frac {frac} #{i}: {e}", flush=True)

@@ -25,7 +25,8 @@ from typing import Any, Callable, Literal
 
 from pydantic import BaseModel
 
-from ..env.taubench_dialogue import fork_episode
+from ..benchmark import Benchmark
+from ..experiment import fork_episode
 from ..snapshot import SnapshotStore
 from ..trace import load_trace
 
@@ -88,7 +89,7 @@ def pending(rows: list[dict], out: str | Path) -> list[tuple[dict, int]]:
     return todo
 
 
-async def assess_failures(rows: list[dict], out: str | Path, *, store: SnapshotStore, provider: Any,
+async def assess_failures(rows: list[dict], out: str | Path, *, store: SnapshotStore, bench: Benchmark, provider: Any,
                           user_llm: Any, registry: Any, n: int = 5, stable_max: int = 1,
                           flaky_min: int = 3, concurrency: int = 4,
                           log: Callable[[str], None] = print) -> dict[str, StabilityRecord]:
@@ -120,7 +121,7 @@ async def assess_failures(rows: list[dict], out: str | Path, *, store: SnapshotS
         try:
             for i in range(n):
                 async with sem:
-                    ep = await fork_episode(events, 1, provider=provider, user_llm=user_llm,
+                    ep = await fork_episode(bench, events, 1, provider=provider, user_llm=user_llm,
                                             store=store, registry=registry,
                                             run_id=f"{events[0].run_id}~null1-{i}")
                 done += 1

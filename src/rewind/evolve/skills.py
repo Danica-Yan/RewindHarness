@@ -21,8 +21,7 @@ from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel
 
-from ..env.taubench_adapter import MUTATING_TOOLS
-from ..env.taubench_dialogue import load_task
+from ..benchmark import Benchmark
 from ..skills import LOAD_SKILL
 from .proposer import _excerpt
 from .surface import ContextVersion, Edit, EditError, parse_skill
@@ -75,11 +74,11 @@ def failure_half(task_id: int) -> str:
     return "A" if hashlib.sha256(f"skill-split-{task_id}".encode()).digest()[0] % 2 == 0 else "B"
 
 
-def task_writes(split: str, task_id: int) -> set[str]:
-    return {a.name for a in load_task(split, task_id).actions if a.name in MUTATING_TOOLS}
+def task_writes(split: str, task_id: int, *, bench: Benchmark) -> set[str]:
+    return {a.name for a in bench.task(split, task_id).actions if a.name in bench.write_tools}
 
 
-def skill_groups(rows: list[dict], split: str, *, min_passing: int = 5, k: int = 4,
+def skill_groups(rows: list[dict], split: str, *, bench: Benchmark, min_passing: int = 5, k: int = 4,
                  skip_tools: set[str] = frozenset(), contrast: bool = False,
                  fail_k: int = 2) -> list[SkillGroup]:
     """One group per write tool with at least `min_passing` passing episodes.
@@ -91,7 +90,7 @@ def skill_groups(rows: list[dict], split: str, *, min_passing: int = 5, k: int =
     for i, r in enumerate(rows):
         if r["reward"] < 1.0:
             continue
-        w = writes.setdefault(r["task_id"], task_writes(split, r["task_id"]))
+        w = writes.setdefault(r["task_id"], task_writes(split, r["task_id"], bench=bench))
         for t in w:
             by_tool[t].append(i)
     out = []
@@ -114,7 +113,7 @@ def skill_groups(rows: list[dict], split: str, *, min_passing: int = 5, k: int =
                 t = rr["task_id"]
                 if rr["reward"] >= 1.0 or t in seen_f or failure_half(t) != "A":
                     continue
-                if tool in writes.setdefault(t, task_writes(split, t)):
+                if tool in writes.setdefault(t, task_writes(split, t, bench=bench)):
                     fails.append(i)
                     seen_f.add(t)
                 if len(fails) == fail_k:
@@ -125,10 +124,10 @@ def skill_groups(rows: list[dict], split: str, *, min_passing: int = 5, k: int =
 
 
 def induce_messages(group: SkillGroup, rows: list[dict], split: str, ctx: ContextVersion,
-                    tool_names: list[str], policy: str | None = None) -> list[dict]:
+                    tool_names: list[str], policy: str | None = None, *,
+                    bench: Benchmark) -> list[dict]:
     if policy is None:
-        from ..env.taubench_dialogue import wiki
-        policy = wiki()
+        policy = bench.policy_text()
     parts = [f"Kind of request: tasks that need `{group.tool}`.", f"Tools: {', '.join(tool_names)}", "",
              "=== The agent's policy ===", policy.strip(), ""]
     if ctx.rules or ctx.tool_notes:
@@ -143,12 +142,12 @@ def induce_messages(group: SkillGroup, rows: list[dict], split: str, ctx: Contex
     for n, i in enumerate(group.examples, 1):
         r = rows[i]
         parts.append(f"=== Successful conversation {n} ===")
-        parts.append(f"Customer goal: {load_task(split, r['task_id']).instruction}")
+        parts.append(f"Customer goal: {bench.task(split, r['task_id']).instruction}")
         parts += _excerpt(r.get("traj", []), max_msgs=24, max_chars=220)
         parts.append("")
     for n, i in enumerate(group.failing_examples, 1):
         r = rows[i]
-        task = load_task(split, r["task_id"])
+        task = bench.task(split, r["task_id"])
         gold = [f"{a.name}({json.dumps(a.kwargs, ensure_ascii=False)})" for a in task.actions
                 if a.name != "respond"]
         parts.append(f"=== FAILED conversation {n} (same kind of request) ===")
@@ -184,12 +183,12 @@ def parse_skill_edit(text: str, group: SkillGroup, rows: list[dict]) -> Edit | N
 
 
 async def induce(groups: list[SkillGroup], rows: list[dict], split: str, ctx: ContextVersion,
-                 llm: JsonLLM, tool_names: list[str], policy: str | None = None
-                 ) -> list[tuple[SkillGroup, Edit | None, str]]:
+                 llm: JsonLLM, tool_names: list[str], policy: str | None = None, *,
+                 bench: Benchmark) -> list[tuple[SkillGroup, Edit | None, str]]:
     """One LLM call per group. Returns (group, edit or None, raw text)."""
     out = []
     for g in groups:
-        text = await llm(induce_messages(g, rows, split, ctx, tool_names, policy))
+        text = await llm(induce_messages(g, rows, split, ctx, tool_names, policy, bench=bench))
         out.append((g, parse_skill_edit(text, g, rows), text))
     return out
 
@@ -239,14 +238,15 @@ class SkillUsage(BaseModel):
     loaded_elsewhere: int           # loaded in episodes whose task does not need the tool
 
 
-def skill_usage(rows: list[dict], split: str, covers: dict[str, str]) -> list[SkillUsage]:
+def skill_usage(rows: list[dict], split: str, covers: dict[str, str], *,
+                bench: Benchmark) -> list[SkillUsage]:
     """`covers`: skill name -> the write tool it is for (from the edit's
     source_cluster "skill:<tool>"). Observational: agents choose when to load."""
     out = []
     names = set(covers) | {s for r in rows for s in loaded_skills(r.get("traj", []))}
     for name in sorted(names):
         tool = covers.get(name)
-        rel = [r for r in rows if tool and tool in task_writes(split, r["task_id"])]
+        rel = [r for r in rows if tool and tool in task_writes(split, r["task_id"], bench=bench)]
         ld = [r for r in rel if name in loaded_skills(r.get("traj", []))]
         nl = [r for r in rel if name not in loaded_skills(r.get("traj", []))]
         elsewhere = sum(1 for r in rows if name in loaded_skills(r.get("traj", [])) and r not in rel)

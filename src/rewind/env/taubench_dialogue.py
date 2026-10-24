@@ -29,13 +29,17 @@ after a mutating tool ran, so read-only steps cost almost nothing.
 Fork semantics: restoring a step-k snapshot restores the simulator's full
 conversation up to that point; the continuation talks to a *live*
 simulator. Replay instead serves recorded replies (`recorded_user_llm`).
+
+Running, forking and replaying an episode is not done here: that is
+rewind/experiment.py, generic over any `Benchmark`. This module only builds,
+restores and grades the env; `taubench_benchmark.TauBenchRetail` exposes it
+through the Benchmark port.
 """
 from __future__ import annotations
 
 import asyncio
 import copy
 import json
-from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Awaitable, Callable
 
@@ -345,108 +349,3 @@ def result_record(env: TauBenchDialogueEnv, rr: Any, trial: int, trace_path: str
 
 def dump_json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, default=str)
-
-
-# ---------------------------------------------------------------------------
-# episode helpers: run / fork / replay one real task
-# ---------------------------------------------------------------------------
-@dataclass
-class Episode:
-    result: Any                    # loop.RunResult
-    env: TauBenchDialogueEnv
-    events: list[Event]
-    reward: Reward
-
-
-async def run_episode(split: str, index: int, *, provider: Any, user_llm: UserLLM,
-                      store: SnapshotStore, cfg: Any = None, registry: ToolRegistry | None = None,
-                      run_id: str | None = None, trace_path: str | None = None) -> Episode:
-    from ..loop import AgentRunner
-    from ..trace import TraceWriter
-    cfg = cfg or faithful_config()
-    registry = registry or build_dialogue_registry()
-    env = TauBenchDialogueEnv(store, TauUserSim(user_llm), split, index)
-    first = await env.start()
-    runner = AgentRunner(provider, registry, cfg, store)
-    with TraceWriter(run_id or f"tau-{split}-{index}", path=trace_path) as trace:
-        rr = await runner.run(env, first, trace)
-        events = list(trace.events)
-    return Episode(rr, env, events, grade(env))
-
-
-async def fork_episode(base_events: list[Event], at_step: int, *, provider: Any, user_llm: UserLLM,
-                       store: SnapshotStore, cfg: Any = None, registry: ToolRegistry | None = None,
-                       patch: Any = None, run_id: str | None = None,
-                       trace_path: str | None = None,
-                       system_prompt: str | None = None) -> Episode:
-    """Restore env + simulator at `at_step` of a recorded episode and continue
-    live. With `patch=None` this is the *null fork* used to calibrate how much
-    a continuation varies on its own; with a `ForkPatch` it is a
-    counterfactual. `cfg` defaults to the parent's recorded config, so a
-    context edit is expressed by passing a different cfg (system prompt)."""
-    from ..fork import fork_run
-    from ..loop import AgentConfig, AgentRunner
-    from ..trace import TraceWriter
-    if cfg is None:
-        cfg = AgentConfig(**base_events[0].data["cfg"])
-    registry = registry or build_dialogue_registry()
-    holder: dict[str, TauBenchDialogueEnv] = {}
-
-    def env_factory(state: dict) -> TauBenchDialogueEnv:
-        holder["env"] = TauBenchDialogueEnv.restore(state, store=store, user_llm=user_llm)
-        return holder["env"]
-
-    runner = AgentRunner(provider, registry, cfg, store)
-    rid = run_id or f"{base_events[0].run_id}~fork{at_step}"
-    with TraceWriter(rid, path=trace_path) as trace:
-        rr = await fork_run(base_events, store, at_step=at_step, runner=runner,
-                            env_factory=env_factory, trace=trace, patch=patch,
-                            system_prompt=system_prompt)
-        events = list(trace.events)
-    env = holder["env"]
-    return Episode(rr, env, events, grade(env))
-
-
-async def replay_episode(events: list[Event], store: SnapshotStore,
-                         registry: ToolRegistry | None = None):
-    """Deterministic replay of a recorded dialogue episode: recorded model
-    responses AND recorded user replies, no API calls."""
-    from ..replay import replay_run
-    registry = registry or build_dialogue_registry()
-    user_llm = recorded_user_llm(events)
-    return await replay_run(events, store, registry,
-                            lambda s: TauBenchDialogueEnv.restore(s, store=store, user_llm=user_llm))
-
-
-class FidelityResult(BaseModel):
-    step: int
-    ok: bool
-    error: str | None = None
-
-
-async def fork_fidelity(events: list[Event], store: SnapshotStore, steps: list[int] | None = None,
-                        registry: ToolRegistry | None = None) -> list[FidelityResult]:
-    """API-free check that forking a recorded episode at step k restores
-    EXACTLY what the agent saw: fork at k, then serve the parent's own
-    recorded model responses and user replies from k on, with every request
-    hash-checked against the recording (ReplayProvider). Any difference in
-    restored DB content or order, dialogue state or message history shows up
-    as a request-hash mismatch; the final env must also hash the same."""
-    from ..replay import ReplayMismatch, ReplayProvider
-    registry = registry or build_dialogue_registry()
-    all_steps = sorted({e.step for e in events if e.type == "step_start"})
-    parent_end = next(e for e in reversed(events) if e.type == "run_end").data["env_hash"]
-    out: list[FidelityResult] = []
-    for k in (steps or all_steps):
-        rest = [e for e in events if e.step >= k]
-        try:
-            ep = await fork_episode(events, k, provider=ReplayProvider(rest),
-                                    user_llm=recorded_user_llm(rest), store=store,
-                                    registry=registry, run_id=f"{events[0].run_id}~fid{k}")
-        except (ReplayMismatch, RuntimeError) as e:
-            out.append(FidelityResult(step=k, ok=False, error=str(e)))
-            continue
-        end = next(e for e in reversed(ep.events) if e.type == "run_end").data["env_hash"]
-        out.append(FidelityResult(step=k, ok=end == parent_end,
-                                  error=None if end == parent_end else "final env differs"))
-    return out

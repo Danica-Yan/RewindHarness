@@ -14,6 +14,9 @@ import pytest
 
 from rewind.evolve.surface import ContextVersion, Edit, EditError, validate_edit
 from rewind.policy import Check, PolicySet, turns
+from rewind.env.taubench_benchmark import TauBenchRetail
+
+TAU = TauBenchRetail()
 
 ROOT = Path(__file__).resolve().parents[1]
 RETAIL_CHECKS = json.loads((ROOT / "data/policy_checks/taubench_retail.json").read_text())
@@ -227,7 +230,10 @@ def _two_write_task():
 
 
 def _episode(idx, checks, tmp_path, name, replies=("Thanks, please go ahead.",)):
-    from rewind.env.taubench_dialogue import build_dialogue_registry, run_episode
+    from rewind.env.taubench_dialogue import build_dialogue_registry
+    from rewind.experiment import run_episode
+    from rewind.env.taubench_benchmark import TauBenchRetail
+    TAU = TauBenchRetail()
     from rewind.providers import ScriptedProvider
     from rewind.snapshot import SnapshotStore
     from tests.test_taubench_dialogue import (
@@ -240,7 +246,7 @@ def _episode(idx, checks, tmp_path, name, replies=("Thanks, please go ahead.",))
     from rewind.env.taubench_dialogue import STOP_TOKEN
     user = scripted_user(["I need help.", *replies, STOP_TOKEN, STOP_TOKEN, STOP_TOKEN])
     trace = tmp_path / f"{name}.jsonl"
-    ep = asyncio.run(run_episode("train", idx, provider=ScriptedProvider(script), user_llm=user,
+    ep = asyncio.run(run_episode(TAU, "train", idx, provider=ScriptedProvider(script), user_llm=user,
                                  store=store, registry=reg, run_id=name, trace_path=str(trace)))
     return ep, store, trace
 
@@ -273,7 +279,9 @@ def test_observe_mode_never_changes_the_episode(tmp_path):
 
 @needs_tau
 def test_fork_and_replay_keep_the_policy(tmp_path):
-    from rewind.env.taubench_dialogue import fork_episode, replay_episode
+    from rewind.experiment import fork_episode, replay_episode
+    from rewind.env.taubench_benchmark import TauBenchRetail
+    TAU = TauBenchRetail()
     from rewind.providers import ScriptedProvider
     from rewind.trace import load_trace
     idx = _two_write_task()
@@ -281,10 +289,10 @@ def test_fork_and_replay_keep_the_policy(tmp_path):
     ep, store, trace = _episode(idx, chk, tmp_path, "parent")
     reg = ep_registry(chk)
     # replay under the same policy reproduces the block byte for byte
-    assert asyncio.run(replay_episode(load_trace(trace), store, registry=reg)).ok
+    assert asyncio.run(replay_episode(TAU, load_trace(trace), store, registry=reg)).ok
     # ...and without it the replay diverges at the blocked call (the tool would run)
     from rewind.env.taubench_dialogue import build_dialogue_registry
-    assert not asyncio.run(replay_episode(load_trace(trace), store, registry=build_dialogue_registry())).ok
+    assert not asyncio.run(replay_episode(TAU, load_trace(trace), store, registry=build_dialogue_registry())).ok
     # a fork from step 1 under the policy blocks the same call
     from rewind.env.taubench_dialogue import STOP_TOKEN
     from tests.test_taubench_dialogue import (
@@ -292,7 +300,7 @@ def test_fork_and_replay_keep_the_policy(tmp_path):
         scripted_user,
     )
     script, _ = golden_dialogue("train", idx)
-    f = asyncio.run(fork_episode(load_trace(trace), 1, provider=ScriptedProvider(script),
+    f = asyncio.run(fork_episode(TAU, load_trace(trace), 1, provider=ScriptedProvider(script),
                                  user_llm=scripted_user(["Thanks, please go ahead.", STOP_TOKEN, STOP_TOKEN]),
                                  store=store, registry=reg))
     assert any(e.type == "tool_call" and e.data["error_class"] == "POLICY_BLOCKED" for e in f.events)
@@ -306,7 +314,7 @@ def ep_registry(checks):
 @needs_tau
 def test_backtest_counts_fires_on_passing_and_catches_on_failing(tmp_path):
     from rewind.env.taubench_dialogue import result_record
-    from rewind.evolve.backtest import taubench_backtest
+    from rewind.evolve.backtest import benchmark_backtest
     from rewind.snapshot import SnapshotStore
     idx = _two_write_task()
     # recorded WITHOUT any policy (as all real runs so far)
@@ -316,7 +324,7 @@ def test_backtest_counts_fires_on_passing_and_catches_on_failing(tmp_path):
     failing = dict(row, reward=0.0, trial=1)
 
     pol = PolicySet([check("confirm_before_write"), check("act_for_authenticated_user")])
-    rep = taubench_backtest(pol, [row, failing], store=SnapshotStore(tmp_path / "snaps"), split="train")
+    rep = benchmark_backtest(pol, [row, failing], store=SnapshotStore(tmp_path / "snaps"), split="train", bench=TAU)
     s = {x["check"]: x for x in rep.summaries()}
     # the scripted agent wrote twice on one "go ahead": live, the second write was blocked;
     # offline the same firing shows up as a fire on a passing episode
@@ -339,14 +347,11 @@ def test_backtest_counts_fires_on_passing_and_catches_on_failing(tmp_path):
 def test_backtest_catches_an_off_gold_write(tmp_path):
     """A failed episode whose agent cancelled a different order with no
     confirmation: the check fires on a call the gold solution never makes."""
-    from rewind.env.taubench_dialogue import (
-        STOP_TOKEN,
-        build_dialogue_registry,
-        load_task,
-        result_record,
-        run_episode,
-    )
-    from rewind.evolve.backtest import taubench_backtest
+    from rewind.env.taubench_dialogue import STOP_TOKEN, build_dialogue_registry, load_task, result_record
+    from rewind.experiment import run_episode
+    from rewind.env.taubench_benchmark import TauBenchRetail
+    TAU = TauBenchRetail()
+    from rewind.evolve.backtest import benchmark_backtest
     from rewind.providers import LLMResponse, ScriptedProvider, ToolCall
     from rewind.snapshot import SnapshotStore
     from tests.test_taubench_dialogue import scripted_user
@@ -364,12 +369,12 @@ def test_backtest_catches_an_off_gold_write(tmp_path):
                                                args={"order_id": oid, "reason": "no longer needed"})]),
               LLMResponse(text="Done.")]
     trace = tmp_path / "bad.jsonl"
-    ep = asyncio.run(run_episode("train", idx, provider=ScriptedProvider(script),
+    ep = asyncio.run(run_episode(TAU, "train", idx, provider=ScriptedProvider(script),
                                  user_llm=scripted_user(["hi", "what do you mean?", STOP_TOKEN]),
                                  store=store, registry=build_dialogue_registry(), trace_path=str(trace)))
     row = result_record(ep.env, ep.result, 0, str(trace), ep.events)
     assert row["reward"] == 0.0
-    rep = taubench_backtest(PolicySet([check("confirm_before_write")]), [row], store=store, split="train")
+    rep = benchmark_backtest(PolicySet([check("confirm_before_write")]), [row], store=store, split="train", bench=TAU)
     [s] = rep.summaries()
     assert s["catches"] == 1 and s["failing_episodes_caught"] == 1
 
@@ -377,7 +382,7 @@ def test_backtest_catches_an_off_gold_write(tmp_path):
     from rewind.evolve.loop import EvolveConfig, backtest_edit
     spec = {k: v for k, v in RETAIL_CHECKS[0].items() if k != "id"}
     e = Edit(kind="check", target="confirm_before_write", op="add", text=json.dumps(spec))
-    ok, why, data = backtest_edit(EvolveConfig(), e, [row], store, {idx})
+    ok, why, data = backtest_edit(EvolveConfig(), e, [row], store, {idx}, bench=TAU)
     assert ok and data["cluster_caught"] == [idx], why
-    ok, why, _ = backtest_edit(EvolveConfig(), e, [row], store, {idx + 1})
+    ok, why, _ = backtest_edit(EvolveConfig(), e, [row], store, {idx + 1}, bench=TAU)
     assert not ok and "catches 0 of this cluster" in why

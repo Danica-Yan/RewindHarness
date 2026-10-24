@@ -23,9 +23,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from rewind.evolve.backtest import taubench_backtest
+from rewind.evolve.backtest import benchmark_backtest
 from rewind.policy import Check, PolicySet
 from rewind.snapshot import SnapshotStore
+from rewind.env.taubench_benchmark import TauBenchRetail  # noqa: E402
+
+TAU = TauBenchRetail()
 
 DEFAULT_CHECKS = Path(__file__).resolve().parents[1] / "data/policy_checks/taubench_retail.json"
 
@@ -46,7 +49,7 @@ def main() -> None:
     if a.only:
         checks = [c for c in checks if c.id in a.only]
     rows = [r for f in a.results for r in json.loads(Path(f).read_text(encoding="utf-8"))]
-    rep = taubench_backtest(PolicySet(checks), rows, store=SnapshotStore(a.store_dir), split=a.split)
+    rep = benchmark_backtest(PolicySet(checks), rows, store=SnapshotStore(a.store_dir), split=a.split, bench=TAU)
 
     print(f"{len(rows)} episodes ({rep.n_pass} passed, {rep.n_fail} failed), "
           f"{len(rep.skipped)} skipped (no trace / snapshot)\n")

@@ -39,7 +39,7 @@ import argparse
 import sys
 
 sys.path.insert(0, "src")
-from rewind.flywheel.taubench_failures import load_results  # noqa: E402
+from rewind.env.taubench_failures import load_results  # noqa: E402
 
 
 # The statistics now live in rewind.evolve.stats so the evolution gate uses

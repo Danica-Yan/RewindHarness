@@ -5,12 +5,14 @@ can be explained in one line and recomputed exactly:
 
     category | tool | detail
 
-* category: the existing tau-bench taxonomy (`classify_taubench`)
+* category: the benchmark's failure taxonomy
 * tool:     the first mutating tool where agent and ground truth disagree
-* detail:   for action failures, WHICH argument keys differed on that tool
-            (rewind traces carry the agent's real arguments, so this is now
-            visible -- run.py results only had tool names); otherwise the
-            normalised error text or the coarse action shape
+* detail:   e.g. WHICH argument keys differed on that tool, the normalised
+            error text, or the coarse action shape
+
+The signature itself comes from the benchmark (`Benchmark.failure_signature`):
+reading a failed row is format-specific (tau-bench: `classify_taubench` over
+its OpenAI-format `traj`), clustering and the prevalence rule are not.
 
 Clusters are counted in DISTINCT TASKS (several trials of one task are one
 piece of evidence), and a cluster is eligible only if the Wilson lower bound
@@ -19,78 +21,16 @@ not pass for a 9% problem. Everything here is free: it reads results files.
 """
 from __future__ import annotations
 
-import json
-import re
 from collections import defaultdict
+
 from pydantic import BaseModel
 
-from ..env.taubench_adapter import MUTATING_TOOLS
-from ..env.taubench_dialogue import load_task
-from ..flywheel.taubench_failures import action_shape, classify_taubench
+from ..benchmark import Benchmark, FailureSignature
 from .stats import wilson_interval
 
 
-class FailureSignature(BaseModel):
-    category: str
-    tool: str | None = None
-    detail: str | None = None
-
-    @property
-    def key(self) -> str:
-        return f"{self.category}|{self.tool or '-'}|{self.detail or '-'}"
-
-    @property
-    def coarse_key(self) -> str:
-        return f"{self.category}|{self.tool or '-'}"
-
-
-def _agent_calls(traj: list[dict]) -> list[tuple[str, dict]]:
-    out = []
-    for m in traj:
-        if m.get("role") != "assistant":
-            continue
-        for c in (m.get("tool_calls") or [])[:1]:
-            fn = c.get("function") or {}
-            if fn.get("name") in MUTATING_TOOLS:
-                try:
-                    args = json.loads(fn.get("arguments") or "{}")
-                except json.JSONDecodeError:
-                    args = {}
-                out.append((fn["name"], args))
-    return out
-
-
-_NUM = re.compile(r"#?W?\d+")
-
-
-def _norm_error(msg: str) -> str:
-    return _NUM.sub("<n>", msg.replace("Error:", "").strip())[:80]
-
-
-def signature(row: dict, split: str) -> FailureSignature | None:
-    rec = classify_taubench(row)
-    if rec is None:
-        return None
-    if rec.category == "TOOL_RUNTIME_ERROR":  # only unrecovered errors land here
-        return FailureSignature(category=rec.category, tool=rec.last_tool_error_tool,
-                                detail=_norm_error(rec.last_tool_error or ""))
-    if rec.category == "WRONG_OUTPUT":
-        return FailureSignature(category=rec.category, detail="missing required output")
-    # action failures: find the first mutating tool where agent and truth differ
-    task = load_task(split, row["task_id"])
-    gt = [(a.name, a.kwargs) for a in task.actions if a.name in MUTATING_TOOLS]
-    agent = _agent_calls(row.get("traj", []))
-    gt_names, ag_names = [n for n, _ in gt], [n for n, _ in agent]
-    if gt_names == ag_names:
-        for (gn, ga), (_, aa) in zip(gt, agent):
-            diff = sorted(k for k in set(ga) | set(aa) if ga.get(k) != aa.get(k))
-            if diff:
-                return FailureSignature(category=rec.category, tool=gn,
-                                        detail="wrong args: " + ",".join(diff))
-        return FailureSignature(category=rec.category, detail="same calls, state still differs")
-    missing = [n for n in gt_names if n not in ag_names]
-    tool = missing[0] if missing else next((n for n in ag_names if n not in gt_names), None)
-    return FailureSignature(category=rec.category, tool=tool, detail=action_shape(rec))
+def signature(row: dict, split: str, *, bench: Benchmark) -> FailureSignature | None:
+    return bench.failure_signature(row, split)
 
 
 class ClusterStats(BaseModel):
@@ -107,7 +47,7 @@ class PrevalencePolicy(BaseModel):
     min_share_lb: float = 0.05     # Wilson lower bound of share of failed tasks
 
 
-def clusters(rows: list[dict], split: str, *, only_tasks: set[int] | None = None
+def clusters(rows: list[dict], split: str, *, bench: Benchmark, only_tasks: set[int] | None = None
              ) -> tuple[list[ClusterStats], dict[int, FailureSignature]]:
     """Fine and coarse clusters over failed rows (one signature per task: its
     first failed trial). `only_tasks` restricts members (e.g. to stable
@@ -116,7 +56,7 @@ def clusters(rows: list[dict], split: str, *, only_tasks: set[int] | None = None
     for r in sorted(rows, key=lambda r: (r["task_id"], r["trial"])):
         if r["reward"] >= 1.0 or r["task_id"] in sigs:
             continue
-        s = signature(r, split)
+        s = signature(r, split, bench=bench)
         if s is not None:
             sigs[r["task_id"]] = s
     n_failed = len(sigs)

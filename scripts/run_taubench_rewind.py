@@ -41,6 +41,9 @@ from rewind.evolve.surface import ContextVersion  # noqa: E402
 from rewind.evolve.stats import pass_hat_k, per_task_rewards, pooled_pass1  # noqa: E402
 from rewind.providers import DeepSeekProvider  # noqa: E402
 from rewind.snapshot import SnapshotStore  # noqa: E402
+from rewind.env.taubench_benchmark import TauBenchRetail  # noqa: E402
+
+TAU = TauBenchRetail()
 
 
 def parse_ids(spec: str | None, total: int) -> list[int]:
@@ -64,7 +67,7 @@ async def main_async(args: argparse.Namespace) -> None:
                            provider=DeepSeekProvider(model=args.model),
                            user_llm=litellm_user_llm(model=args.user_model, provider=args.user_provider),
                            store=store, trace_dir=args.trace_dir, concurrency=args.concurrency,
-                           log=lambda m: print(m, flush=True))
+                           log=lambda m: print(m, flush=True), bench=TAU)
     by_task = per_task_rewards(rows)
     p1, n = pooled_pass1(by_task)
     k_max = min(len(v) for v in by_task.values()) if by_task else 0

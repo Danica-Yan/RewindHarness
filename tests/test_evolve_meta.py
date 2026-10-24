@@ -8,7 +8,7 @@ import json
 import pytest
 
 from tests.test_evolve_loop import (  # noqa: F401  (base_run is a fixture)
-    _IMPORT_ERROR, HARD, MAGIC, POISON, FakeAgent, FakeProposer, base_run, fake_user, rule, setup,
+    TAU, _IMPORT_ERROR, HARD, MAGIC, POISON, FakeAgent, FakeProposer, base_run, fake_user, rule, setup,
 )
 
 pytestmark = pytest.mark.skipif(_IMPORT_ERROR is not None, reason=f"tau_bench not importable: {_IMPORT_ERROR}")
@@ -19,7 +19,7 @@ GOOD = f"Before exchanging, {MAGIC} with the user."
 def _commit_good_rule(store, ledger, cfg):
     from rewind.evolve.loop import run_round
     rep = asyncio.run(run_round(cfg, ledger, provider=FakeAgent(), user_llm=fake_user, store=store,
-                                proposer=FakeProposer([rule("exchange_confirm", GOOD)]), log=lambda m: None))
+                                proposer=FakeProposer([rule("exchange_confirm", GOOD)]), log=lambda m: None, bench=TAU))
     assert rep.version_to == 1
     return rep
 
@@ -42,7 +42,7 @@ def test_accepted_fixes_are_remembered_and_rechecked_by_later_gates(setup):
     eff = Efficacy(tasks=[], cand_passes=5, cand_n=5, null_passes=0, null_n=5, p_value=0.004, lift=1.0, passed=True)
     v = asyncio.run(gate(bad, rows, pool, split="train", out=cfg.run_dir + "/gate/bad.json", provider=FakeAgent(),
                          user_llm=fake_user, store=store, policy=cfg.gate, incumbent=inc, prior_efficacy=eff,
-                         regression_suite=suite, log=lambda m: None))
+                         regression_suite=suite, log=lambda m: None, bench=TAU))
     assert not v.accepted and v.reason.startswith("breaks remembered fixes")
     assert set(v.regression_check["broken"]) == {t for t, _ in suite}
     # rollback forgets the fixes of the versions rolled back
@@ -80,7 +80,7 @@ def test_consolidation_keeps_a_rule_that_earns_its_place_and_drops_one_that_does
     plan = {i["target"]: i for i in consol.plan(ledger, cfg.gate)}
     assert plan["be_kind"]["evidence"] == easy and plan["exchange_confirm"]["evidence"]
     res = {r["target"]: r for r in asyncio.run(consol.ablate(
-        ledger, cfg.gate, provider=FakeAgent(), user_llm=fake_user, store=store, log=lambda m: None))}
+        ledger, cfg.gate, provider=FakeAgent(), user_llm=fake_user, store=store, log=lambda m: None, bench=TAU))}
     assert not res["exchange_confirm"]["removed"] and "still earns its place" in res["exchange_confirm"]["reason"]
     assert res["be_kind"]["removed"]
     cur = ledger.current()
@@ -114,7 +114,7 @@ def test_meta_eval_adopts_lessons_only_when_they_win(setup):
     from rewind.evolve.loop import run_round
     store, ledger, cfg = setup
     rep = asyncio.run(run_round(cfg, ledger, provider=FakeAgent(), user_llm=fake_user, store=store,
-                                proposer=FakeProposer([rule("poison", f"You must {POISON}.")]), log=lambda m: None))
+                                proposer=FakeProposer([rule("poison", f"You must {POISON}.")]), log=lambda m: None, bench=TAU))
     assert rep.version_to is None
     clusters = meta.meta_clusters(ledger, cfg)
     assert clusters and clusters[0]["B"]
@@ -135,7 +135,7 @@ def test_meta_eval_adopts_lessons_only_when_they_win(setup):
                                       "trigger": "the customer asks to exchange delivered items",
                                       "text": text}]})
     res = asyncio.run(meta.meta_eval(cfg, ledger, new, clusters[:1], llm=proposer_llm, tool_names=[],
-                                     provider=FakeAgent(), user_llm=fake_user, store=store, log=lambda m: None))
+                                     provider=FakeAgent(), user_llm=fake_user, store=store, log=lambda m: None, bench=TAU))
     assert res["adopted"], res
     assert meta.lessons(ledger) == new and meta.history(ledger)[-1]["lessons"] == new
     stages = [d["stage"] for d in ledger.decisions()]
@@ -144,7 +144,7 @@ def test_meta_eval_adopts_lessons_only_when_they_win(setup):
     # a lesson set that does no better is not adopted
     worse = ["Keep rules short."]
     res2 = asyncio.run(meta.meta_eval(cfg, ledger, worse, clusters[:1], llm=proposer_llm, tool_names=[],
-                                      provider=FakeAgent(), user_llm=fake_user, store=store, log=lambda m: None))
+                                      provider=FakeAgent(), user_llm=fake_user, store=store, log=lambda m: None, bench=TAU))
     assert not res2["adopted"] and meta.lessons(ledger) == new
 
 

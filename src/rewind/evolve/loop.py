@@ -18,6 +18,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from ..benchmark import Benchmark
 from .gate import GatePolicy, gate
 from .ledger import EditLedger
 from .prevalence import PrevalencePolicy, clusters, describe, eligible, evidence_rows
@@ -96,13 +97,13 @@ def _dedupe(cs: list) -> list:
     return out
 
 
-def plan(cfg: EvolveConfig, ledger: EditLedger) -> str:
+def plan(cfg: EvolveConfig, ledger: EditLedger, *, bench: Benchmark) -> str:
     """Worst-case API use of the next round. No API calls."""
     inc = ledger.current()
     rows = load_rows(ledger.rows_path(inc.version))
     shown = ledger.shown()
     pool_rows = [r for r in rows if r["task_id"] not in shown]
-    stats, sigs = clusters(pool_rows, cfg.split)
+    stats, sigs = clusters(pool_rows, cfg.split, bench=bench)
     elig = _dedupe([c for c in stats if eligible(c, cfg.prevalence)[0]])[: cfg.max_clusters_per_round]
     lines = [f"incumbent v{inc.version}: {len({r['task_id'] for r in rows})} tasks, "
              f"{len(sigs)} failed in the unseen pool ({len(shown)} tasks already shown)",
@@ -137,7 +138,7 @@ def plan(cfg: EvolveConfig, ledger: EditLedger) -> str:
     return "\n".join(lines)
 
 
-async def run_round(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, user_llm: Any, store: Any,
+async def run_round(cfg: EvolveConfig, ledger: EditLedger, *, bench: Benchmark, provider: Any, user_llm: Any, store: Any,
                     proposer: Any, log: Callable[[str], None] = print) -> RoundReport:
     paths = _paths(cfg)
     budget = Budget(cfg.budget_episodes)
@@ -147,11 +148,11 @@ async def run_round(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, use
     rows = load_rows(ledger.rows_path(inc.version))
     shown = ledger.shown()
     pool_rows = [r for r in rows if r["task_id"] not in shown]
-    stats, _ = clusters(pool_rows, cfg.split)
+    stats, _ = clusters(pool_rows, cfg.split, bench=bench)
     tried = {d["cluster"] for d in ledger.decisions()
              if d["stage"] == "stability" and d["version_from"] == inc.version}
     uniq = _dedupe([c for c in stats if eligible(c, cfg.prevalence)[0] and c.key not in tried])
-    _, inc_registry = version_setup(inc)
+    _, inc_registry = version_setup(inc, bench=bench)
 
     def note(msg: str) -> None:
         rep.events.append(msg)
@@ -170,7 +171,7 @@ async def run_round(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, use
             note(f"budget: stability for {cluster.key} needs <= {cost}, {budget.left} left -- stop")
             break
         note(f"cluster {cluster.key}: {len(cluster.tasks)} tasks, assessing {len(members)} for stability")
-        recs = await assess_failures(members, paths["stability"], store=store, provider=provider,
+        recs = await assess_failures(members, paths["stability"], store=store, bench=bench, provider=provider,
                                      user_llm=user_llm, registry=inc_registry, n=cfg.stability_n,
                                      stable_max=cfg.stable_max, concurrency=cfg.concurrency, log=log)
         mine = [recs[k] for k in recs if recs[k].ctx_version == inc.version
@@ -192,7 +193,7 @@ async def run_round(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, use
                       {"A": [r.task_id for r in a], "B": [r.task_id for r in b]}, cluster=cluster.key)
 
         stop_round = await _try_edits(cfg, ledger, round_no, inc, rows, pool_rows, cluster.key, a, b,
-                                      budget, rep, provider=provider, user_llm=user_llm, store=store,
+                                      budget, rep, bench=bench, provider=provider, user_llm=user_llm, store=store,
                                       proposer=proposer, log=log, note=note)
         if rep.gate is not None or stop_round:
             break  # a gated or gate-pending candidate ends the round
@@ -255,25 +256,25 @@ def backfill_memory(ledger: EditLedger, cfg: EvolveConfig) -> int:
 
 
 def _record_gate(ledger: EditLedger, round_no: int, inc: Any, e: Any, v: Any, rows: list[dict],
-                 split: str, extra: dict | None = None) -> int:
+                 split: str, extra: dict | None = None, *, bench: Benchmark) -> int:
     from .feedback import gate_feedback
     data = v.model_dump()
     data.update(extra or {})
     did = ledger.record(round_no, inc.version, e, "gate", v.accepted, v.reason, data)
     if not v.accepted and Path(v.rows_path).exists():
-        ledger.set_feedback(did, gate_feedback(data, rows, load_rows(v.rows_path), split))
+        ledger.set_feedback(did, gate_feedback(data, rows, load_rows(v.rows_path), split, bench=bench))
     return did
 
 
 def backtest_edit(cfg: EvolveConfig, e: Any, rows: list[dict], store: Any,
-                  cluster_tasks: set[int]) -> tuple[bool, str, dict]:
+                  cluster_tasks: set[int], *, bench: Benchmark) -> tuple[bool, str, dict]:
     """Replay a proposed check over the incumbent's recorded episodes (no API):
     it must stay quiet where the agent succeeded and fire on at least one of
     this cluster's failures, on a call the gold solution does not make."""
     from ..policy import PolicySet
-    from .backtest import taubench_backtest
+    from .backtest import benchmark_backtest
     chk = parse_check(e).model_copy(update={"mode": "block"})
-    rep = taubench_backtest(PolicySet([chk]), rows, store=store, split=cfg.split)
+    rep = benchmark_backtest(PolicySet([chk]), rows, store=store, split=cfg.split, bench=bench)
     s = rep.stats[chk.id]
     caught = sorted({t for t, _ in s.episodes_failing_caught} & cluster_tasks)
     data = {**s.summary(rep.n_pass, rep.n_fail), "cluster_caught": caught,
@@ -290,12 +291,12 @@ def backtest_edit(cfg: EvolveConfig, e: Any, rows: list[dict], store: Any,
 
 async def _try_edits(cfg: EvolveConfig, ledger: EditLedger, round_no: int, inc: Any, rows: list[dict],
                      pool_rows: list[dict], cluster_key: str, a: list, b: list, budget: Budget,
-                     rep: RoundReport, *, provider: Any, user_llm: Any, store: Any, proposer: Any,
+                     rep: RoundReport, *, bench: Benchmark, provider: Any, user_llm: Any, store: Any, proposer: Any,
                      log: Callable[[str], None], note: Callable[[str], None]) -> bool:
     """Propose for one cluster's A half, then check, screen and gate. Returns
     True if the round must stop (a candidate was gated, or one passed
     screening but the budget cannot cover its gate)."""
-    _, inc_registry = version_setup(inc)
+    _, inc_registry = version_setup(inc, bench=bench)
     tools = set(inc_registry._tools)
     a_rows = evidence_rows(rows, [r.task_id for r in a])
     edits = await proposer.propose(cluster_key, a_rows, cfg.split, inc,
@@ -312,7 +313,7 @@ async def _try_edits(cfg: EvolveConfig, ledger: EditLedger, round_no: int, inc: 
             note(f"  [invalid] {e.kind} {e.target}: {why}")
             continue
         if e.kind == "check" and e.op != "delete":
-            ok, why, data = backtest_edit(cfg, e, rows, store, {r.task_id for r in a + b})
+            ok, why, data = backtest_edit(cfg, e, rows, store, {r.task_id for r in a + b}, bench=bench)
             ledger.record(round_no, inc.version, e, "backtest", ok, why, data, cluster=cluster_key)
             note(f"  backtest {e.target}: {'PASS' if ok else 'fail'} -- {why}")
             if not ok:
@@ -323,12 +324,12 @@ async def _try_edits(cfg: EvolveConfig, ledger: EditLedger, round_no: int, inc: 
             return True
         cand = inc.apply(e, known_tools=tools).model_copy(
             update={"version": ledger.next_version_number(), "parent": inc.version})
-        cand_cfg, cand_reg = version_setup(cand)
+        cand_cfg, cand_reg = version_setup(cand, bench=bench)
         shown = cand.rules.get(e.target) or cand.tool_notes.get(e.target) or cand.checks.get(e.target) \
             or cand.skills.get(e.target)
         note(f"  screening {e.kind} {e.target}: {shown!r}")
         sr = await screen([e.edit_id], b_tasks, system_prompt=cand_cfg.system_prompt,
-                          registry=cand_reg, store=store, provider=provider, user_llm=user_llm,
+                          registry=cand_reg, store=store, bench=bench, provider=provider, user_llm=user_llm,
                           policy=cfg.screen, log=log)
         budget.spend(sr.forks)
         ledger.record(round_no, inc.version, e, "screen", sr.passed, sr.reason, sr.model_dump(),
@@ -347,12 +348,12 @@ async def _try_edits(cfg: EvolveConfig, ledger: EditLedger, round_no: int, inc: 
                  f"run `run_evolve.py gate-pending` to gate it without redoing anything")
             return True
         out = _paths(cfg)["gate"] / f"v{cand.version}_{e.edit_id}.json"
-        v = await gate(cand, rows, pool, split=cfg.split, out=out, provider=provider,
+        v = await gate(cand, rows, pool, split=cfg.split, out=out, bench=bench, provider=provider,
                        user_llm=user_llm, store=store, policy=cfg.gate, targets=targets,
                        concurrency=cfg.concurrency, log=log, incumbent=inc, regression_suite=suite)
         budget.spend(v.episodes)
         rep.gate = v.model_dump()
-        _record_gate(ledger, round_no, inc, e, v, rows, cfg.split)
+        _record_gate(ledger, round_no, inc, e, v, rows, cfg.split, bench=bench)
         note(f"  gate: {'ACCEPT' if v.accepted else 'reject'} -- {v.reason}")
         if v.accepted:
             ledger.commit(cand, [e], str(out), v.model_dump())
@@ -400,7 +401,7 @@ def retry_candidates(ledger: EditLedger, cfg: EvolveConfig) -> list[dict]:
     return out
 
 
-async def retry_cluster(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, user_llm: Any,
+async def retry_cluster(cfg: EvolveConfig, ledger: EditLedger, *, bench: Benchmark, provider: Any, user_llm: Any,
                         store: Any, proposer: Any, cluster_key: str | None = None,
                         max_attempts: int = 3, log: Callable[[str], None] = print) -> RoundReport:
     """Another proposal for a cluster whose A/B split already exists: no
@@ -412,7 +413,7 @@ async def retry_cluster(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any,
     budget = Budget(cfg.budget_episodes)
     inc = ledger.current()
     rows = load_rows(ledger.rows_path(inc.version))
-    backfill_feedback(ledger, cfg)
+    backfill_feedback(ledger, cfg, bench=bench)
     cands = [c for c in retry_candidates(ledger, cfg) if cluster_key in (None, c["cluster"])]
     round_no = ledger.bump_round()
     rep = RoundReport(round=round_no, version_from=inc.version)
@@ -435,14 +436,14 @@ async def retry_cluster(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any,
          f"A={[r.task_id for r in c['A']]} B={[r.task_id for r in c['B']]}")
     pool_rows = [r for r in rows if r["task_id"] not in ledger.shown()]
     await _try_edits(cfg, ledger, round_no, inc, rows, pool_rows, c["cluster"], c["A"], c["B"], budget,
-                     rep, provider=provider, user_llm=user_llm, store=store, proposer=proposer,
+                     rep, bench=bench, provider=provider, user_llm=user_llm, store=store, proposer=proposer,
                      log=log, note=note)
     rep.episodes_used = budget.used
     _save(paths, rep)
     return rep
 
 
-def backfill_feedback(ledger: EditLedger, cfg: EvolveConfig) -> int:
+def backfill_feedback(ledger: EditLedger, cfg: EvolveConfig, *, bench: Benchmark) -> int:
     """Attach feedback to rejected gate decisions recorded before feedback
     existed. Free: reads results already on disk."""
     from .feedback import gate_feedback
@@ -450,7 +451,8 @@ def backfill_feedback(ledger: EditLedger, cfg: EvolveConfig) -> int:
     for did, v, data in ledger.gate_rejections_without_feedback():
         if Path(data["rows_path"]).exists():
             inc_rows = load_rows(ledger.rows_path(v))
-            ledger.set_feedback(did, gate_feedback(data, inc_rows, load_rows(data["rows_path"]), cfg.split))
+            ledger.set_feedback(did, gate_feedback(data, inc_rows, load_rows(data["rows_path"]), cfg.split,
+                                                     bench=bench))
             n += 1
     return n
 
@@ -472,7 +474,7 @@ def regate_candidates(ledger: EditLedger) -> list[dict]:
     return out
 
 
-async def regate(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, user_llm: Any, store: Any,
+async def regate(cfg: EvolveConfig, ledger: EditLedger, *, bench: Benchmark, provider: Any, user_llm: Any, store: Any,
                  decision_id: int | None = None, log: Callable[[str], None] = print) -> list[dict]:
     """Re-decide earlier gate rejections under the current policy. Reuses the
     efficacy result and every pool episode already run (the runner skips
@@ -488,16 +490,16 @@ async def regate(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, user_l
         pool = sorted({r["task_id"] for r in load_rows(old["rows_path"])}) if Path(old["rows_path"]).exists() \
             else _pool(rows, ledger.shown())
         e = c["edit"]
-        _, reg = version_setup(inc)
+        _, reg = version_setup(inc, bench=bench)
         cand = inc.apply(e, known_tools=set(reg._tools)).model_copy(
             update={"version": ledger.next_version_number(), "parent": inc.version})
         log(f"re-gating {e.kind} {e.target} (decision {c['decision_id']}): was '{old['reason']}'")
-        v = await gate(cand, rows, pool, split=cfg.split, out=Path(old["rows_path"]), provider=provider,
+        v = await gate(cand, rows, pool, split=cfg.split, out=Path(old["rows_path"]), bench=bench, provider=provider,
                        user_llm=user_llm, store=store, policy=cfg.gate, concurrency=cfg.concurrency,
                        log=log, incumbent=inc, prior_efficacy=Efficacy(**old["efficacy"]),
                        regression_suite=ledger.regression_suite())
         _record_gate(ledger, c["round"], inc, e, v, rows, cfg.split,
-                     {"regate_of": c["decision_id"]})
+                     {"regate_of": c["decision_id"]}, bench=bench)
         ledger.mark_regated(c["decision_id"])
         log(f"  gate: {'ACCEPT' if v.accepted else 'reject'} -- {v.reason}")
         results.append({"edit": e.model_dump(), "verdict": v.model_dump(), "was": old["reason"]})
@@ -536,7 +538,7 @@ def pending_candidates(ledger: EditLedger, cfg: EvolveConfig) -> list[dict]:
     return out
 
 
-async def gate_pending(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, user_llm: Any,
+async def gate_pending(cfg: EvolveConfig, ledger: EditLedger, *, bench: Benchmark, provider: Any, user_llm: Any,
                        store: Any, log: Callable[[str], None] = print) -> list[dict]:
     """Gate every pending candidate (oldest first) until one is accepted."""
     results = []
@@ -551,16 +553,16 @@ async def gate_pending(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, 
         if not budget.can(cost):
             log(f"budget: gate needs <= {cost}, {budget.left} left -- stop")
             break
-        _, reg = version_setup(inc)
+        _, reg = version_setup(inc, bench=bench)
         cand = inc.apply(e, known_tools=set(reg._tools)).model_copy(
             update={"version": ledger.next_version_number(), "parent": inc.version})
         log(f"gating {e.kind} {e.target}: {e.text!r} on {len(p['targets'])} targets + {len(pool)} pool tasks")
         out = _paths(cfg)["gate"] / f"v{cand.version}_{e.edit_id}.json"
-        v = await gate(cand, rows, pool, split=cfg.split, out=out, provider=provider, user_llm=user_llm,
+        v = await gate(cand, rows, pool, split=cfg.split, out=out, bench=bench, provider=provider, user_llm=user_llm,
                        store=store, policy=cfg.gate, targets=p["targets"],
                        concurrency=cfg.concurrency, log=log, incumbent=inc, regression_suite=suite)
         budget.spend(v.episodes)
-        _record_gate(ledger, p["round"], inc, e, v, rows, cfg.split)
+        _record_gate(ledger, p["round"], inc, e, v, rows, cfg.split, bench=bench)
         log(f"  gate: {'ACCEPT' if v.accepted else 'reject'} -- {v.reason}")
         results.append({"edit": e.model_dump(), "verdict": v.model_dump()})
         if v.accepted:
@@ -582,7 +584,8 @@ def _save(paths: dict[str, Path], rep: RoundReport) -> None:
 # skill library: induced from successes (and optionally contrasted with the
 # A half of failures), gated as one candidate version on stable B failures
 # ---------------------------------------------------------------------------
-def skill_failures(base_rows: list[dict], split: str, tools: set[str]) -> list[dict]:
+def skill_failures(base_rows: list[dict], split: str, tools: set[str], *,
+                   bench: Benchmark) -> list[dict]:
     """Failed baseline episodes (with a trace) whose task needs one of
     `tools`, one per task."""
     from .skills import task_writes
@@ -591,7 +594,7 @@ def skill_failures(base_rows: list[dict], split: str, tools: set[str]) -> list[d
         tr = ((r.get("info") or {}).get("rewind") or {}).get("trace")
         if r["reward"] >= 1.0 or not tr or r["task_id"] in seen:
             continue
-        if task_writes(split, r["task_id"]) & tools:
+        if task_writes(split, r["task_id"], bench=bench) & tools:
             out.append(r)
             seen.add(r["task_id"])
     return out
@@ -611,12 +614,12 @@ def stability_of(rows: list[dict], cfg: EvolveConfig) -> dict[int, Any]:
 
 
 def skill_target_plan(cfg: EvolveConfig, base_rows: list[dict], tools: set[str],
-                      exclude: set[int]) -> dict:
+                      exclude: set[int], *, bench: Benchmark) -> dict:
     """Which failures can be targets: not shown to the inducer, and STABLE
     (fails >= 4 of 5 null forks) by independent stability data -- the
     first library gate used every baseline failure and the incumbent then
     passed 21 of 40 forks on them: mostly unlucky runs, not real failures."""
-    fails = [r for r in skill_failures(base_rows, cfg.split, tools) if r["task_id"] not in exclude]
+    fails = [r for r in skill_failures(base_rows, cfg.split, tools, bench=bench) if r["task_id"] not in exclude]
     stab = stability_of(fails, cfg)
     missing = [r for r in fails if r["task_id"] not in stab]
     return {"failures": fails, "stability": stab, "missing": missing,
@@ -630,7 +633,7 @@ def skill_gate_cost(cfg: EvolveConfig, pool: list[int], n_targets: int, n_reg: i
 
 
 async def gate_skill_library(cfg: EvolveConfig, ledger: EditLedger, edits: list, base_rows: list[dict], *,
-                             provider: Any, user_llm: Any, store: Any, max_targets: int = 8,
+                             bench: Benchmark, provider: Any, user_llm: Any, store: Any, max_targets: int = 8,
                              log: Callable[[str], None] = print) -> dict:
     """Gate a set of induced skills as ONE candidate version.
 
@@ -649,7 +652,7 @@ async def gate_skill_library(cfg: EvolveConfig, ledger: EditLedger, edits: list,
     from .stability import assess_failures
     inc = ledger.current()
     inc_rows = load_rows(ledger.rows_path(inc.version))
-    _, reg = version_setup(inc)
+    _, reg = version_setup(inc, bench=bench)
     known = set(reg._tools)  # noqa: SLF001
     cand = library_version(inc, edits, known).model_copy(update={"version": ledger.next_version_number()})
     added = [e for e in edits if e.target in cand.skills and e.target not in inc.skills]
@@ -657,18 +660,18 @@ async def gate_skill_library(cfg: EvolveConfig, ledger: EditLedger, edits: list,
         return {"accepted": False, "reason": "no induced skill applies to the current version", "episodes": 0}
     tools = {e.source_cluster.split(":", 1)[1] for e in added if e.source_cluster.startswith("skill:")}
     evidence = {t for e in added for t in e.evidence_tasks}
-    tp = skill_target_plan(cfg, base_rows, tools, evidence)
+    tp = skill_target_plan(cfg, base_rows, tools, evidence, bench=bench)
     used = 0
     if tp["missing"]:
         log(f"stability: assessing {len(tp['missing'])} uncached failures under the baseline")
-        _, base_reg = version_setup(ledger.version(0))
+        _, base_reg = version_setup(ledger.version(0), bench=bench)
         before = {k for k in stability_of(tp["missing"], cfg)}
-        await assess_failures(tp["missing"], _paths(cfg)["stability"], store=store, provider=provider,
+        await assess_failures(tp["missing"], _paths(cfg)["stability"], store=store, bench=bench, provider=provider,
                               user_llm=user_llm, registry=base_reg, n=cfg.stability_n,
                               stable_max=cfg.stable_max, concurrency=cfg.concurrency, log=log)
         new = stability_of(tp["missing"], cfg)
         used += sum(rec.n for t, rec in new.items() if t not in before)
-        tp = skill_target_plan(cfg, base_rows, tools, evidence)
+        tp = skill_target_plan(cfg, base_rows, tools, evidence, bench=bench)
     targets = [(r["task_id"], r["info"]["rewind"]["trace"], 0, 0) for r in tp["stable"]][:max_targets]
     pool = _pool(inc_rows, ledger.shown() | evidence | {t[0] for t in targets})
     round_no = ledger.bump_round()
@@ -681,10 +684,10 @@ async def gate_skill_library(cfg: EvolveConfig, ledger: EditLedger, edits: list,
                 "episodes": used}
 
     gdir = _paths(cfg)["gate"]
-    null, n_null = await efficacy(inc, targets, policy=cfg.gate, provider=provider, user_llm=user_llm,
+    null, n_null = await efficacy(inc, targets, policy=cfg.gate, bench=bench, provider=provider, user_llm=user_llm,
                                   store=store, log=lambda m: log("  [incumbent]" + m),
                                   rows_out=gdir / f"v{cand.version}_skills_eff_incumbent.json")
-    cnd, n_cand = await efficacy(cand, targets, policy=cfg.gate, provider=provider, user_llm=user_llm,
+    cnd, n_cand = await efficacy(cand, targets, policy=cfg.gate, bench=bench, provider=provider, user_llm=user_llm,
                                  store=store, log=lambda m: log("  [skills]" + m),
                                  rows_out=gdir / f"v{cand.version}_skills_eff_candidate.json")
     used += n_null + n_cand
@@ -696,7 +699,7 @@ async def gate_skill_library(cfg: EvolveConfig, ledger: EditLedger, edits: list,
     log(f"  efficacy: skills {eff.cand_passes}/{eff.cand_n} vs incumbent {eff.null_passes}/{eff.null_n}, "
         f"p = {p:.4f}")
     out = gdir / f"v{cand.version}_skills.json"
-    v = await gate(cand, inc_rows, pool, split=cfg.split, out=out, provider=provider, user_llm=user_llm,
+    v = await gate(cand, inc_rows, pool, split=cfg.split, out=out, bench=bench, provider=provider, user_llm=user_llm,
                    store=store, policy=cfg.gate, concurrency=cfg.concurrency, log=log, incumbent=inc,
                    prior_efficacy=eff, regression_suite=ledger.regression_suite())
     v = v.model_copy(update={"episodes": v.episodes + used})

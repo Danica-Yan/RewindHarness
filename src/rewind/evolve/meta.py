@@ -27,6 +27,7 @@ from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel
 
+from ..benchmark import Benchmark
 from .ledger import EditLedger
 from .surface import leak_reasons
 
@@ -192,7 +193,7 @@ def meta_cost(cfg: Any, clusters: list[dict]) -> int:
 
 
 async def meta_eval(cfg: Any, ledger: EditLedger, new: list[str], clusters: list[dict], *, llm: JsonLLM,
-                    tool_names: list[str], provider: Any, user_llm: Any, store: Any,
+                    tool_names: list[str], bench: Benchmark, provider: Any, user_llm: Any, store: Any,
                     log: Callable[[str], None] = print) -> dict:
     """Old vs new lessons on the same clusters, judged by the fixed offline
     validation + screening. Adopts the new lessons only if they win."""
@@ -205,7 +206,7 @@ async def meta_eval(cfg: Any, ledger: EditLedger, new: list[str], clusters: list
     inc = ledger.current()
     rows = load_rows(ledger.rows_path(inc.version))
     base_rows = load_rows(ledger.rows_path(0))
-    _, reg = version_setup(inc)
+    _, reg = version_setup(inc, bench=bench)
     tools = set(reg._tools)  # noqa: SLF001
     arms = {"old": ArmResult(), "new": ArmResult()}
     round_no = ledger.bump_round()
@@ -218,13 +219,14 @@ async def meta_eval(cfg: Any, ledger: EditLedger, new: list[str], clusters: list
         pending: list[tuple] = []
         for arm, ls in (("old", lessons(ledger)), ("new", new)):
             res = arms[arm]
-            prop = LLMProposer(llm, tool_names, lessons=ls)
+            prop = LLMProposer(llm, tool_names, lessons=ls, bench=bench)
             edits = await prop.propose(c["cluster"], a_rows, cfg.split, inc, rejected, cfg.n_candidates)
             res.proposed += len(edits)
             for e in edits:
                 why = validate_edit(e, inc, known_tools=tools, max_tokens=cfg.gate.max_ctx_tokens)
                 if why is None and e.kind == "check" and e.op != "delete":
-                    ok, why2, _ = backtest_edit(cfg, e, rows, store, {r.task_id for r in c["A"] + c["B"]})
+                    ok, why2, _ = backtest_edit(cfg, e, rows, store, {r.task_id for r in c["A"] + c["B"]},
+                                                bench=bench)
                     why = None if ok else why2
                 if why is not None:
                     res.edits.append({"cluster": c["cluster"], "target": e.target, "stage": "invalid", "why": why})
@@ -232,9 +234,9 @@ async def meta_eval(cfg: Any, ledger: EditLedger, new: list[str], clusters: list
                     continue
                 res.valid += 1
                 cand = inc.apply(e, known_tools=tools)
-                ccfg, creg = version_setup(cand)
+                ccfg, creg = version_setup(cand, bench=bench)
                 sr = await screen([e.edit_id], b_tasks, system_prompt=ccfg.system_prompt, registry=creg,
-                                  store=store, provider=provider, user_llm=user_llm, policy=cfg.screen, log=log)
+                                  store=store, bench=bench, provider=provider, user_llm=user_llm, policy=cfg.screen, log=log)
                 res.forks += sr.forks
                 res.screened_in += sr.passed
                 pending.append((e, "meta_screen", sr.passed, f"[{arm} lessons] {sr.reason}", sr.model_dump()))

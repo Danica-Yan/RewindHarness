@@ -9,7 +9,7 @@ test_eval_attribution.py checks bisect_attribute without needing a live LLM.
 """
 from __future__ import annotations
 
-from rewind.flywheel.taubench_failures import action_shape, classify_taubench, summarize
+from rewind.env.taubench_failures import action_shape, classify_taubench, summarize
 
 
 def _tool_msg(content: str, name: str = "get_order_details") -> dict:

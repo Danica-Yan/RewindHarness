@@ -15,8 +15,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from ..env.taubench_adapter import MUTATING_TOOLS
-from ..env.taubench_dialogue import load_task
+from ..benchmark import Benchmark
 
 
 class ToolConcentration(BaseModel):
@@ -32,17 +31,17 @@ def binom_tail(k: int, n: int, p: float) -> float:
     return sum(comb(n, i) * p ** i * (1 - p) ** (n - i) for i in range(k, n + 1))
 
 
-def task_tools(split: str, task_id: int) -> set[str]:
-    return {a.name for a in load_task(split, task_id).actions if a.name in MUTATING_TOOLS}
+def task_tools(split: str, task_id: int, *, bench: Benchmark) -> set[str]:
+    return {a.name for a in bench.task(split, task_id).actions if a.name in bench.write_tools}
 
 
-def concentration(pool: list[int], broken: list[int], fixed: list[int], split: str
-                  ) -> list[ToolConcentration]:
+def concentration(pool: list[int], broken: list[int], fixed: list[int], split: str, *,
+                  bench: Benchmark) -> list[ToolConcentration]:
     """Per mutating tool: how concentrated the broken tasks are on tasks that
     use it, most surprising first."""
-    tools = {t: task_tools(split, t) for t in set(pool) | set(broken) | set(fixed)}
+    tools = {t: task_tools(split, t, bench=bench) for t in set(pool) | set(broken) | set(fixed)}
     out = []
-    for tool in sorted(MUTATING_TOOLS):
+    for tool in sorted(bench.write_tools):
         p = sum(1 for t in pool if tool in tools[t]) / len(pool) if pool else 0.0
         kb = sum(1 for t in broken if tool in tools[t])
         kf = sum(1 for t in fixed if tool in tools[t])
@@ -76,11 +75,11 @@ def _first_row(rows: list[dict], task_id: int) -> dict | None:
 
 
 def gate_feedback(verdict: dict, incumbent_rows: list[dict], candidate_rows: list[dict],
-                  split: str) -> dict[str, Any]:
+                  split: str, *, bench: Benchmark) -> dict[str, Any]:
     """Structured + text feedback for a rejected gate verdict."""
     broken, fixed = verdict.get("regressions", []), verdict.get("improvements", [])
     pool = sorted({r["task_id"] for r in candidate_rows})
-    conc = concentration(pool, broken, fixed, split) if pool else []
+    conc = concentration(pool, broken, fixed, split, bench=bench) if pool else []
     lines = []
     eff = verdict.get("efficacy")
     if eff:
@@ -98,7 +97,7 @@ def gate_feedback(verdict: dict, incumbent_rows: list[dict], candidate_rows: lis
     for t in broken:
         before, after = _first_row(incumbent_rows, t), _first_row(candidate_rows, t)
         if before and after:
-            example = {"task_id": t, "goal": load_task(split, t).instruction,
+            example = {"task_id": t, "goal": bench.task(split, t).instruction,
                        "before_passed": agent_actions(before.get("traj", [])),
                        "after_failed": agent_actions(after.get("traj", []))}
             break

@@ -27,6 +27,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from rewind.env.taubench_adapter import MUTATING_TOOLS  # noqa: E402
 from rewind.evolve.feedback import binom_tail as tail  # noqa: E402
 from rewind.evolve.feedback import task_tools as tools_of  # noqa: E402
+from rewind.env.taubench_benchmark import TauBenchRetail  # noqa: E402
+
+TAU = TauBenchRetail()
 
 
 def main() -> None:
@@ -58,7 +61,7 @@ def main() -> None:
 
     pool_rows = json.loads(Path(v["rows_path"]).read_text(encoding="utf-8"))
     pool = sorted({r["task_id"] for r in pool_rows})
-    tools = {t: tools_of(a.split, t) for t in pool}
+    tools = {t: tools_of(a.split, t, bench=TAU) for t in pool}
     broken, fixed = v["regressions"], v["improvements"]
 
     groups = [(name, {name}) for name in sorted(MUTATING_TOOLS)]

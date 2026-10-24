@@ -18,7 +18,7 @@ import sys
 from collections import Counter
 
 sys.path.insert(0, "src")
-from rewind.flywheel.taubench_failures import action_shape, load_results, summarize  # noqa: E402
+from rewind.env.taubench_failures import action_shape, load_results, summarize  # noqa: E402
 
 
 def main() -> None:

@@ -12,6 +12,9 @@ import pytest
 from rewind.evolve.surface import ContextVersion, Edit, EditError, validate_edit
 from rewind.skills import LOAD_SKILL, MAX_SKILLS, SKILLS_HEADER, Skill
 from rewind.tools import ToolRegistry
+from rewind.env.taubench_benchmark import TauBenchRetail
+
+TAU = TauBenchRetail()
 
 EXCHANGE = {"description": "The customer wants to exchange items of a delivered order for other variants.",
             "steps": ["Authenticate the customer by email, or by name and zip code.",
@@ -94,9 +97,10 @@ needs_tau = pytest.mark.skipif(_TAU is not None, reason=f"tau_bench not importab
 
 @needs_tau
 def test_agent_loads_a_skill_mid_episode_and_reward_is_unaffected(tmp_path):
-    from rewind.env.taubench_dialogue import (
-        STOP_TOKEN, build_dialogue_registry, faithful_config, result_record, run_episode, wiki,
-    )
+    from rewind.env.taubench_dialogue import STOP_TOKEN, build_dialogue_registry, faithful_config, result_record, wiki
+    from rewind.experiment import run_episode
+    from rewind.env.taubench_benchmark import TauBenchRetail
+    TAU = TauBenchRetail()
     from rewind.evolve.skills import loaded_skills, skill_usage
     from rewind.providers import LLMResponse, ScriptedProvider, ToolCall
     from rewind.snapshot import SnapshotStore
@@ -107,7 +111,7 @@ def test_agent_loads_a_skill_mid_episode_and_reward_is_unaffected(tmp_path):
     script, _ = golden_dialogue("train", idx)
     script = [script[0], LLMResponse(tool_calls=[ToolCall(id="", name=LOAD_SKILL, args={"name": "exchange_items"})]),
               *script[1:]]
-    ep = asyncio.run(run_episode(
+    ep = asyncio.run(run_episode(TAU, 
         "train", idx, provider=ScriptedProvider(script),
         user_llm=scripted_user(["hi", "Thanks, please go ahead.", STOP_TOKEN]), store=SnapshotStore(),
         cfg=faithful_config(system_prompt=v.render_system_prompt(wiki())),
@@ -118,7 +122,7 @@ def test_agent_loads_a_skill_mid_episode_and_reward_is_unaffected(tmp_path):
     row = result_record(ep.env, ep.result, 0, None, ep.events)
     assert loaded_skills(row["traj"]) == ["exchange_items"]
     [u] = skill_usage([row, dict(row, trial=1, reward=0.0, traj=[])], "train",
-                      {"exchange_items": "exchange_delivered_order_items"})
+                      {"exchange_items": "exchange_delivered_order_items"}, bench=TAU)
     assert (u.relevant, u.loaded, u.pass_loaded, u.pass_not_loaded) == (2, 1, 1.0, 0.0)
 
 
@@ -130,10 +134,10 @@ def test_groups_and_induction_from_passing_episodes():
     for t in range(40):
         rows.append({"task_id": t, "trial": 0, "reward": 1.0 if t % 3 else 0.0,
                      "traj": [{"role": "system", "content": "w"}] * (1 + t % 5), "info": {}})
-    groups = skill_groups(rows, "train", min_passing=3, k=2)
+    groups = skill_groups(rows, "train", min_passing=3, k=2, bench=TAU)
     assert groups
     for g in groups:
-        assert all(rows[i]["reward"] == 1.0 and g.tool in task_writes("train", rows[i]["task_id"])
+        assert all(rows[i]["reward"] == 1.0 and g.tool in task_writes("train", rows[i]["task_id"], bench=TAU)
                    for i in g.passing)
         assert len(g.examples) <= 2 and len({rows[i]["task_id"] for i in g.examples}) == len(g.examples)
         assert all(load_task("train", t) for t in g.task_ids)
@@ -146,7 +150,7 @@ def test_groups_and_induction_from_passing_episodes():
         return json.dumps({"name": f"do_{tool}"[:40], "description": f"The customer needs {tool} done for them.",
                            "steps": ["Authenticate the customer first.", f"Call {tool} after a yes."],
                            "tools": [tool]})
-    res = asyncio.run(induce(groups, rows, "train", ContextVersion(), llm, sorted(TOOLS)))
+    res = asyncio.run(induce(groups, rows, "train", ContextVersion(), llm, sorted(TOOLS), bench=TAU))
     edits = [e for _, e, _ in res]
     assert all(e and e.kind == "skill" and e.source_cluster.startswith("skill:") for e in edits)
     from rewind.env.taubench_adapter import MUTATING_TOOLS
@@ -169,7 +173,7 @@ def test_skill_library_gate_end_to_end(tmp_path):
     good = skill_edit(description=f"Exchanges of delivered items: always {MAGIC} with the user first.")
     good = good.model_copy(update={"evidence_tasks": [1, 2]})
     res = asyncio.run(gate_skill_library(cfg, ledger, [good], base_rows, provider=FakeAgent(),
-                                         user_llm=fake_user, store=store, log=lambda m: None))
+                                         user_llm=fake_user, store=store, log=lambda m: None, bench=TAU))
     assert res["accepted"], res
     # targets were stability-checked under the baseline first, and every efficacy fork was saved
     from rewind.evolve.stability import load_records
@@ -189,7 +193,7 @@ def test_skill_library_gate_end_to_end(tmp_path):
     cfg2.gate.efficacy_n = 2
     res2 = asyncio.run(gate_skill_library(cfg2, ledger2, [useless], load_rows(ledger2.rows_path(0)),
                                           provider=FakeAgent(), user_llm=fake_user, store=store2,
-                                          log=lambda m: None))
+                                          log=lambda m: None, bench=TAU))
     assert not res2["accepted"] and "no proven effect" in res2["reason"]
     assert ledger2.current().version == 0
 
@@ -202,14 +206,14 @@ def test_contrast_groups_show_only_a_half_failures_and_targets_must_be_stable(tm
     assert failure_half(7) == failure_half(7) and {failure_half(t) for t in range(40)} == {"A", "B"}
     rows = [{"task_id": t, "trial": 0, "reward": 1.0 if t % 3 else 0.0, "traj": [],
              "info": {"rewind": {"trace": f"/x/{t}.jsonl", "ctx_version": 0}}} for t in range(60)]
-    plain = skill_groups(rows, "train", min_passing=3, k=2)
+    plain = skill_groups(rows, "train", min_passing=3, k=2, bench=TAU)
     assert all(not g.failing_examples for g in plain)
-    groups = skill_groups(rows, "train", min_passing=3, k=2, contrast=True)
+    groups = skill_groups(rows, "train", min_passing=3, k=2, contrast=True, bench=TAU)
     shown = [rows[i]["task_id"] for g in groups for i in g.failing_examples]
     assert shown and all(failure_half(t) == "A" and rows[t]["reward"] == 0.0 for t in shown)
     g = next(g for g in groups if g.failing_examples)
     msgs = induce_messages(g, rows, "train", ContextVersion(rules={"r": "When options are empty: swap the item for itself."}),
-                           sorted(TOOLS), policy="POLICY")
+                           sorted(TOOLS), policy="POLICY", bench=TAU)
     assert "never contradict" in msgs[1]["content"] and "swap the item for itself" in msgs[1]["content"]
     assert "FAILED conversation 1" in msgs[1]["content"] and "Correct actions would have been" in msgs[1]["content"]
     assert "restates it adds nothing" in msgs[0]["content"]
@@ -226,7 +230,7 @@ def test_contrast_groups_show_only_a_half_failures_and_targets_must_be_stable(tm
         recs[_key(r["task_id"], 0, 0)] = StabilityRecord(task_id=r["task_id"], trial=0, trace="t", ctx_version=0,
                                                           n=5, passes=passes, label="stable" if passes <= 1 else "flaky")
     save_records(tmp_path / "stability.json", recs)
-    tp = skill_target_plan(cfg, rows, tools, exclude=set(shown))
+    tp = skill_target_plan(cfg, rows, tools, exclude=set(shown), bench=TAU)
     assert tp["failures"] and not {r["task_id"] for r in tp["failures"]} & set(shown)
     assert all(tp["stability"][r["task_id"]].label == "stable" for r in tp["stable"])
     assert len(tp["stable"]) < len(tp["failures"]) and not tp["missing"]

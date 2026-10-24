@@ -57,7 +57,8 @@ from typing import Any, Callable, Literal
 
 from pydantic import BaseModel
 
-from ..env.taubench_dialogue import fork_episode
+from ..benchmark import Benchmark
+from ..experiment import fork_episode
 from ..trace import load_trace
 from .runner import run_batch, version_setup
 from .stats import paired_bootstrap_ci, per_task_rewards, pooled_pass1, task_means
@@ -128,15 +129,14 @@ def fisher_greater(k1: int, n1: int, k0: int, n0: int) -> float:
 
 
 async def efficacy(candidate: ContextVersion, targets: list[tuple[int, str, int, int]], *,
-                   policy: GatePolicy, provider: Any, user_llm: Any, store: Any,
+                   policy: GatePolicy, bench: Benchmark, provider: Any, user_llm: Any, store: Any,
                    log: Callable[[str], None] = print,
                    rows_out: str | Path | None = None) -> tuple[Efficacy, int]:
     """`targets`: (task_id, parent trace, null passes, null forks).
     `rows_out`: also write every fork as a results row (with its
     conversation), e.g. to see which skills the agent loaded."""
-    from ..env.taubench_dialogue import result_record
     from .runner import write_rows
-    cfg, reg = version_setup(candidate)
+    cfg, reg = version_setup(candidate, bench=bench)
     k1 = n1 = 0
     rows: list[dict] = []
     per_task: dict[int, int] = {}
@@ -144,12 +144,12 @@ async def efficacy(candidate: ContextVersion, targets: list[tuple[int, str, int,
         events = load_trace(trace)
         passes = 0
         for i in range(policy.efficacy_n):
-            ep = await fork_episode(events, 1, provider=provider, user_llm=user_llm, store=store,
+            ep = await fork_episode(bench, events, 1, provider=provider, user_llm=user_llm, store=store,
                                     registry=reg, system_prompt=cfg.system_prompt,
                                     run_id=f"{events[0].run_id}~eff{candidate.version}-{i}")
             passes += ep.reward.reward >= 1.0
             if rows_out is not None:
-                row = result_record(ep.env, ep.result, i, None, ep.events)
+                row = bench.result_record(ep.env, ep.result, i, None, ep.events)
                 row["info"]["rewind"]["ctx_version"] = candidate.version
                 rows.append(row)
         if rows_out is not None:
@@ -169,7 +169,7 @@ async def efficacy(candidate: ContextVersion, targets: list[tuple[int, str, int,
 
 
 async def regression_check(candidate: ContextVersion, incumbent: ContextVersion,
-                           suite: list[tuple[int, str]], *, k: int, provider: Any, user_llm: Any,
+                           suite: list[tuple[int, str]], *, k: int, bench: Benchmark, provider: Any, user_llm: Any,
                            store: Any, log: Callable[[str], None] = print) -> dict:
     """Regression memory: every task an accepted version fixed is re-checked
     by every later gate. Each suite task is forked from step 1, `k` times
@@ -184,10 +184,10 @@ async def regression_check(candidate: ContextVersion, incumbent: ContextVersion,
         events = load_trace(trace)
         res = {}
         for name, ctx in (("candidate", candidate), ("incumbent", incumbent)):
-            cfg, reg = _vs(ctx)
+            cfg, reg = _vs(ctx, bench=bench)
             passes = 0
             for i in range(k):
-                ep = await fork_episode(events, 1, provider=provider, user_llm=user_llm, store=store,
+                ep = await fork_episode(bench, events, 1, provider=provider, user_llm=user_llm, store=store,
                                         registry=reg, system_prompt=cfg.system_prompt,
                                         run_id=f"{events[0].run_id}~reg{ctx.version}-{i}")
                 passes += ep.reward.reward >= 1.0
@@ -223,7 +223,7 @@ def _verdict(**kw) -> GateVerdict:
 
 
 async def gate(candidate: ContextVersion, incumbent_rows: list[dict], pool: list[int], *,
-               split: str, out: str | Path, provider: Any, user_llm: Any, store: Any,
+               split: str, out: str | Path, bench: Benchmark, provider: Any, user_llm: Any, store: Any,
                policy: GatePolicy = GatePolicy(), targets: list[tuple[int, str, int, int]] = (),
                concurrency: int = 4, log: Callable[[str], None] = print,
                incumbent: ContextVersion | None = None,
@@ -248,7 +248,7 @@ async def gate(candidate: ContextVersion, incumbent_rows: list[dict], pool: list
         if not targets:
             return _verdict(accepted=False, mode=policy.mode, rows_path=str(out),
                             reason="targeted gate needs held-out target tasks")
-        eff, used = await efficacy(candidate, list(targets), policy=policy, provider=provider,
+        eff, used = await efficacy(candidate, list(targets), policy=policy, bench=bench, provider=provider,
                                    user_llm=user_llm, store=store, log=log)
         episodes += used
         log(f"  efficacy: {eff.cand_passes}/{eff.cand_n} vs null {eff.null_passes}/{eff.null_n}, "
@@ -267,7 +267,7 @@ async def gate(candidate: ContextVersion, incumbent_rows: list[dict], pool: list
     rows: list[dict] = []
     stopped = False
     for h, part in enumerate(halves):
-        rows = await run_batch(split, part, policy.trials, out, ctx=candidate, provider=provider,
+        rows = await run_batch(split, part, policy.trials, out, ctx=candidate, bench=bench, provider=provider,
                                user_llm=user_llm, store=store, concurrency=concurrency, log=log)
         cand = per_task_rewards(rows)
         common, delta, ci, regs, imps = _compare(inc, cand, part, policy)
@@ -287,7 +287,7 @@ async def gate(candidate: ContextVersion, incumbent_rows: list[dict], pool: list
     if not harmful and incumbent is not None and policy.confirm_k > 0 and (regs or imps):
         conf_regs, conf_fixes, conf_eps = await confirm_flips(
             candidate, incumbent, regs, imps, split=split, out=Path(out), k=policy.confirm_k,
-            provider=provider, user_llm=user_llm, store=store, concurrency=concurrency, log=log)
+            bench=bench, provider=provider, user_llm=user_llm, store=store, concurrency=concurrency, log=log)
         episodes += conf_eps
         log(f"  confirmation: {len(conf_regs)}/{len(regs)} regressions and "
             f"{len(conf_fixes)}/{len(imps)} fixes reproduce")
@@ -299,7 +299,7 @@ async def gate(candidate: ContextVersion, incumbent_rows: list[dict], pool: list
     suite = [s for s in regression_suite if not eff or s[0] not in eff.tasks]
     if not early_reject and incumbent is not None and policy.regression_k > 0 and suite:
         reg_chk = await regression_check(candidate, incumbent, suite, k=policy.regression_k,
-                                         provider=provider, user_llm=user_llm, store=store, log=log)
+                                         bench=bench, provider=provider, user_llm=user_llm, store=store, log=log)
         episodes += reg_chk["episodes"]
         log(f"  regression memory: {len(suite)} tasks, candidate {reg_chk['cand_passes']}/{reg_chk['n']} vs "
             f"incumbent {reg_chk['inc_passes']}/{reg_chk['n']}, broken {reg_chk['broken']}")
@@ -344,14 +344,14 @@ def confirm_paths(out: Path) -> tuple[Path, Path]:
 
 
 async def confirm_flips(candidate: ContextVersion, incumbent: ContextVersion, regs: list[int],
-                        imps: list[int], *, split: str, out: Path, k: int, provider: Any,
+                        imps: list[int], *, split: str, out: Path, k: int, bench: Benchmark, provider: Any,
                         user_llm: Any, store: Any, concurrency: int = 4,
                         log: Callable[[str], None] = print) -> tuple[list[int], list[int], int]:
     flips = sorted(set(regs) | set(imps))
     c_out, i_out = confirm_paths(out)
-    c_rows = await run_batch(split, flips, k, c_out, ctx=candidate, provider=provider, user_llm=user_llm,
+    c_rows = await run_batch(split, flips, k, c_out, ctx=candidate, bench=bench, provider=provider, user_llm=user_llm,
                              store=store, concurrency=concurrency, log=log, trial_offset=1)
-    i_rows = await run_batch(split, flips, k, i_out, ctx=incumbent, provider=provider, user_llm=user_llm,
+    i_rows = await run_batch(split, flips, k, i_out, ctx=incumbent, bench=bench, provider=provider, user_llm=user_llm,
                              store=store, concurrency=concurrency, log=log, trial_offset=1)
     c, i = per_task_rewards(c_rows), per_task_rewards(i_rows)
     passed = lambda v: [r >= 1.0 for r in v]  # noqa: E731

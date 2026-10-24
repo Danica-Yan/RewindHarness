@@ -29,9 +29,12 @@ pytestmark = pytest.mark.skipif(_IMPORT_ERROR is not None,
 
 if _IMPORT_ERROR is None:
     from rewind.env.taubench_dialogue import (
-        STOP_TOKEN, TauBenchDialogueEnv, TauUserSim, faithful_config, fork_episode, grade,
-        load_task, n_tasks, replay_episode, result_record, run_episode,
+        STOP_TOKEN, TauBenchDialogueEnv, TauUserSim, faithful_config, grade, load_task, n_tasks,
+        result_record,
     )
+    from rewind.experiment import fork_episode, replay_episode, run_episode
+    from rewind.env.taubench_benchmark import TauBenchRetail
+    TAU = TauBenchRetail()
 
 
 def _run(coro):
@@ -73,7 +76,7 @@ def test_golden_dialogue_episode_gets_full_reward_and_records_user_turns():
     script, replies = golden_dialogue("train", idx)
     store = SnapshotStore()
     user = scripted_user(["I need help with my order.", *replies])
-    ep = _run(run_episode("train", idx, provider=ScriptedProvider(script), user_llm=user,
+    ep = _run(run_episode(TAU, "train", idx, provider=ScriptedProvider(script), user_llm=user,
                           store=store))
     assert ep.result.status == "completed"
     assert ep.reward.reward == 1.0 and ep.reward.r_actions
@@ -96,7 +99,7 @@ def test_outputs_task_needs_the_required_text_in_what_the_agent_said():
     said_all = "Here you go: " + " and ".join(task.outputs)
     for final, expect in ((said_all, 1.0), ("Done, anything else?", 0.0)):
         script, replies = golden_dialogue("test", idx, final_text=final)
-        ep = _run(run_episode("test", idx, provider=ScriptedProvider(script),
+        ep = _run(run_episode(TAU, "test", idx, provider=ScriptedProvider(script),
                               user_llm=scripted_user(["hello", *replies]), store=SnapshotStore()))
         assert ep.reward.r_actions
         assert ep.reward.reward == expect
@@ -107,7 +110,7 @@ def test_db_is_snapshotted_once_per_distinct_content():
     idx = _first_task("train", with_outputs=False, min_mutations=2)
     script, replies = golden_dialogue("train", idx)
     store = SnapshotStore()
-    ep = _run(run_episode("train", idx, provider=ScriptedProvider(script),
+    ep = _run(run_episode(TAU, "train", idx, provider=ScriptedProvider(script),
                           user_llm=scripted_user(["hi", *replies]), store=store))
     step_snaps = [store.get(e.data["env_hash"]) for e in ep.events if e.type == "step_start"]
     data_refs = {s["data_ref"] for s in step_snaps}
@@ -122,9 +125,9 @@ def test_replay_is_deterministic_without_any_model_or_user_calls():
     idx = _first_task("train", with_outputs=False)
     script, replies = golden_dialogue("train", idx)
     store = SnapshotStore()
-    ep = _run(run_episode("train", idx, provider=ScriptedProvider(script),
+    ep = _run(run_episode(TAU, "train", idx, provider=ScriptedProvider(script),
                           user_llm=scripted_user(["hi", *replies]), store=store))
-    rep = _run(replay_episode(ep.events, store))
+    rep = _run(replay_episode(TAU, ep.events, store))
     assert rep.ok, rep
 
 
@@ -132,7 +135,7 @@ def test_null_fork_restores_dialogue_state_and_reaches_the_same_outcome():
     idx = _first_task("train", with_outputs=False, min_mutations=1)
     script, replies = golden_dialogue("train", idx)
     store = SnapshotStore()
-    ep = _run(run_episode("train", idx, provider=ScriptedProvider(script),
+    ep = _run(run_episode(TAU, "train", idx, provider=ScriptedProvider(script),
                           user_llm=scripted_user(["hi", *replies]), store=store))
     k = 3  # after the greeting turn and one tool call
     snap = store.get(next(e for e in ep.events if e.type == "step_start" and e.step == k)
@@ -140,7 +143,7 @@ def test_null_fork_restores_dialogue_state_and_reaches_the_same_outcome():
     # the restored simulator holds the conversation so far (system, opener, 2 turns, 1 reply)
     assert len(snap["user"]) == 5 and snap["user"][-1]["content"] == "Thanks, please go ahead."
     rest = script[k - 1:]
-    fk = _run(fork_episode(ep.events, k, provider=ScriptedProvider(rest),
+    fk = _run(fork_episode(TAU, ep.events, k, provider=ScriptedProvider(rest),
                            user_llm=scripted_user([STOP_TOKEN]), store=store))
     assert fk.reward.reward == ep.reward.reward == 1.0
     assert [e for e in fk.events if e.inherited]  # prefix copied, flagged
@@ -150,7 +153,7 @@ def test_counterfactual_fork_with_a_wrong_mutation_flips_the_outcome():
     idx = _first_task("train", with_outputs=False, min_mutations=1)
     script, replies = golden_dialogue("train", idx)
     store = SnapshotStore()
-    ep = _run(run_episode("train", idx, provider=ScriptedProvider(script),
+    ep = _run(run_episode(TAU, "train", idx, provider=ScriptedProvider(script),
                           user_llm=scripted_user(["hi", *replies]), store=store))
     from rewind.env.taubench_adapter import MUTATING_TOOLS
     mut_i = next(i for i, r in enumerate(script) if r.tool_calls
@@ -159,7 +162,7 @@ def test_counterfactual_fork_with_a_wrong_mutation_flips_the_outcome():
     # replace the first mutation by a harmless read: the DB never reaches the goal state
     patch = ForkPatch(tool_calls=[{"name": "list_all_product_types", "args": {}}])
     rest = [r for r in script[mut_i + 1:]]
-    fk = _run(fork_episode(ep.events, step, provider=ScriptedProvider(rest),
+    fk = _run(fork_episode(TAU, ep.events, step, provider=ScriptedProvider(rest),
                            user_llm=scripted_user([STOP_TOKEN]), store=store, patch=patch))
     assert ep.reward.reward == 1.0 and fk.reward.reward == 0.0
 
@@ -169,7 +172,7 @@ def test_transfer_to_human_ends_the_episode_and_single_tool_call_truncates():
     script = [LLMResponse(tool_calls=[
         ToolCall(id="a", name="transfer_to_human_agents", args={"summary": "user wants a human"}),
         ToolCall(id="b", name="list_all_product_types", args={})])]
-    ep = _run(run_episode("train", idx, provider=ScriptedProvider(script),
+    ep = _run(run_episode(TAU, "train", idx, provider=ScriptedProvider(script),
                           user_llm=scripted_user(["get me a human"]), store=SnapshotStore()))
     assert ep.env.terminated and ep.result.status == "completed"
     assert any(e.type == "guard" and e.data.get("guard") == "truncate_tool_calls"
@@ -180,12 +183,12 @@ def test_transfer_to_human_ends_the_episode_and_single_tool_call_truncates():
 
 
 def test_tool_errors_use_tau_bench_format_and_result_row_matches_run_py_shape():
-    from rewind.flywheel.taubench_failures import classify_taubench
+    from rewind.env.taubench_failures import classify_taubench
     idx = _first_task("train", with_outputs=False)
     script = [LLMResponse(tool_calls=[ToolCall(id="a", name="get_order_details",
                                                args={"order_id": "#W0000000"})]),
               LLMResponse(text="I could not find that order.")]
-    ep = _run(run_episode("train", idx, provider=ScriptedProvider(script),
+    ep = _run(run_episode(TAU, "train", idx, provider=ScriptedProvider(script),
                           user_llm=scripted_user(["hi", STOP_TOKEN]), store=SnapshotStore()))
     tool_msg = next(e.data["message"] for e in ep.events
                     if e.type == "message" and e.data["message"]["role"] == "tool")
@@ -208,7 +211,9 @@ def test_fork_from_disk_store_reproduces_exactly_what_the_agent_saw(tmp_path):
     new process (store read from disk) showed the agent differently-ordered
     tool results than its parent. Checked with hash-verified replay from a
     store that has only the files, not the in-memory copies."""
-    from rewind.env.taubench_dialogue import fork_fidelity
+    from rewind.experiment import fork_fidelity
+    from rewind.env.taubench_benchmark import TauBenchRetail
+    TAU = TauBenchRetail()
     from rewind.trace import load_trace
     for split, with_outputs in (("train", False), ("test", True)):
         idx = _first_task(split, with_outputs=with_outputs, min_mutations=1)
@@ -216,15 +221,15 @@ def test_fork_from_disk_store_reproduces_exactly_what_the_agent_saw(tmp_path):
         final = "Summary: " + " ".join(task.outputs) if task.outputs else "All done."
         script, replies = golden_dialogue(split, idx, final_text=final)
         path = tmp_path / f"{split}.jsonl"
-        ep = _run(run_episode(split, idx, provider=ScriptedProvider(script),
+        ep = _run(run_episode(TAU, split, idx, provider=ScriptedProvider(script),
                               user_llm=scripted_user(["hi", *replies]),
                               store=SnapshotStore(tmp_path / "snaps"), trace_path=str(path)))
         assert ep.reward.reward == 1.0
         fresh = SnapshotStore(tmp_path / "snaps")  # disk only, like a new process
-        res = _run(fork_fidelity(load_trace(path), fresh))
+        res = _run(fork_fidelity(TAU, load_trace(path), fresh))
         assert res and all(r.ok for r in res), [r for r in res if not r.ok][:1]
         # and a plain replay from disk
-        assert _run(replay_episode(load_trace(path), SnapshotStore(tmp_path / "snaps"))).ok
+        assert _run(replay_episode(TAU, load_trace(path), SnapshotStore(tmp_path / "snaps"))).ok
 
 
 def test_ordered_snapshot_preserves_key_order_through_disk(tmp_path):

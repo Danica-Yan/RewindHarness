@@ -21,7 +21,8 @@ from typing import Any, Callable
 
 from pydantic import BaseModel
 
-from ..env.taubench_dialogue import fork_episode
+from ..benchmark import Benchmark
+from ..experiment import fork_episode
 from ..snapshot import SnapshotStore
 from ..trace import load_trace
 
@@ -49,7 +50,7 @@ class ScreenResult(BaseModel):
 
 
 async def screen(edit_ids: list[str], b_tasks: list[tuple[int, str, float]], *,
-                 system_prompt: str, registry: Any, store: SnapshotStore, provider: Any,
+                 system_prompt: str, registry: Any, store: SnapshotStore, bench: Benchmark, provider: Any,
                  user_llm: Any, policy: ScreenPolicy = ScreenPolicy(),
                  log: Callable[[str], None] = print) -> ScreenResult:
     """`b_tasks`: (task_id, parent trace path, null-fork pass rate)."""
@@ -64,7 +65,7 @@ async def screen(edit_ids: list[str], b_tasks: list[tuple[int, str, float]], *,
         target = null_rate + policy.tau  # pass rate this task must reach
         passes = forks = 0
         for i in range(policy.n):
-            ep = await fork_episode(events, 1, provider=provider, user_llm=user_llm, store=store,
+            ep = await fork_episode(bench, events, 1, provider=provider, user_llm=user_llm, store=store,
                                     registry=registry, system_prompt=system_prompt,
                                     run_id=f"{events[0].run_id}~screen-{i}")
             forks += 1

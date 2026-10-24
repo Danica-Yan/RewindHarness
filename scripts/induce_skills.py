@@ -38,6 +38,9 @@ from rewind.evolve.skills import (  # noqa: E402
     covers_from_ledger, induce, induce_messages, skill_groups, skill_usage,
 )
 from rewind.evolve.surface import Edit, validate_edit  # noqa: E402
+from rewind.env.taubench_benchmark import TauBenchRetail  # noqa: E402
+
+TAU = TauBenchRetail()
 
 
 def main() -> None:
@@ -72,7 +75,7 @@ def main() -> None:
         print(f"{'skill':32s} {'for tool':32s} {'relevant':>8s} {'loaded':>7s} {'pass|loaded':>12s} "
               f"{'pass|not':>9s} {'elsewhere':>9s}")
         fmt = lambda x: "-" if x is None else f"{x:.0%}"  # noqa: E731
-        for u in skill_usage(rows, a.split, covers):
+        for u in skill_usage(rows, a.split, covers, bench=TAU):
             print(f"{u.skill:32s} {u.covers_tool or '?':32s} {u.relevant:>8d} {u.loaded:>7d} "
                   f"{fmt(u.pass_loaded):>12s} {fmt(u.pass_not_loaded):>9s} {u.loaded_elsewhere:>9d}")
         print("\nObservational: the agent decides when to load, so loaded-vs-not is a diagnostic, not proof.")
@@ -82,12 +85,12 @@ def main() -> None:
         sys.exit("--base <baseline results json> is required")
     base_rows = load_rows(a.base)
     inc = led.current()
-    _, reg = version_setup(inc)
+    _, reg = version_setup(inc, bench=TAU)
     tools = sorted(reg._tools)  # noqa: SLF001
     covered = {e["source_cluster"].split(":", 1)[1] for _v, es in led.lineage(inc.version) for e in es
                if e.get("kind") == "skill" and str(e.get("source_cluster", "")).startswith("skill:")}
     groups = skill_groups(base_rows, a.split, min_passing=a.min_passing, k=a.examples, skip_tools=covered,
-                          contrast=a.contrast)
+                          contrast=a.contrast, bench=TAU)
 
     def target_summary(tp: dict, n_targets: int, pool: list[int]) -> str:
         return (f"  targets: {len(tp['failures'])} unseen failures of these types, "
@@ -106,9 +109,9 @@ def main() -> None:
             print(f"  {g.tool:32s} {len(g.task_ids):3d} passing tasks; examples {ex}"
                   + (f"; failures shown {fx}" if a.contrast else ""))
         prompt_chars = sum(len(m["content"]) for g in groups
-                           for m in induce_messages(g, base_rows, a.split, inc, tools))
+                           for m in induce_messages(g, base_rows, a.split, inc, tools, bench=TAU))
         evidence = {base_rows[i]["task_id"] for g in groups for i in g.examples + g.failing_examples}
-        tp = skill_target_plan(cfg, base_rows, {g.tool for g in groups}, evidence)
+        tp = skill_target_plan(cfg, base_rows, {g.tool for g in groups}, evidence, bench=TAU)
         n_t = min(a.max_targets, len(tp["stable"]) + len(tp["missing"]))
         pool = _pool(load_rows(led.rows_path(inc.version)), led.shown() | evidence
                      | {r["task_id"] for r in tp["failures"]})
@@ -125,7 +128,7 @@ def main() -> None:
             return
         from rewind.evolve.proposer import deepseek_json_llm
         res = asyncio.run(induce(groups, base_rows, a.split, inc, deepseek_json_llm(model=a.model, temperature=0.3),
-                                 tools))
+                                 tools, bench=TAU))
         out = []
         for g, e, raw in res:
             why = "unparseable output" if e is None else validate_edit(
@@ -152,7 +155,7 @@ def main() -> None:
              if c.get("valid") and c.get("edit")]
     tools_cov = {e.source_cluster.split(":", 1)[1] for e in edits}
     evidence = {t for e in edits for t in e.evidence_tasks}
-    tp = skill_target_plan(cfg, base_rows, tools_cov, evidence)
+    tp = skill_target_plan(cfg, base_rows, tools_cov, evidence, bench=TAU)
     n_t = min(a.max_targets, len(tp["stable"]) + len(tp["missing"]))
     pool = _pool(load_rows(led.rows_path(inc.version)), led.shown() | evidence
                  | {r["task_id"] for r in tp["failures"]})
@@ -166,7 +169,7 @@ def main() -> None:
     res = asyncio.run(gate_skill_library(cfg, led, edits, base_rows, max_targets=a.max_targets,
                                          provider=DeepSeekProvider(model=a.model),
                                          user_llm=litellm_user_llm(model=a.model, provider="deepseek"),
-                                         store=SnapshotStore(a.store_dir), log=lambda m: print(m, flush=True)))
+                                         store=SnapshotStore(a.store_dir), log=lambda m: print(m, flush=True), bench=TAU))
     print(json.dumps(res, indent=1, ensure_ascii=False))
 
 

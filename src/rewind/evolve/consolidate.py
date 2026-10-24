@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from ..benchmark import Benchmark
 from .gate import GatePolicy, efficacy, fisher_greater, regression_check
 from .ledger import EditLedger
 from .surface import ContextVersion, Edit
@@ -46,7 +47,7 @@ def plan(ledger: EditLedger, policy: GatePolicy) -> list[dict]:
     return out
 
 
-async def ablate(ledger: EditLedger, policy: GatePolicy, *, provider: Any, user_llm: Any, store: Any,
+async def ablate(ledger: EditLedger, policy: GatePolicy, *, bench: Benchmark, provider: Any, user_llm: Any, store: Any,
                  only: str | None = None, log: Callable[[str], None] = print) -> list[dict]:
     results = []
     for kind, target in items(ledger.current()):
@@ -62,9 +63,9 @@ async def ablate(ledger: EditLedger, policy: GatePolicy, *, provider: Any, user_
             update={"version": ledger.next_version_number(), "parent": inc.version})
         targets = [(t, tr, 0, 0) for t, tr in ev]
         log(f"ablating {kind} {target} on its remembered fixes {[t for t, _ in ev]}")
-        with_it, n1 = await efficacy(inc, targets, policy=policy, provider=provider, user_llm=user_llm,
+        with_it, n1 = await efficacy(inc, targets, policy=policy, bench=bench, provider=provider, user_llm=user_llm,
                                      store=store, log=lambda m: log("  [with]" + m))
-        without, n2 = await efficacy(cand, targets, policy=policy, provider=provider, user_llm=user_llm,
+        without, n2 = await efficacy(cand, targets, policy=policy, bench=bench, provider=provider, user_llm=user_llm,
                                      store=store, log=lambda m: log("  [without]" + m))
         used = n1 + n2
         k_with, k_without, n = with_it.cand_passes, without.cand_passes, with_it.cand_n
@@ -77,7 +78,7 @@ async def ablate(ledger: EditLedger, policy: GatePolicy, *, provider: Any, user_
             others = [s for s in ledger.regression_suite() if s not in ev]
             chk = None
             if others and policy.regression_k > 0:
-                chk = await regression_check(cand, inc, others, k=policy.regression_k, provider=provider,
+                chk = await regression_check(cand, inc, others, k=policy.regression_k, bench=bench, provider=provider,
                                              user_llm=user_llm, store=store, log=log)
                 used += chk["episodes"]
                 data["regression_check"] = chk

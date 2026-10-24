@@ -22,7 +22,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from rewind.env.taubench_dialogue import build_dialogue_registry, fork_fidelity  # noqa: E402
+from rewind.env.taubench_dialogue import build_dialogue_registry  # noqa: E402
+from rewind.experiment import fork_fidelity  # noqa: E402
+from rewind.env.taubench_benchmark import TauBenchRetail  # noqa: E402
+TAU = TauBenchRetail()  # noqa: E402
 from rewind.snapshot import SnapshotStore  # noqa: E402
 from rewind.trace import load_trace  # noqa: E402
 
@@ -37,7 +40,7 @@ async def main_async(args: argparse.Namespace) -> int:
     n_ok = n = 0
     for r in rows:
         events = load_trace(r["info"]["rewind"]["trace"])
-        res = await fork_fidelity(events, store, registry=registry)
+        res = await fork_fidelity(TAU, events, store, registry=registry)
         bad = [x for x in res if not x.ok]
         n += len(res)
         n_ok += len(res) - len(bad)

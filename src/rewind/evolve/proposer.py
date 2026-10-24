@@ -19,7 +19,7 @@ import os
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
-from ..env.taubench_dialogue import load_task
+from ..benchmark import Benchmark
 from .surface import ContextVersion, Edit
 
 JsonLLM = Callable[[list[dict]], Awaitable[str]]
@@ -101,7 +101,7 @@ def _excerpt(traj: list[dict], max_msgs: int = 14, max_chars: int = 300) -> list
 
 def build_messages(cluster_key: str, evidence: list[dict], split: str, ctx: ContextVersion,
                    rejected: list[dict], n: int, tool_names: list[str],
-                   lessons: list[str] | None = None) -> list[dict]:
+                   lessons: list[str] | None = None, *, bench: Benchmark) -> list[dict]:
     parts = [f"Failure pattern: {cluster_key}", f"Tools: {', '.join(tool_names)}", ""]
     if ctx.rules or ctx.tool_notes or ctx.checks or ctx.skills:
         parts.append("Current learned rules:")
@@ -122,7 +122,7 @@ def build_messages(cluster_key: str, evidence: list[dict], split: str, ctx: Cont
                 parts += ["    " + line for line in r["feedback"].splitlines()]
         parts.append("")
     for i, row in enumerate(evidence, 1):
-        task = load_task(split, row["task_id"])
+        task = bench.task(split, row["task_id"])
         gt = [f"{a.name}({json.dumps(a.kwargs, ensure_ascii=False)})" for a in task.actions
               if a.name != "respond"]
         parts.append(f"=== Failure {i} ===")
@@ -165,14 +165,17 @@ def parse_edits(text: str, cluster_key: str, evidence_tasks: list[int]) -> list[
 
 
 class LLMProposer:
-    def __init__(self, llm: JsonLLM, tool_names: list[str], lessons: list[str] | None = None) -> None:
+    def __init__(self, llm: JsonLLM, tool_names: list[str], lessons: list[str] | None = None, *,
+                 bench: Benchmark) -> None:
         self.llm = llm
+        self.bench = bench
         self.tool_names = tool_names
         self.lessons = list(lessons or [])
         self.calls = 0
 
     async def propose(self, cluster_key, evidence, split, ctx, rejected, n=3) -> list[Edit]:
-        msgs = build_messages(cluster_key, evidence, split, ctx, rejected, n, self.tool_names, self.lessons)
+        msgs = build_messages(cluster_key, evidence, split, ctx, rejected, n, self.tool_names, self.lessons,
+                              bench=self.bench)
         self.last_messages = msgs
         self.calls += 1
         text = await self.llm(msgs)

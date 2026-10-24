@@ -54,6 +54,9 @@ from rewind.evolve.proposer import LLMProposer, deepseek_json_llm  # noqa: E402
 from rewind.evolve.screen import ScreenPolicy  # noqa: E402
 from rewind.providers import DeepSeekProvider  # noqa: E402
 from rewind.snapshot import SnapshotStore  # noqa: E402
+from rewind.env.taubench_benchmark import TauBenchRetail  # noqa: E402
+
+TAU = TauBenchRetail()
 
 
 def make_cfg(a: argparse.Namespace) -> EvolveConfig:
@@ -159,7 +162,7 @@ def main() -> None:
             return
         prov, user, store = clients()
         res = asyncio.run(consol.ablate(led, cfg.gate, provider=prov, user_llm=user, store=store, only=a.item,
-                                        log=lambda m: print(m, flush=True)))
+                                        log=lambda m: print(m, flush=True), bench=TAU))
         print(json.dumps(res, indent=1, ensure_ascii=False))
         return
 
@@ -203,12 +206,12 @@ def main() -> None:
         registry = build_dialogue_registry()
         res = asyncio.run(meta.meta_eval(cfg, led, new, cl, llm=deepseek_json_llm(model=a.model),
                                          tool_names=sorted(registry._tools), provider=prov,  # noqa: SLF001
-                                         user_llm=user, store=store, log=lambda m: print(m, flush=True)))
+                                         user_llm=user, store=store, log=lambda m: print(m, flush=True), bench=TAU))
         print(json.dumps(res, indent=1, ensure_ascii=False))
         return
 
     if a.cmd == "regate":
-        n = backfill_feedback(led, cfg)
+        n = backfill_feedback(led, cfg, bench=TAU)
         cands = regate_candidates(led)
         if not cands:
             print("nothing to re-gate" + (f" (attached feedback to {n} old rejection(s))" if n else ""))
@@ -225,13 +228,13 @@ def main() -> None:
             return
         prov, user, store = clients()
         res = asyncio.run(regate(cfg, led, provider=prov, user_llm=user, store=store,
-                                 log=lambda m: print(m, flush=True)))
+                                 log=lambda m: print(m, flush=True), bench=TAU))
         print(json.dumps([{"target": r["edit"]["target"], "was": r["was"], "accepted": r["verdict"]["accepted"],
                            "reason": r["verdict"]["reason"]} for r in res], indent=1, ensure_ascii=False))
         return
 
     if a.cmd == "retry":
-        backfill_feedback(led, cfg)
+        backfill_feedback(led, cfg, bench=TAU)
         cands = [c for c in retry_candidates(led, cfg) if a.cluster in (None, c["cluster"])]
         if not cands:
             print("no cluster to retry at this version")
@@ -255,10 +258,10 @@ def main() -> None:
         prov, user, store = clients()
         registry = build_dialogue_registry()
         proposer = LLMProposer(deepseek_json_llm(model=a.model), sorted(registry._tools),  # noqa: SLF001
-                               lessons=meta.lessons(led))
+                               lessons=meta.lessons(led), bench=TAU)
         rep = asyncio.run(retry_cluster(cfg, led, provider=prov, user_llm=user, store=store,
                                         proposer=proposer, cluster_key=c["cluster"],
-                                        max_attempts=a.max_attempts, log=lambda m: print(m, flush=True)))
+                                        max_attempts=a.max_attempts, log=lambda m: print(m, flush=True), bench=TAU))
         print(json.dumps({"round": rep.round, "from": rep.version_from, "to": rep.version_to,
                           "episodes_used": rep.episodes_used}, indent=1))
         return
@@ -282,24 +285,24 @@ def main() -> None:
         res = asyncio.run(gate_pending(cfg, led, provider=DeepSeekProvider(model=a.model),
                                        user_llm=litellm_user_llm(model=a.model, provider="deepseek"),
                                        store=SnapshotStore(a.store_dir),
-                                       log=lambda m: print(m, flush=True)))
+                                       log=lambda m: print(m, flush=True), bench=TAU))
         print(json.dumps([{"target": r["edit"]["target"], "accepted": r["verdict"]["accepted"],
                            "reason": r["verdict"]["reason"], "episodes": r["verdict"]["episodes"]}
                           for r in res], indent=1, ensure_ascii=False))
         return
 
-    print(plan(cfg, led))
+    print(plan(cfg, led, bench=TAU))
     if a.cmd == "plan":
         return
     if not a.yes and input("\nrun this round? [y/N] ").strip().lower() != "y":
         return
     registry = build_dialogue_registry()
     proposer = LLMProposer(deepseek_json_llm(model=a.model), sorted(registry._tools),  # noqa: SLF001
-                               lessons=meta.lessons(led))
+                               lessons=meta.lessons(led), bench=TAU)
     rep = asyncio.run(run_round(cfg, led, provider=DeepSeekProvider(model=a.model),
                                 user_llm=litellm_user_llm(model=a.model, provider="deepseek"),
                                 store=SnapshotStore(a.store_dir), proposer=proposer,
-                                log=lambda m: print(m, flush=True)))
+                                log=lambda m: print(m, flush=True), bench=TAU))
     print(json.dumps({"round": rep.round, "from": rep.version_from, "to": rep.version_to,
                       "episodes_used": rep.episodes_used, "proposer_calls": rep.proposer_calls},
                      indent=1))

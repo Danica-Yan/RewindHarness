@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..benchmark import Benchmark
 from ..policy import PolicySet
 from ..snapshot import SnapshotStore
 from ..trace import load_trace
@@ -185,9 +186,8 @@ def backtest(policy: PolicySet, rows: list[dict], *, store: SnapshotStore,
     return BacktestReport(stats, firings, n_pass, n_fail, skipped)
 
 
-def taubench_backtest(policy: PolicySet, rows: list[dict], *, store: SnapshotStore,
-                      split: str) -> BacktestReport:
-    from ..env.taubench_adapter import MUTATING_TOOLS
-    from ..env.taubench_dialogue import load_task
-    return backtest(policy, rows, store=store, gold_actions=lambda t: load_task(split, t).actions,
-                    is_write=lambda n: n in MUTATING_TOOLS)
+def benchmark_backtest(policy: PolicySet, rows: list[dict], *, store: SnapshotStore, split: str,
+                       bench: Benchmark) -> BacktestReport:
+    """`backtest` with gold actions and write tools taken from `bench`."""
+    return backtest(policy, rows, store=store, gold_actions=lambda t: bench.task(split, t).actions,
+                    is_write=lambda n: n in bench.write_tools)
