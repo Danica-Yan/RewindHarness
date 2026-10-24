@@ -15,7 +15,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from ..benchmark import Benchmark
+from ..benchmark import Benchmark, ResultRow
 
 
 class ToolConcentration(BaseModel):
@@ -32,7 +32,7 @@ def binom_tail(k: int, n: int, p: float) -> float:
 
 
 def task_tools(split: str, task_id: int, *, bench: Benchmark) -> set[str]:
-    return {a.name for a in bench.task(split, task_id).actions if a.name in bench.write_tools}
+    return {a.name for a in bench.gold_calls(split, task_id) if a.name in bench.write_tools}
 
 
 def concentration(pool: list[int], broken: list[int], fixed: list[int], split: str, *,
@@ -70,11 +70,11 @@ def agent_actions(traj: list[dict], max_items: int = 10) -> list[str]:
     return out[:max_items]
 
 
-def _first_row(rows: list[dict], task_id: int) -> dict | None:
+def _first_row(rows: list[ResultRow], task_id: int) -> ResultRow | None:
     return next((r for r in sorted(rows, key=lambda r: r["trial"]) if r["task_id"] == task_id), None)
 
 
-def gate_feedback(verdict: dict, incumbent_rows: list[dict], candidate_rows: list[dict],
+def gate_feedback(verdict: dict, incumbent_rows: list[ResultRow], candidate_rows: list[ResultRow],
                   split: str, *, bench: Benchmark) -> dict[str, Any]:
     """Structured + text feedback for a rejected gate verdict."""
     broken, fixed = verdict.get("regressions", []), verdict.get("improvements", [])

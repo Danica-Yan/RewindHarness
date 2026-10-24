@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from ..benchmark import Benchmark
+from ..benchmark import Benchmark, ResultRow, set_ctx_version, validate_row
 from ..experiment import run_episode
 from ..snapshot import SnapshotStore
 from .surface import ContextVersion
@@ -26,12 +26,12 @@ def version_setup(ctx: ContextVersion, *, bench: Benchmark):
     return cfg, ctx.patch_registry(bench.build_registry())
 
 
-def load_rows(path: str | Path) -> list[dict]:
+def load_rows(path: str | Path) -> list[ResultRow]:
     p = Path(path)
     return json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
 
 
-def write_rows(path: str | Path, rows: list[dict]) -> None:
+def write_rows(path: str | Path, rows: list[ResultRow]) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")
@@ -43,7 +43,7 @@ def write_rows(path: str | Path, rows: list[dict]) -> None:
 async def run_batch(split: str, task_ids: list[int], trials: int, out: str | Path, *,
                     ctx: ContextVersion, bench: Benchmark, provider: Any, user_llm: Any, store: SnapshotStore,
                     trace_dir: str | Path | None = None, concurrency: int = 4,
-                    log: Callable[[str], None] = print, trial_offset: int = 0) -> list[dict]:
+                    log: Callable[[str], None] = print, trial_offset: int = 0) -> list[ResultRow]:
     """Run `trials` trials (numbered from `trial_offset`) of each task; rows
     already in `out` are kept and skipped."""
     out = Path(out)
@@ -68,8 +68,9 @@ async def run_batch(split: str, task_ids: list[int], trials: int, out: str | Pat
             except Exception as e:  # one broken episode must not kill the batch
                 log(f"[error] {name}: {type(e).__name__}: {e}")
                 return
-            row = bench.result_record(ep.env, ep.result, trial, str(path), ep.events)
-            row["info"]["rewind"]["ctx_version"] = ctx.version
+            row = validate_row(bench.result_record(ep.env, ep.result, trial, str(path), ep.events),
+                               f"{bench.name} task {idx} trial {trial}")
+            set_ctx_version(row, ctx.version)
             async with lock:
                 rows.append(row)
                 write_rows(out, rows)

@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..benchmark import Benchmark
+from ..benchmark import Benchmark, ResultRow, row_trace
 from ..policy import PolicySet
 from ..snapshot import SnapshotStore
 from ..trace import load_trace
@@ -139,14 +139,14 @@ def calls_with_context(events: list, store: SnapshotStore):
             yield e.step, d["name"], d.get("args") or {}, d.get("call_id"), db(env_hash), list(messages)
 
 
-def backtest(policy: PolicySet, rows: list[dict], *, store: SnapshotStore,
+def backtest(policy: PolicySet, rows: list[ResultRow], *, store: SnapshotStore,
              gold_actions: Callable[[int], list[Any]], is_write: Callable[[str], bool]) -> BacktestReport:
     stats = {c.id: CheckStats(c.id) for c in policy.checks}
     firings: list[Firing] = []
     skipped: list[str] = []
     n_pass = n_fail = 0
     for r in rows:
-        trace = ((r.get("info") or {}).get("rewind") or {}).get("trace")
+        trace = row_trace(r)
         if not trace or not Path(trace).exists():
             skipped.append(f"task {r.get('task_id')} trial {r.get('trial')}: no trace on disk")
             continue
@@ -186,8 +186,8 @@ def backtest(policy: PolicySet, rows: list[dict], *, store: SnapshotStore,
     return BacktestReport(stats, firings, n_pass, n_fail, skipped)
 
 
-def benchmark_backtest(policy: PolicySet, rows: list[dict], *, store: SnapshotStore, split: str,
+def benchmark_backtest(policy: PolicySet, rows: list[ResultRow], *, store: SnapshotStore, split: str,
                        bench: Benchmark) -> BacktestReport:
     """`backtest` with gold actions and write tools taken from `bench`."""
-    return backtest(policy, rows, store=store, gold_actions=lambda t: bench.task(split, t).actions,
+    return backtest(policy, rows, store=store, gold_actions=lambda t: bench.gold_calls(split, t),
                     is_write=lambda n: n in bench.write_tools)

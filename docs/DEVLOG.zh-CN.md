@@ -7,59 +7,61 @@
 
 ## 架构
 
+分层结构，从上到下，上层只依赖下层。"端口"是 Protocol，"实现"层的模块插在端口上，所以内核、持久化层和自迭代层都不认识具体的后端或 benchmark。（这是分层重构之后的结构，过程见下方"分层重构"一节；早期按功能画的旧图已替换。）
+
 ```mermaid
 flowchart TB
-    subgraph Harness["harness（loop.py）"]
-        Loop["AgentRunner<br/>预算/重试/修复/loop检测"]
-        Tools["ToolRegistry<br/>pydantic校验+幂等"]
+    subgraph Apps["应用"]
+        CLI["cli · scripts"]
     end
-    subgraph Durability["确定性 + 崩溃恢复"]
-        Trace["TraceWriter<br/>seq严格递增"]
-        Snap["SnapshotStore<br/>内容寻址"]
-        Ckpt["Coordinator / PgCoordinator<br/>lease+fencing+3级checkpoint"]
+    subgraph Evolve["自迭代（evolve/）"]
+        Ev["聚类 → 稳定性过滤 → 提议 → 初筛 → 门禁 → 账本"]
     end
-    subgraph CounterFactual["回放 / 分叉 / 归因"]
-        Replay["replay_run"]
+    subgraph Analysis["分析（flywheel/）"]
+        Fw["失败分类 · 二分归因 · 数据飞轮"]
+    end
+    subgraph Exp["编排（experiment.py）"]
+        Ep["对任意 Benchmark<br/>跑 / 分叉 / 回放一个 episode"]
+    end
+    subgraph Dur["持久化 + 反事实"]
+        Replay["replay_run<br/>逐请求 hash 校验"]
         Fork["fork_run"]
-        Attr["bisect_attribute<br/>+ flip_rate_via_fork"]
+        Worker["worker<br/>lease · fencing · 续跑"]
+        Ckpt["StepCheckpointer<br/>intent → tool → step"]
     end
-    subgraph Dist["分布式执行层（W5，真实 Postgres+Redis）"]
-        Gateway["LLMGateway<br/>缓存+pub/sub single-flight<br/>RPM/TPM限流+熔断"]
-        Stream["StreamEventBus<br/>consumer group+XCLAIM"]
+    subgraph Kernel["内核（loop.py）"]
+        Loop["AgentRunner<br/>预算 · 重试 · 输出修复 · loop 检测<br/>policy 检查 · 只读工具并行"]
     end
-    subgraph Chaos["chaos 测试（W6，真实故障）"]
-        Kill["真实 kill -9<br/>跨进程恢复"]
-        Toxi["Toxiproxy<br/>真实网络故障"]
-        Inv["不变量检查器"]
+    subgraph Ports["端口"]
+        PEnv["Environment<br/>+ 对话 / 可终止 / 带数据 三种能力"]
+        PBench["Benchmark<br/>+ ResultRow 契约"]
+        PStore["CoordinatorStore"]
+        PGate["ToolGate"]
+        PProv["Provider"]
     end
-    subgraph Flywheel["数据飞轮（W7/W8）"]
-        Classify["classify() 失败分类"]
-        Cluster["cluster() 按类别+工具聚类"]
-        Eval["attribute-eval<br/>合成ground truth准确率"]
-        Round["两轮 gate: dev验证→merge→heldout报告"]
+    subgraph Impl["实现"]
+        Tau["τ-bench 零售域<br/>env/taubench_*"]
+        Toy["玩具零售 env"]
+        Sqlite["SqliteCoordinator"]
+        Pg["PgCoordinator<br/>FOR UPDATE SKIP LOCKED"]
+        Pol["PolicySet"]
+        LLM["DeepSeek · Anthropic<br/>Redis 上的 LLMGateway"]
     end
+    Core["核心：events · trace · snapshot · state · tools（各层共用）"]
 
-    Loop --> Trace
-    Loop --> Tools
-    Trace --> Snap
-    Loop -.checkpointer.-> Ckpt
-    Trace --> Replay
-    Snap --> Fork
-    Fork --> Attr
-    Ckpt --> Gateway
-    Ckpt --> Stream
-    Kill --> Ckpt
-    Toxi --> Gateway
-    Toxi --> Ckpt
-    Kill --> Inv
-    Trace --> Classify
-    Classify --> Cluster
-    Cluster --> Round
-    Attr --> Eval
-    Cluster --> Eval
+    Apps --> Evolve
+    Apps --> Exp
+    Evolve --> Exp
+    Evolve --> Ports
+    Analysis --> Dur
+    Exp --> Dur
+    Dur --> Kernel
+    Kernel --> Ports
+    Impl -. 实现 .-> Ports
+    Ports --> Core
 ```
 
-（GitHub 会原生渲染这个 Mermaid 图；本地看纯文本也不影响理解各层的依赖方向：harness 产生 trace → trace 既喂 checkpoint 也喂 replay/fork/归因 → 分布式层是 checkpoint 的真实基础设施实现 → chaos 测试真实地打这两层 → 失败分类/聚类/归因/飞轮消费 trace 和归因结果，形成闭环。）
+（依赖方向由 `tests/test_layering.py` 强制：它解析每个模块的 import（包括函数内的延迟 import），evolve 引用 benchmark 插件、插件引用编排层、端口引用使用它的模块、持久化层引用 runner，都会让测试失败；evolve 源码里出现 τ-bench 的工具名或动作名字符串也会失败。分布式层（Postgres coordinator、Redis gateway 和事件流）在 `dist/`，是同一组端口的实现；chaos 测试（真 `kill -9`、Toxiproxy、不变量检查）打的就是它们。）
 
 ```bash
 pip install -e ".[dev]"
@@ -163,15 +165,20 @@ pytest -q tests/test_taubench_adapter.py
 | `snapshot.py` | 内容寻址存储（sha256），env 状态和 checkpoint bundle 共用 |
 | `tools.py` | tool 注册、pydantic 校验、结构化错误、按 `action_id` 幂等 |
 | `providers.py` | Provider 抽象、ScriptedProvider、故障注入、Anthropic/DeepSeek 适配器 |
+| `state.py` | `LoopState`、`RunAbort`：内核和持久化层共用的运行状态，放在两者之下（原来在 `loop.py` 里，导致 `checkpoint.py` 要 import runner） |
+| `environment.py` | Environment 端口：必需的 `Environment`（`snapshot()` + `applied` 幂等账本）和三个可选能力 `DialogueEnv`/`TerminatingEnv`/`DataBackedEnv`，loop 用 `isinstance` 判断而不是 `getattr` 试探 |
+| `benchmark.py` | Benchmark 端口：evolve 和 `experiment.py` 需要的任务、agent 配置、episode、结果四组能力；`ResultRow` 结果行契约（`check_row`/`validate_row`/`row_trace`/`row_ctx_version`）；`FailureSignature` |
+| `experiment.py` | 对任意 Benchmark 跑 / 分叉 / 回放一个 episode、fork 保真度检查（原来写在 τ-bench 插件里） |
+| `coordination/` | 协调层：`types.py`（Job/JobSpec/Checkpoint，与后端无关）、`store.py`（异步 `CoordinatorStore` 端口）、`sqlite.py`（离线后端，`Coordinator` 为旧名别名） |
 | `loop.py` | agent loop：预算、重试退避、fallback、输出修复、参数自纠、loop 检测、checkpoint 挂钩点、并行 tool call（同一 turn 里 2+ 个非 mutating 调用并发执行，mutating 的仍严格顺序） |
 | `replay.py` | 确定性回放：记录的 LLM 输出驱动 harness，逐请求校验 hash，再做 trace diff |
 | `fork.py` | 反事实分叉：从第 k 步的 snapshot + 历史恢复，可替换该步动作后 live 续跑 |
-| `checkpoint.py` | `Coordinator`（sqlite：队列 + lease/fencing + checkpoint 日志）、`StepCheckpointer` |
+| `checkpoint.py` | `StepCheckpointer`：把 loop 的 `Checkpointer` 接口适配到 `CoordinatorStore` 端口（sqlite 后端已移到 `coordination/sqlite.py`） |
 | `worker.py` | 单次 job 执行：claim → 冷/热启动 → 跑 → complete；崩溃只是这个函数没返回 |
 | `flywheel/attribute.py` | 反事实归因：二分找根因步，纯算法和 fork 接线分开两层，各自可单测 |
 | `flywheel/failures.py` | 失败分类（方案 4.6 表）、按 (类别,工具) 聚类、`patch_for_step` 自动配对 |
 | `flywheel/eval_attribution.py` | 归因算法在合成 ground truth 上的准确率评测（精确匹配 / ±1 步容忍） |
-| `_await.py` | `maybe_await`：让 `worker.py`/`StepCheckpointer` 同时兼容同步（sqlite）和异步（Postgres）coordinator |
+| ~~`_await.py`~~ | 已删除：两个 coordination 后端统一成异步接口后，不再需要同步/异步桥接（见"分层重构"一节） |
 | `dist/pg_coordinator.py` | `PgCoordinator`：和 sqlite 版同协议的 asyncpg 实现，`claim()` 用真正的 `FOR UPDATE SKIP LOCKED` |
 | `dist/gateway.py` | `LLMGateway`：Redis 实现的响应缓存 + pub/sub single-flight + RPM/TPM 双维度限流 + 共享熔断器，套在任意 Provider 外面 |
 | `dist/eventstream.py` | `StreamEventBus`/`TraceStreamConsumer`：Redis Streams 事件总线，consumer group + `seq` 去重 + `XAUTOCLAIM` 崩溃恢复 |
@@ -182,13 +189,14 @@ pytest -q tests/test_taubench_adapter.py
 | `flywheel/heuristic_provider.py` | W8：确定性启发式 provider（真实 LLM 的替身，见下方 W8 一节），两个独立可开关的"bug" |
 | `flywheel/data_flywheel.py` | W8：两轮飞轮——在 train 上跑+分类+聚类，取 top cluster 找候选修复，在 dev 上门禁验证，通过则合并并报告 heldout |
 | `env/__init__.py` | 离线玩具零售环境（`env.py` 原地改成了包，内容不变，导出名不变） |
+| `env/taubench_benchmark.py` | `TauBenchRetail`：用委托的方式实现 Benchmark 端口；τ-bench 的失败签名逻辑和 `gold_calls`（去掉 `respond` 伪动作）在这里 |
 | `env/taubench_adapter.py` | W1 followup：真实 tau-bench 零售域 adapter——真实工具、真实数据、真实 reward 约定，黄金轨迹回放校验（不是模型 baseline，见下方 W1 一节） |
 | `scripts/ci_pr_gate.sh` | W8：快速回归门禁，不需要外部服务，PR 应该挡在这上面 |
 | `scripts/ci_nightly.sh` | W8：全量回归（含 dist/ 和 chaos），需要真实 Postgres/Redis/toxiproxy |
 | `.github/workflows/ci.yml` | W8：真实、valid 的 GitHub Actions 配置，PR 触发快速门禁、nightly/手动触发全量（见下方"已知局限"对这份配置未被真正跑过的说明） |
 | `scripts/taubench_baseline.py` | W1 followup：跑真实 tau-bench 任务的黄金轨迹回放，train/dev/test 三个 split，报告通过率 + 诚实跳过的 outputs 任务数 |
 | `scripts/run_taubench_deepseek.sh` | 真实 tau-bench baseline：调用 tau-bench 自己的 `run.py`（不是 rewind 代码）+ DeepSeek，需要 `DEEPSEEK_API_KEY` |
-| `flywheel/taubench_failures.py` | W1 followup：真实 DeepSeek 失败样本（test split 34 个）的归因分类——读 tau-bench 自己的 `EnvRunResult` 格式，和 `flywheel/failures.py` 读的 `AgentRunner` trace 格式不同，所以是独立模块 |
+| `env/taubench_failures.py`（原 `flywheel/taubench_failures.py`，旧路径保留转发） | W1 followup：真实 DeepSeek 失败样本（test split 34 个）的归因分类——读 tau-bench 自己的 `EnvRunResult` 格式，和 `flywheel/failures.py` 读的 `AgentRunner` trace 格式不同，所以是独立模块 |
 | `scripts/taubench_failure_report.py` | W1 followup：对一份真实 tau-bench 结果 json 跑失败分布报告，见下方"真实失败归因"一节 |
 | `scripts/taubench_round1_wiki.patch` | W1 followup：针对 tau-bench retail policy 的一个真实 bug（改商品前改地址的顺序约束）的真实 patch，已验证能干净应用 |
 | `scripts/run_taubench_round1.sh` | W1 followup：打上面那个 patch 后，用和 baseline 完全相同的协议重跑 test split，见下方"真实失败归因 round 1"一节 |
@@ -967,6 +975,32 @@ python scripts/run_evolve.py status
 **还没证明的**：账本里目前只有一轮的历史（几条提案），从这么少的历史里学到的经验未必有用——这正是要用 `meta-eval` 而不是直接采用的原因。
 
 **第一次真实 reflect（12 条提案的历史）**：第一次调用整组被拒——防"钻空子"的过滤器把提到 gate/screen 这些阶段名的经验都当成了谈论评测（又一次校准问题），现在只逐条删掉真正谈"怎么通过检验"的经验。第二次得到 8 条经验，人工审：有 3 条有根据（触发条件写到可观察的具体情况、不写复述现有行为的修改、整工具级 skill 没修好目标）；**2 条学自一个已被推翻的结论**——v1 第一次被拒时的"收窄触发条件"反馈，而那次拒绝后来重审发现是噪声；1 条与事实相反（"拒绝很少是失败原因"，而 v1 修的正是拒绝）；2 条是从一次成功推出的普遍规律。修复：被重审推翻的拒绝在 reflect 历史里标为 OVERTURNED 并去掉原反馈，也不再作为"被拒的想法"给 proposer 看（这条误导反馈此前同样会进入 proposer 的提示）；reflect 提示要求只见过一次的模式要写成试探性的或不写。
+
+### 分层重构：端口、依赖方向和结果行契约（本轮新增，0 次 API）
+
+**起因**：对 `src/rewind` 做了一次 import 依赖分析，底层（util/events/tools/providers）是干净的，但中上层有几处方向反了，几个关键契约只写在 docstring 里：
+
+- `checkpoint.py`（持久化层）import 了 `loop.py` 的 `LoopState`/`RunAbort`，持久化依赖 runner；它还同时装着领域模型、sqlite 实现和 loop 适配器三样东西，`PgCoordinator` 只能从 sqlite 实现的模块里拿类型。两个后端一个同步一个异步，靠 `maybe_await` 粘合。
+- loop 和环境的契约是 `getattr(env, "on_text_turn")`、`getattr(env, "terminated")` 这样的属性名试探。
+- evolve 的 9 个模块直接 import `env.taubench_*`，自迭代层实际上只能跑 τ-bench；τ-bench 插件自己又 import 了 fork/replay/loop（episode 的跑/分叉/回放写在插件里），依赖两头都是反的。
+
+**做了什么**（四个 commit，行为不变，没有调 API）：
+
+1. **协调层**：`LoopState`/`RunAbort` 下沉到 `state.py`；新建 `coordination/`（与后端无关的类型、异步 `CoordinatorStore` 端口、sqlite 后端）；`checkpoint.py` 只剩 `StepCheckpointer` 这个适配器；删掉 `_await.py`，两个后端只有一种调用约定。顺手修了一个类型 bug：`CheckpointKind` 只写了 `intent`/`step`，loop 实际一直在写 `tool` 级 checkpoint。新增端口一致性测试：两个后端实现了端口的全部方法、都是 async、签名一致。
+2. **Environment 端口**（`environment.py`）：必需的 `Environment` 只要求内核真正用到的 `snapshot()` 和 `applied`；对话、工具终止、policy 读的 `data` 是三个可选能力，loop 用 `isinstance` 判断。`db_hash()` 是评分的事，不放进内核接口。policy 仍然挂在 registry 上（它和它守护的工具同属 Evolve 版本化的"动作面"，要跟着 run/fork/replay/门禁每条路径走），只是类型化成 `ToolGate`。
+3. **Benchmark 端口**（`benchmark.py`）+ **编排层**（`experiment.py`）：evolve 需要的东西归成四组（任务、agent 配置、episode、结果）；跑/分叉/回放一个 episode 从插件里搬到 `experiment.py`，对任意 benchmark 通用；`TauBenchRetail` 用委托实现端口，τ-bench 的失败签名逻辑从 `evolve/prevalence.py` 搬到插件（它读的是 τ-bench 自己的结果格式）；`taubench_failures.py` 从 `flywheel/` 挪进 `env/`。evolve 里 τ-bench import 归零，`bench` 和 `provider`/`user_llm`/`store` 一样作为依赖显式传入（35 个函数，用 AST 静态检查确认所有调用点都传了）。
+4. **结果行契约 + 去掉硬编码名字**：evolve 只读结果文件，读的字段（`task_id`、`trial`、`reward`、OpenAI 格式的 `traj`、`info.rewind.trace`、`info.rewind.ctx_version`）原来是隐式约定，`((r.get("info") or {}).get("rewind") or {}).get("trace")` 在 5 处各写一遍。现在是端口里的 `ResultRow` TypedDict + `check_row`/`validate_row`，evolve 只通过 `row_trace`/`row_ctx_version`/`set_ctx_version` 读写嵌套字段；`run_batch` 和门禁的 efficacy fork 在 benchmark 产出结果行的那一刻校验，坏行当场报错，而不是在三个模块之后报 KeyError。`proposer.py`/`skills.py` 里硬编码的 `a.name != "respond"`（τ-bench 的"对用户说话"伪动作）换成端口的 `gold_calls()`，由 benchmark 自己过滤。
+
+**怎么防止退回去**：`tests/test_layering.py` 静态解析每个模块的 import（包括函数里的延迟 import），检查 6 条层间规则；另一条检查 evolve 源码里没有任何字符串常量等于 τ-bench 的工具名或动作名——import 检查看不到硬编码的名字。两类规则都做过反向验证：往 evolve 里加一行 τ-bench import、把旧版 `proposer.py` 放回去，测试都失败（后者报出 `{'evolve/proposer.py': {'respond'}}`），恢复后通过。
+
+**有一个发现**：train/dev/test 的 635 个零售任务里，没有一个的标准动作含 `respond`——那行过滤一直是空操作。所以 `gold_calls()` 对现有数据和旧逻辑结果完全一致（测试逐任务比对了 train 和 test），proposer 和技能归纳的提示一个字都没变，之前的实验结果不受影响；过滤本身用一个合成任务单独测试。它仍然是该删的耦合：换一个有 `respond` 的域（比如 τ-bench 的 airline）就会起作用，而那时 evolve 不应该需要知道这个名字。
+
+**测试**：224 个通过，3 个跳过（只缺 Toxiproxy），Postgres 和 Redis 都是真实服务。
+
+**局限**：
+- τ-bench 零售是 Benchmark 端口目前唯一的实现。端口的通用性还没有被第二个 benchmark 验证过，接口形状可能仍然偏向 τ-bench（比如 `user` 这个对话方句柄、要求 `traj` 是 OpenAI 格式）。
+- loop 里的横切逻辑（预算、loop 检测、policy、trace、checkpoint）仍然内联在 `_loop` 里，还没有抽成 middleware；context compaction 计划作为第一个 middleware 来做，届时压缩必须作为事件记进 trace，否则 replay/fork 会和实际发给模型的内容不一致。
+- `flywheel/` 和 `evolve/` 的职责边界还没理清（两者都有聚类）。
 
 ## 已知局限（诚实版）
 

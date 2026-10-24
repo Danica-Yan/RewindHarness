@@ -83,6 +83,26 @@ def test_layer_rule(under, forbidden, why):
     assert not violations, f"{why}:\n" + "\n".join(f"  {k}: {v}" for k, v in violations.items())
 
 
+def test_evolve_has_no_benchmark_vocabulary():
+    """An import rule cannot see a benchmark's names hard-coded as strings
+    (the old `a.name != "respond"`). No string constant in evolve/ may equal
+    one of tau-bench's tool or action names; anything benchmark-specific
+    belongs behind the port (e.g. `Benchmark.gold_calls`)."""
+    from rewind.env.taubench_adapter import MUTATING_TOOLS, RESPOND_ACTION_NAME, TERMINATE_TOOLS
+    vocab = {RESPOND_ACTION_NAME, *MUTATING_TOOLS, *TERMINATE_TOOLS}
+    try:
+        from rewind.env.taubench_dialogue import build_dialogue_registry
+        vocab |= set(build_dialogue_registry()._tools)  # noqa: SLF001
+    except Exception:  # tau_bench not installed: the constants above still apply
+        pass
+    found = {}
+    for path in _modules("evolve"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in vocab:
+                found.setdefault(str(path.relative_to(SRC)), set()).add(node.value)
+    assert not found, f"benchmark names hard-coded in evolve: {found}"
+
+
 def test_tau_benchmark_implements_the_port():
     from rewind.benchmark import Benchmark
     from rewind.env.taubench_benchmark import TauBenchRetail

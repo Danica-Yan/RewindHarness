@@ -57,7 +57,7 @@ from typing import Any, Callable, Literal
 
 from pydantic import BaseModel
 
-from ..benchmark import Benchmark
+from ..benchmark import Benchmark, ResultRow, set_ctx_version, validate_row
 from ..experiment import fork_episode
 from ..trace import load_trace
 from .runner import run_batch, version_setup
@@ -138,7 +138,7 @@ async def efficacy(candidate: ContextVersion, targets: list[tuple[int, str, int,
     from .runner import write_rows
     cfg, reg = version_setup(candidate, bench=bench)
     k1 = n1 = 0
-    rows: list[dict] = []
+    rows: list[ResultRow] = []
     per_task: dict[int, int] = {}
     for task_id, trace, _, _ in targets:
         events = load_trace(trace)
@@ -149,8 +149,9 @@ async def efficacy(candidate: ContextVersion, targets: list[tuple[int, str, int,
                                     run_id=f"{events[0].run_id}~eff{candidate.version}-{i}")
             passes += ep.reward.reward >= 1.0
             if rows_out is not None:
-                row = bench.result_record(ep.env, ep.result, i, None, ep.events)
-                row["info"]["rewind"]["ctx_version"] = candidate.version
+                row = validate_row(bench.result_record(ep.env, ep.result, i, None, ep.events),
+                                   f"{bench.name} efficacy fork of task {task_id}")
+                set_ctx_version(row, candidate.version)
                 rows.append(row)
         if rows_out is not None:
             write_rows(rows_out, rows)
@@ -222,7 +223,7 @@ def _verdict(**kw) -> GateVerdict:
     return GateVerdict(**base)
 
 
-async def gate(candidate: ContextVersion, incumbent_rows: list[dict], pool: list[int], *,
+async def gate(candidate: ContextVersion, incumbent_rows: list[ResultRow], pool: list[int], *,
                split: str, out: str | Path, bench: Benchmark, provider: Any, user_llm: Any, store: Any,
                policy: GatePolicy = GatePolicy(), targets: list[tuple[int, str, int, int]] = (),
                concurrency: int = 4, log: Callable[[str], None] = print,
@@ -264,7 +265,7 @@ async def gate(candidate: ContextVersion, incumbent_rows: list[dict], pool: list
     order = list(pool)
     random.Random(policy.seed).shuffle(order)
     halves = [order[: len(order) // 2], order] if policy.futility_stop else [order]
-    rows: list[dict] = []
+    rows: list[ResultRow] = []
     stopped = False
     for h, part in enumerate(halves):
         rows = await run_batch(split, part, policy.trials, out, ctx=candidate, bench=bench, provider=provider,

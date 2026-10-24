@@ -25,11 +25,11 @@ from collections import defaultdict
 
 from pydantic import BaseModel
 
-from ..benchmark import Benchmark, FailureSignature
+from ..benchmark import Benchmark, FailureSignature, ResultRow
 from .stats import wilson_interval
 
 
-def signature(row: dict, split: str, *, bench: Benchmark) -> FailureSignature | None:
+def signature(row: ResultRow, split: str, *, bench: Benchmark) -> FailureSignature | None:
     return bench.failure_signature(row, split)
 
 
@@ -47,7 +47,7 @@ class PrevalencePolicy(BaseModel):
     min_share_lb: float = 0.05     # Wilson lower bound of share of failed tasks
 
 
-def clusters(rows: list[dict], split: str, *, bench: Benchmark, only_tasks: set[int] | None = None
+def clusters(rows: list[ResultRow], split: str, *, bench: Benchmark, only_tasks: set[int] | None = None
              ) -> tuple[list[ClusterStats], dict[int, FailureSignature]]:
     """Fine and coarse clusters over failed rows (one signature per task: its
     first failed trial). `only_tasks` restricts members (e.g. to stable
@@ -101,7 +101,7 @@ def describe(stats: list[ClusterStats], policy: PrevalencePolicy, top: int = 12)
     return "\n".join(lines)
 
 
-def evidence_rows(rows: list[dict], tasks: list[int]) -> list[dict]:
+def evidence_rows(rows: list[ResultRow], tasks: list[int]) -> list[ResultRow]:
     """First failed row per task, in task order."""
     seen, out = set(), []
     for r in sorted(rows, key=lambda r: (r["task_id"], r["trial"])):

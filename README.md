@@ -47,59 +47,69 @@ The τ-bench evaluation and the Evolve gate are the parts I would point to first
 
 ## Architecture
 
+Layered top to bottom; a layer depends only on layers below it. Ports are Protocols, and the boxes in *Implementations* plug into them, so the kernel, the durability layer and the self-improvement loop never name a concrete backend or benchmark.
+
 ```mermaid
 flowchart TB
-    subgraph Harness["Harness (loop.py)"]
-        Loop["AgentRunner<br/>budgets · retries · output repair · loop detection<br/>parallel read-only tool calls"]
-        Tools["ToolRegistry<br/>pydantic validation · idempotency"]
+    subgraph Apps["Apps"]
+        CLI["cli · scripts"]
     end
-    subgraph Durability["Determinism + crash recovery"]
-        Trace["TraceWriter<br/>append-only JSONL, strict seq"]
-        Snap["SnapshotStore<br/>content-addressed"]
-        Ckpt["Coordinator / PgCoordinator<br/>lease · fencing · 3-level checkpoints"]
+    subgraph Evolve["Self-improvement (evolve/)"]
+        Ev["cluster → stability filter → propose → screen → gate → ledger"]
     end
-    subgraph CF["Replay / fork / attribution"]
-        Replay["replay_run"]
+    subgraph Analysis["Analysis (flywheel/)"]
+        Fw["failure classification · bisect attribution · data flywheel"]
+    end
+    subgraph Exp["Orchestration (experiment.py)"]
+        Ep["run / fork / replay one episode<br/>for any Benchmark"]
+    end
+    subgraph Dur["Durability + counterfactuals"]
+        Replay["replay_run<br/>request-hashed"]
         Fork["fork_run"]
-        Attr["bisect_attribute<br/>+ flip_rate_via_fork"]
+        Worker["worker<br/>lease · fencing · resume"]
+        Ckpt["StepCheckpointer<br/>intent → tool → step"]
     end
-    subgraph Dist["Distributed layer (Postgres + Redis)"]
-        Gateway["LLMGateway<br/>cache · single-flight · RPM/TPM · circuit breaker"]
-        Stream["StreamEventBus<br/>consumer groups · XAUTOCLAIM"]
+    subgraph Kernel["Kernel (loop.py)"]
+        Loop["AgentRunner<br/>budgets · retries · output repair · loop detection<br/>policy checks · parallel read-only tool calls"]
     end
-    subgraph Chaos["Chaos testing"]
-        Kill["real kill -9<br/>cross-process recovery"]
-        Toxi["Toxiproxy<br/>network faults"]
-        Inv["invariant checks"]
+    subgraph Ports["Ports"]
+        PEnv["Environment<br/>+ Dialogue / Terminating / DataBacked"]
+        PBench["Benchmark<br/>+ ResultRow contract"]
+        PStore["CoordinatorStore"]
+        PGate["ToolGate"]
+        PProv["Provider"]
     end
-    subgraph Flywheel["Evaluation + data flywheel"]
-        Classify["classify failures"]
-        Cluster["cluster by category + tool"]
-        Round["gated rounds: dev → merge → heldout"]
+    subgraph Impl["Implementations"]
+        Tau["τ-bench retail<br/>env/taubench_*"]
+        Toy["toy retail env"]
+        Sqlite["SqliteCoordinator"]
+        Pg["PgCoordinator<br/>FOR UPDATE SKIP LOCKED"]
+        Pol["PolicySet"]
+        LLM["DeepSeek · Anthropic<br/>LLMGateway on Redis"]
     end
+    Core["Core: events · trace · snapshot · state · tools — used by every layer"]
 
-    Loop --> Trace
-    Loop --> Tools
-    Trace --> Snap
-    Loop -.checkpointer.-> Ckpt
-    Trace --> Replay
-    Snap --> Fork
-    Fork --> Attr
-    Ckpt --> Gateway
-    Ckpt --> Stream
-    Kill --> Ckpt
-    Toxi --> Gateway
-    Kill --> Inv
-    Trace --> Classify
-    Classify --> Cluster
-    Cluster --> Round
+    Apps --> Evolve
+    Apps --> Exp
+    Evolve --> Exp
+    Evolve --> Ports
+    Analysis --> Dur
+    Exp --> Dur
+    Dur --> Kernel
+    Kernel --> Ports
+    Impl -. implements .-> Ports
+    Ports --> Core
 ```
+
+**The layering is enforced, not just drawn.** `tests/test_layering.py` parses every module's imports (lazy imports included) and fails if `evolve/` imports a benchmark plugin, a plugin imports orchestration (`fork`, `replay`, `experiment`), the port imports anything that uses it, or the durability layer imports the agent runner. It also fails if a string constant in `evolve/` names one of τ-bench's tools or actions, which an import check cannot see. Both rules were checked by injecting the old coupling and watching the test fail.
+
+Distributed execution (Postgres coordinator, Redis gateway and event stream) lives in `dist/` as implementations of the same ports; the chaos tests (real `kill -9`, Toxiproxy network faults, invariant checks) exercise them.
 
 ## Self-improvement loop (Evolve)
 
 One round, run with `scripts/run_evolve.py` (`plan`, `round`, `gate-pending`, `status`, `rollback`):
 
-1. **Run** the current context version on τ-bench train tasks; every episode is a rewind trace.
+1. **Run** the current context version on the benchmark's train tasks (τ-bench retail in every experiment so far; Evolve itself sees only the `Benchmark` port); every episode is a rewind trace.
 2. **Cluster** failures by a deterministic signature (category | tool | which arguments differed), keep only clusters whose share of failed tasks has a Wilson lower bound above a floor.
 3. **Stability filter**: re-run each failure from its first user turn with no change; only failures that pass ≤1 of 5 null forks are "stable". Flaky failures are never optimised.
 4. **Split** stable failures into A (shown to the proposer) and B (held out); both leave the gate pool for good.
@@ -214,19 +224,25 @@ Connection strings can be overridden with `REWIND_PG_DSN` and `REWIND_REDIS_URL`
 - **Only optimise failures that reproduce.** Half the failed parents in calibration passed most null forks. Writing rules for those would "fix" randomness and fool the screen.
 - **A targeted gate, not a whole-pool superiority test.** At a ~90% baseline a 9-task cluster moves pass^1 by ~2.5 pt — below what one trial over ~190 tasks can resolve — and a no-op re-run already "breaks" several passing tasks. So the gate asks separate questions: is there an effect on held-out targets (Fisher test), and is there no harm elsewhere?
 - **Calibrate the gate against noise before trusting its verdicts.** My first safety rule ("drop ≤ 2 pt") looked reasonable and rejected the first real edit; simulating harmless edits showed it rejects ~1 in 5 of them. The replacement re-runs only the flipped tasks and asks whether the breakage reproduces — the same stable-vs-flaky idea as the stability filter. A first version of that rule was itself miscalibrated (13% false rejections on coin-flip tasks) and was tightened after simulation.
+- **Ports between layers, enforced by a test.** Evolve receives the benchmark the same way it receives an LLM provider: as an explicit dependency typed by a Protocol. Result rows have a written, validated contract (`ResultRow`), and a benchmark that breaks it is rejected when it produces the row, not three modules later. The kernel asks an env for capabilities (`isinstance(env, DialogueEnv)`) instead of probing attribute names, and both coordination backends implement one async `CoordinatorStore`, so there is a single calling convention.
 - **Rules must say when they apply.** Every learned rule carries a trigger and is written as "When …: …"; a rule about one tool must be a note on that tool. Blanket instructions are refused before any episode is spent.
 
 ## Project layout
 
 ```text
 src/rewind/
-  loop.py, tools.py, providers.py     agent loop, tool registry, LLM providers (Anthropic, DeepSeek, scripted)
-  trace.py, events.py, snapshot.py    append-only trace, event schema, content-addressed snapshots
+  loop.py, tools.py, providers.py     kernel: agent loop, tool registry and ToolGate slot, LLM providers
+  state.py, events.py, trace.py,      core: loop state, event schema, append-only trace,
+    snapshot.py                         content-addressed snapshots
+  environment.py, benchmark.py        ports: Environment (+ capabilities), Benchmark (+ ResultRow contract)
+  coordination/                       port + domain types for job queue / leases / checkpoints; sqlite backend
   replay.py, fork.py                  deterministic replay and counterfactual forks
-  checkpoint.py, worker.py            sqlite coordinator, checkpointer, job execution
+  checkpoint.py, worker.py            StepCheckpointer (loop ↔ CoordinatorStore), job execution and resume
+  experiment.py                       run / fork / replay one episode of any Benchmark
   dist/                               Postgres coordinator, Redis gateway and event stream, Toxiproxy, invariants
-  flywheel/                           failure classification, attribution, data flywheel, τ-bench failure analysis
-  env/                                offline toy retail env, τ-bench adapter, real multi-turn τ-bench episodes
+  flywheel/                           failure classification, attribution, data flywheel
+  env/                                toy retail env; τ-bench plugin (adapter, dialogue env, failure
+                                        classifier, TauBenchRetail benchmark)
   evolve/                             self-improvement: surface, prevalence, stability, proposer, screen, gate, feedback, ledger, loop
 viewer/index.html                     offline viewer: rounds, versions, gate decisions, side-by-side episode comparison
 scripts/                              experiments, τ-bench runs and comparisons, CI entry points
@@ -249,6 +265,7 @@ Module docstrings refer to the milestones the project was built in:
 | W8 | Data flywheel and CI regression gate |
 | Evolve P0 | τ-bench user simulator inside the runtime, fork fidelity, null-fork calibration |
 | Evolve P1 | Gated self-improvement loop and its first real round |
+| Layering | Ports between layers (environment, coordination, benchmark, result rows), enforced by `tests/test_layering.py` |
 
 ## Limitations
 

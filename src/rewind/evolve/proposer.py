@@ -19,7 +19,7 @@ import os
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
-from ..benchmark import Benchmark
+from ..benchmark import Benchmark, ResultRow
 from .surface import ContextVersion, Edit
 
 JsonLLM = Callable[[list[dict]], Awaitable[str]]
@@ -76,7 +76,7 @@ SYSTEM = SYSTEM.replace("@CONDITIONS@", "\n".join(f"  * {k}: {v}" for k, v in CO
 
 
 class Proposer(Protocol):
-    async def propose(self, cluster_key: str, evidence: list[dict], split: str,
+    async def propose(self, cluster_key: str, evidence: list[ResultRow], split: str,
                       ctx: ContextVersion, rejected: list[dict], n: int) -> list[Edit]: ...
 
 
@@ -99,7 +99,7 @@ def _excerpt(traj: list[dict], max_msgs: int = 14, max_chars: int = 300) -> list
     return out
 
 
-def build_messages(cluster_key: str, evidence: list[dict], split: str, ctx: ContextVersion,
+def build_messages(cluster_key: str, evidence: list[ResultRow], split: str, ctx: ContextVersion,
                    rejected: list[dict], n: int, tool_names: list[str],
                    lessons: list[str] | None = None, *, bench: Benchmark) -> list[dict]:
     parts = [f"Failure pattern: {cluster_key}", f"Tools: {', '.join(tool_names)}", ""]
@@ -123,8 +123,8 @@ def build_messages(cluster_key: str, evidence: list[dict], split: str, ctx: Cont
         parts.append("")
     for i, row in enumerate(evidence, 1):
         task = bench.task(split, row["task_id"])
-        gt = [f"{a.name}({json.dumps(a.kwargs, ensure_ascii=False)})" for a in task.actions
-              if a.name != "respond"]
+        gt = [f"{a.name}({json.dumps(a.kwargs, ensure_ascii=False)})"
+              for a in bench.gold_calls(split, row["task_id"])]
         parts.append(f"=== Failure {i} ===")
         parts.append(f"Customer goal: {task.instruction}")
         parts.append("Correct actions: " + "; ".join(gt))

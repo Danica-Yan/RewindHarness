@@ -25,7 +25,7 @@ from typing import Any, Callable, Literal
 
 from pydantic import BaseModel
 
-from ..benchmark import Benchmark
+from ..benchmark import Benchmark, ResultRow, row_ctx_version, row_trace
 from ..experiment import fork_episode
 from ..snapshot import SnapshotStore
 from ..trace import load_trace
@@ -76,20 +76,19 @@ def save_records(path: str | Path, recs: dict[str, StabilityRecord]) -> None:
     tmp.replace(p)
 
 
-def pending(rows: list[dict], out: str | Path) -> list[tuple[dict, int]]:
+def pending(rows: list[ResultRow], out: str | Path) -> list[tuple[ResultRow, int]]:
     recs = load_records(out)
     todo = []
     for r in rows:
-        rw = r["info"].get("rewind") or {}
-        if r["reward"] >= 1.0 or not rw.get("trace"):
+        if r["reward"] >= 1.0 or not row_trace(r):
             continue
-        v = rw.get("ctx_version", 0)
+        v = row_ctx_version(r)
         if _key(r["task_id"], r["trial"], v) not in recs:
             todo.append((r, v))
     return todo
 
 
-async def assess_failures(rows: list[dict], out: str | Path, *, store: SnapshotStore, bench: Benchmark, provider: Any,
+async def assess_failures(rows: list[ResultRow], out: str | Path, *, store: SnapshotStore, bench: Benchmark, provider: Any,
                           user_llm: Any, registry: Any, n: int = 5, stable_max: int = 1,
                           flaky_min: int = 3, concurrency: int = 4,
                           log: Callable[[str], None] = print) -> dict[str, StabilityRecord]:
@@ -100,18 +99,17 @@ async def assess_failures(rows: list[dict], out: str | Path, *, store: SnapshotS
     recs = load_records(out)
     todo = []
     for r in rows:
-        rw = r["info"].get("rewind") or {}
-        if r["reward"] >= 1.0 or not rw.get("trace"):
+        if r["reward"] >= 1.0 or not row_trace(r):
             continue
-        v = rw.get("ctx_version", 0)
+        v = row_ctx_version(r)
         if _key(r["task_id"], r["trial"], v) not in recs:
             todo.append((r, v))
     log(f"stability: {len(todo)} failed episodes to assess ({len(recs)} cached), {n} null forks each")
     sem = asyncio.Semaphore(concurrency)
     lock = asyncio.Lock()
 
-    async def one(row: dict, version: int) -> None:
-        trace = row["info"]["rewind"]["trace"]
+    async def one(row: ResultRow, version: int) -> None:
+        trace = row_trace(row)
         events = load_trace(trace)
 
         # Sequential with early stopping (API budget): the only label that

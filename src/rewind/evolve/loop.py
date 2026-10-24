@@ -18,7 +18,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from ..benchmark import Benchmark
+from ..benchmark import Benchmark, ResultRow, row_ctx_version, row_trace
 from .gate import GatePolicy, gate
 from .ledger import EditLedger
 from .prevalence import PrevalencePolicy, clusters, describe, eligible, evidence_rows
@@ -83,7 +83,7 @@ def _paths(cfg: EvolveConfig) -> dict[str, Path]:
     return {"stability": d / "stability.json", "gate": d / "gate", "rounds": d / "rounds"}
 
 
-def _pool(rows: list[dict], shown: set[int]) -> list[int]:
+def _pool(rows: list[ResultRow], shown: set[int]) -> list[int]:
     return sorted({r["task_id"] for r in rows} - shown)
 
 
@@ -218,7 +218,7 @@ def trace_lookup(ledger: EditLedger, cfg: EvolveConfig) -> dict[int, str]:
     from .stability import load_records
     out: dict[int, str] = {}
     for r in load_rows(ledger.rows_path(0)):
-        tr = ((r.get("info") or {}).get("rewind") or {}).get("trace")
+        tr = row_trace(r)
         if tr and r["task_id"] not in out:
             out[r["task_id"]] = tr
     for rec in load_records(_paths(cfg)["stability"]).values():
@@ -255,7 +255,7 @@ def backfill_memory(ledger: EditLedger, cfg: EvolveConfig) -> int:
     return n
 
 
-def _record_gate(ledger: EditLedger, round_no: int, inc: Any, e: Any, v: Any, rows: list[dict],
+def _record_gate(ledger: EditLedger, round_no: int, inc: Any, e: Any, v: Any, rows: list[ResultRow],
                  split: str, extra: dict | None = None, *, bench: Benchmark) -> int:
     from .feedback import gate_feedback
     data = v.model_dump()
@@ -266,7 +266,7 @@ def _record_gate(ledger: EditLedger, round_no: int, inc: Any, e: Any, v: Any, ro
     return did
 
 
-def backtest_edit(cfg: EvolveConfig, e: Any, rows: list[dict], store: Any,
+def backtest_edit(cfg: EvolveConfig, e: Any, rows: list[ResultRow], store: Any,
                   cluster_tasks: set[int], *, bench: Benchmark) -> tuple[bool, str, dict]:
     """Replay a proposed check over the incumbent's recorded episodes (no API):
     it must stay quiet where the agent succeeded and fire on at least one of
@@ -289,8 +289,8 @@ def backtest_edit(cfg: EvolveConfig, e: Any, rows: list[dict], store: Any,
     return s.false_fire_rate <= p.max_false_fire_rate and len(caught) >= p.min_cluster_catches, why, data
 
 
-async def _try_edits(cfg: EvolveConfig, ledger: EditLedger, round_no: int, inc: Any, rows: list[dict],
-                     pool_rows: list[dict], cluster_key: str, a: list, b: list, budget: Budget,
+async def _try_edits(cfg: EvolveConfig, ledger: EditLedger, round_no: int, inc: Any, rows: list[ResultRow],
+                     pool_rows: list[ResultRow], cluster_key: str, a: list, b: list, budget: Budget,
                      rep: RoundReport, *, bench: Benchmark, provider: Any, user_llm: Any, store: Any, proposer: Any,
                      log: Callable[[str], None], note: Callable[[str], None]) -> bool:
     """Propose for one cluster's A half, then check, screen and gate. Returns
@@ -584,14 +584,14 @@ def _save(paths: dict[str, Path], rep: RoundReport) -> None:
 # skill library: induced from successes (and optionally contrasted with the
 # A half of failures), gated as one candidate version on stable B failures
 # ---------------------------------------------------------------------------
-def skill_failures(base_rows: list[dict], split: str, tools: set[str], *,
+def skill_failures(base_rows: list[ResultRow], split: str, tools: set[str], *,
                    bench: Benchmark) -> list[dict]:
     """Failed baseline episodes (with a trace) whose task needs one of
     `tools`, one per task."""
     from .skills import task_writes
     out, seen = [], set()
     for r in sorted(base_rows, key=lambda r: (r["task_id"], r["trial"])):
-        tr = ((r.get("info") or {}).get("rewind") or {}).get("trace")
+        tr = row_trace(r)
         if r["reward"] >= 1.0 or not tr or r["task_id"] in seen:
             continue
         if task_writes(split, r["task_id"], bench=bench) & tools:
@@ -600,20 +600,20 @@ def skill_failures(base_rows: list[dict], split: str, tools: set[str], *,
     return out
 
 
-def stability_of(rows: list[dict], cfg: EvolveConfig) -> dict[int, Any]:
+def stability_of(rows: list[ResultRow], cfg: EvolveConfig) -> dict[int, Any]:
     """Cached stability record per task for these baseline rows (if any)."""
     from .stability import _key, load_records
     recs = load_records(_paths(cfg)["stability"])
     out = {}
     for r in rows:
-        v = ((r.get("info") or {}).get("rewind") or {}).get("ctx_version", 0)
+        v = row_ctx_version(r)
         rec = recs.get(_key(r["task_id"], r["trial"], v))
         if rec is not None:
             out[r["task_id"]] = rec
     return out
 
 
-def skill_target_plan(cfg: EvolveConfig, base_rows: list[dict], tools: set[str],
+def skill_target_plan(cfg: EvolveConfig, base_rows: list[ResultRow], tools: set[str],
                       exclude: set[int], *, bench: Benchmark) -> dict:
     """Which failures can be targets: not shown to the inducer, and STABLE
     (fails >= 4 of 5 null forks) by independent stability data -- the
@@ -632,7 +632,7 @@ def skill_gate_cost(cfg: EvolveConfig, pool: list[int], n_targets: int, n_reg: i
     return n_targets * cfg.gate.efficacy_n + _gate_reserve(cfg, pool, n_targets, n_reg)
 
 
-async def gate_skill_library(cfg: EvolveConfig, ledger: EditLedger, edits: list, base_rows: list[dict], *,
+async def gate_skill_library(cfg: EvolveConfig, ledger: EditLedger, edits: list, base_rows: list[ResultRow], *,
                              bench: Benchmark, provider: Any, user_llm: Any, store: Any, max_targets: int = 8,
                              log: Callable[[str], None] = print) -> dict:
     """Gate a set of induced skills as ONE candidate version.
@@ -672,7 +672,7 @@ async def gate_skill_library(cfg: EvolveConfig, ledger: EditLedger, edits: list,
         new = stability_of(tp["missing"], cfg)
         used += sum(rec.n for t, rec in new.items() if t not in before)
         tp = skill_target_plan(cfg, base_rows, tools, evidence, bench=bench)
-    targets = [(r["task_id"], r["info"]["rewind"]["trace"], 0, 0) for r in tp["stable"]][:max_targets]
+    targets = [(r["task_id"], row_trace(r), 0, 0) for r in tp["stable"]][:max_targets]
     pool = _pool(inc_rows, ledger.shown() | evidence | {t[0] for t in targets})
     round_no = ledger.bump_round()
     ledger.mark_shown(sorted(evidence), round_no, "skill_evidence")

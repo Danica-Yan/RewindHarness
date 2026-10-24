@@ -21,7 +21,7 @@ from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel
 
-from ..benchmark import Benchmark
+from ..benchmark import Benchmark, ResultRow
 from ..skills import LOAD_SKILL
 from .proposer import _excerpt
 from .surface import ContextVersion, Edit, EditError, parse_skill
@@ -75,10 +75,10 @@ def failure_half(task_id: int) -> str:
 
 
 def task_writes(split: str, task_id: int, *, bench: Benchmark) -> set[str]:
-    return {a.name for a in bench.task(split, task_id).actions if a.name in bench.write_tools}
+    return {a.name for a in bench.gold_calls(split, task_id) if a.name in bench.write_tools}
 
 
-def skill_groups(rows: list[dict], split: str, *, bench: Benchmark, min_passing: int = 5, k: int = 4,
+def skill_groups(rows: list[ResultRow], split: str, *, bench: Benchmark, min_passing: int = 5, k: int = 4,
                  skip_tools: set[str] = frozenset(), contrast: bool = False,
                  fail_k: int = 2) -> list[SkillGroup]:
     """One group per write tool with at least `min_passing` passing episodes.
@@ -123,7 +123,7 @@ def skill_groups(rows: list[dict], split: str, *, bench: Benchmark, min_passing:
     return out
 
 
-def induce_messages(group: SkillGroup, rows: list[dict], split: str, ctx: ContextVersion,
+def induce_messages(group: SkillGroup, rows: list[ResultRow], split: str, ctx: ContextVersion,
                     tool_names: list[str], policy: str | None = None, *,
                     bench: Benchmark) -> list[dict]:
     if policy is None:
@@ -148,8 +148,8 @@ def induce_messages(group: SkillGroup, rows: list[dict], split: str, ctx: Contex
     for n, i in enumerate(group.failing_examples, 1):
         r = rows[i]
         task = bench.task(split, r["task_id"])
-        gold = [f"{a.name}({json.dumps(a.kwargs, ensure_ascii=False)})" for a in task.actions
-                if a.name != "respond"]
+        gold = [f"{a.name}({json.dumps(a.kwargs, ensure_ascii=False)})"
+                for a in bench.gold_calls(split, r["task_id"])]
         parts.append(f"=== FAILED conversation {n} (same kind of request) ===")
         parts.append(f"Customer goal: {task.instruction}")
         parts.append("Correct actions would have been: " + "; ".join(gold))
@@ -159,7 +159,7 @@ def induce_messages(group: SkillGroup, rows: list[dict], split: str, ctx: Contex
     return [{"role": "system", "content": system}, {"role": "user", "content": "\n".join(parts)}]
 
 
-def parse_skill_edit(text: str, group: SkillGroup, rows: list[dict]) -> Edit | None:
+def parse_skill_edit(text: str, group: SkillGroup, rows: list[ResultRow]) -> Edit | None:
     try:
         d = json.loads(text)
     except json.JSONDecodeError:
@@ -182,7 +182,7 @@ def parse_skill_edit(text: str, group: SkillGroup, rows: list[dict]) -> Edit | N
                 evidence_tasks=[rows[i]["task_id"] for i in group.examples + group.failing_examples])
 
 
-async def induce(groups: list[SkillGroup], rows: list[dict], split: str, ctx: ContextVersion,
+async def induce(groups: list[SkillGroup], rows: list[ResultRow], split: str, ctx: ContextVersion,
                  llm: JsonLLM, tool_names: list[str], policy: str | None = None, *,
                  bench: Benchmark) -> list[tuple[SkillGroup, Edit | None, str]]:
     """One LLM call per group. Returns (group, edit or None, raw text)."""
@@ -238,7 +238,7 @@ class SkillUsage(BaseModel):
     loaded_elsewhere: int           # loaded in episodes whose task does not need the tool
 
 
-def skill_usage(rows: list[dict], split: str, covers: dict[str, str], *,
+def skill_usage(rows: list[ResultRow], split: str, covers: dict[str, str], *,
                 bench: Benchmark) -> list[SkillUsage]:
     """`covers`: skill name -> the write tool it is for (from the edit's
     source_cluster "skill:<tool>"). Observational: agents choose when to load."""

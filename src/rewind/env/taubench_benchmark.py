@@ -16,10 +16,10 @@ import json
 import re
 from typing import Any
 
-from ..benchmark import FailureSignature
+from ..benchmark import FailureSignature, ResultRow
 from ..events import Event
 from ..snapshot import SnapshotStore
-from .taubench_adapter import MUTATING_TOOLS
+from .taubench_adapter import MUTATING_TOOLS, RESPOND_ACTION_NAME
 from .taubench_dialogue import (
     Reward, TauBenchDialogueEnv, TauUserSim, build_dialogue_registry, faithful_config, grade,
     load_task, n_tasks, recorded_user_llm, result_record, wiki,
@@ -65,6 +65,9 @@ class TauBenchRetail:
     def task(self, split: str, index: int) -> Any:
         return load_task(split, index)
 
+    def gold_calls(self, split: str, index: int) -> list[Any]:
+        return [a for a in load_task(split, index).actions if a.name != RESPOND_ACTION_NAME]
+
     def n_tasks(self, split: str) -> int:
         return n_tasks(split)
 
@@ -97,10 +100,10 @@ class TauBenchRetail:
         return grade(env)
 
     def result_record(self, env: TauBenchDialogueEnv, result: Any, trial: int,
-                      trace_path: str | None, events: list[Event]) -> dict:
+                      trace_path: str | None, events: list[Event]) -> ResultRow:
         return result_record(env, result, trial, trace_path, events)
 
-    def failure_signature(self, row: dict, split: str) -> FailureSignature | None:
+    def failure_signature(self, row: ResultRow, split: str) -> FailureSignature | None:
         rec = classify_taubench(row)
         if rec is None:
             return None
@@ -110,8 +113,7 @@ class TauBenchRetail:
         if rec.category == "WRONG_OUTPUT":
             return FailureSignature(category=rec.category, detail="missing required output")
         # action failures: find the first mutating tool where agent and truth differ
-        task = load_task(split, row["task_id"])
-        gt = [(a.name, a.kwargs) for a in task.actions if a.name in MUTATING_TOOLS]
+        gt = [(a.name, a.kwargs) for a in self.gold_calls(split, row["task_id"]) if a.name in MUTATING_TOOLS]
         agent = _agent_writes(row.get("traj", []))
         gt_names, ag_names = [n for n, _ in gt], [n for n, _ in agent]
         if gt_names == ag_names:
