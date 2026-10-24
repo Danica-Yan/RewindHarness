@@ -171,6 +171,12 @@ def test_skill_library_gate_end_to_end(tmp_path):
     res = asyncio.run(gate_skill_library(cfg, ledger, [good], base_rows, provider=FakeAgent(),
                                          user_llm=fake_user, store=store, log=lambda m: None))
     assert res["accepted"], res
+    # targets were stability-checked under the baseline first, and every efficacy fork was saved
+    from rewind.evolve.stability import load_records
+    assert load_records(tmp_path / "run" / "stability.json")
+    inc_rows, cand_rows = (load_rows(p) for p in res["efficacy_rows"])
+    assert len(inc_rows) == len(cand_rows) > 0 and all("traj" in r for r in cand_rows)
+    assert sum(r["reward"] for r in cand_rows) > sum(r["reward"] for r in inc_rows)
     cur = ledger.current()
     assert cur.version == 1 and list(cur.skills) == ["exchange_items"]
     assert {1, 2} <= ledger.shown()
@@ -186,3 +192,39 @@ def test_skill_library_gate_end_to_end(tmp_path):
                                           log=lambda m: None))
     assert not res2["accepted"] and "no proven effect" in res2["reason"]
     assert ledger2.current().version == 0
+
+
+@needs_tau
+def test_contrast_groups_show_only_a_half_failures_and_targets_must_be_stable(tmp_path):
+    from rewind.evolve.loop import EvolveConfig, skill_target_plan
+    from rewind.evolve.skills import failure_half, induce_messages, parse_skill_edit, skill_groups
+    from rewind.evolve.stability import StabilityRecord, _key, save_records
+    assert failure_half(7) == failure_half(7) and {failure_half(t) for t in range(40)} == {"A", "B"}
+    rows = [{"task_id": t, "trial": 0, "reward": 1.0 if t % 3 else 0.0, "traj": [],
+             "info": {"rewind": {"trace": f"/x/{t}.jsonl", "ctx_version": 0}}} for t in range(60)]
+    plain = skill_groups(rows, "train", min_passing=3, k=2)
+    assert all(not g.failing_examples for g in plain)
+    groups = skill_groups(rows, "train", min_passing=3, k=2, contrast=True)
+    shown = [rows[i]["task_id"] for g in groups for i in g.failing_examples]
+    assert shown and all(failure_half(t) == "A" and rows[t]["reward"] == 0.0 for t in shown)
+    g = next(g for g in groups if g.failing_examples)
+    msgs = induce_messages(g, rows, "train", ContextVersion(), sorted(TOOLS), policy="POLICY")
+    assert "FAILED conversation 1" in msgs[1]["content"] and "Correct actions would have been" in msgs[1]["content"]
+    assert "restates it adds nothing" in msgs[0]["content"]
+    e = parse_skill_edit(json.dumps({"name": "abc", **EXCHANGE}), g, rows)
+    assert set(e.evidence_tasks) >= {rows[i]["task_id"] for i in g.failing_examples}
+
+    # target plan: unseen failures only, and only those the stability data calls stable
+    cfg = EvolveConfig(run_dir=str(tmp_path))
+    tools = {g.tool}
+    fails = [r for r in rows if r["reward"] == 0.0]
+    recs = {}
+    for k, r in enumerate(fails):
+        passes = 0 if k % 2 == 0 else 4
+        recs[_key(r["task_id"], 0, 0)] = StabilityRecord(task_id=r["task_id"], trial=0, trace="t", ctx_version=0,
+                                                          n=5, passes=passes, label="stable" if passes <= 1 else "flaky")
+    save_records(tmp_path / "stability.json", recs)
+    tp = skill_target_plan(cfg, rows, tools, exclude=set(shown))
+    assert tp["failures"] and not {r["task_id"] for r in tp["failures"]} & set(shown)
+    assert all(tp["stability"][r["task_id"]].label == "stable" for r in tp["stable"])
+    assert len(tp["stable"]) < len(tp["failures"]) and not tp["missing"]

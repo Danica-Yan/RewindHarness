@@ -525,13 +525,12 @@ def _save(paths: dict[str, Path], rep: RoundReport) -> None:
 
 
 # ---------------------------------------------------------------------------
-# skill library: induced from successes, gated as one candidate version
+# skill library: induced from successes (and optionally contrasted with the
+# A half of failures), gated as one candidate version on stable B failures
 # ---------------------------------------------------------------------------
-def skill_targets(base_rows: list[dict], split: str, tools: set[str], max_targets: int = 8
-                  ) -> list[tuple[int, str, int, int]]:
-    """Failed baseline episodes whose task needs one of `tools` (with a trace
-    to fork from), one per task. Induction never saw failures, so all of
-    them are held out."""
+def skill_failures(base_rows: list[dict], split: str, tools: set[str]) -> list[dict]:
+    """Failed baseline episodes (with a trace) whose task needs one of
+    `tools`, one per task."""
     from .skills import task_writes
     out, seen = [], set()
     for r in sorted(base_rows, key=lambda r: (r["task_id"], r["trial"])):
@@ -539,9 +538,36 @@ def skill_targets(base_rows: list[dict], split: str, tools: set[str], max_target
         if r["reward"] >= 1.0 or not tr or r["task_id"] in seen:
             continue
         if task_writes(split, r["task_id"]) & tools:
-            out.append((r["task_id"], tr, 0, 0))
+            out.append(r)
             seen.add(r["task_id"])
-    return out[:max_targets]
+    return out
+
+
+def stability_of(rows: list[dict], cfg: EvolveConfig) -> dict[int, Any]:
+    """Cached stability record per task for these baseline rows (if any)."""
+    from .stability import _key, load_records
+    recs = load_records(_paths(cfg)["stability"])
+    out = {}
+    for r in rows:
+        v = ((r.get("info") or {}).get("rewind") or {}).get("ctx_version", 0)
+        rec = recs.get(_key(r["task_id"], r["trial"], v))
+        if rec is not None:
+            out[r["task_id"]] = rec
+    return out
+
+
+def skill_target_plan(cfg: EvolveConfig, base_rows: list[dict], tools: set[str],
+                      exclude: set[int]) -> dict:
+    """Which failures can be targets: not shown to the inducer, and STABLE
+    (fails >= 4 of 5 null forks) by independent stability data -- the
+    first library gate used every baseline failure and the incumbent then
+    passed 21 of 40 forks on them: mostly unlucky runs, not real failures."""
+    fails = [r for r in skill_failures(base_rows, cfg.split, tools) if r["task_id"] not in exclude]
+    stab = stability_of(fails, cfg)
+    missing = [r for r in fails if r["task_id"] not in stab]
+    return {"failures": fails, "stability": stab, "missing": missing,
+            "stable": [r for r in fails if r["task_id"] in stab and stab[r["task_id"]].label == "stable"],
+            "assess_cost": len(missing) * cfg.stability_n}
 
 
 def skill_gate_cost(cfg: EvolveConfig, pool: list[int], n_targets: int) -> int:
@@ -550,18 +576,23 @@ def skill_gate_cost(cfg: EvolveConfig, pool: list[int], n_targets: int) -> int:
 
 
 async def gate_skill_library(cfg: EvolveConfig, ledger: EditLedger, edits: list, base_rows: list[dict], *,
-                             provider: Any, user_llm: Any, store: Any,
+                             provider: Any, user_llm: Any, store: Any, max_targets: int = 8,
                              log: Callable[[str], None] = print) -> dict:
     """Gate a set of induced skills as ONE candidate version.
 
-    Efficacy: the incumbent's own null rate on the held-out failures is
-    measured fresh (forks from step 1 under the incumbent's context), because
-    the stability cache was recorded under an older version; the candidate
-    is forked on the same tasks and compared with a one-sided Fisher test.
+    Targets: failures of the covered task types that the inducer never saw,
+    restricted to STABLE ones by the stability filter's null forks under the
+    baseline (assessed now if not cached). Efficacy: the incumbent's rate on
+    them is measured fresh (forks from step 1 under the incumbent's context)
+    -- independent of the stability data used to select them, so selection
+    cannot bias the comparison -- and the candidate is forked on the same
+    tasks; one-sided Fisher test. Every efficacy fork is saved as a results
+    row, so `induce_skills.py usage` can tell whether skills were loaded.
     Safety: the usual pool run + flip confirmation, excluding every task
-    whose episode was shown to the inducer or used as a target."""
+    shown to the inducer or used as a target."""
     from .gate import Efficacy, efficacy, fisher_greater
     from .skills import library_version
+    from .stability import assess_failures
     inc = ledger.current()
     inc_rows = load_rows(ledger.rows_path(inc.version))
     _, reg = version_setup(inc)
@@ -571,20 +602,38 @@ async def gate_skill_library(cfg: EvolveConfig, ledger: EditLedger, edits: list,
     if not added:
         return {"accepted": False, "reason": "no induced skill applies to the current version", "episodes": 0}
     tools = {e.source_cluster.split(":", 1)[1] for e in added if e.source_cluster.startswith("skill:")}
-    targets = skill_targets(base_rows, cfg.split, tools)
     evidence = {t for e in added for t in e.evidence_tasks}
+    tp = skill_target_plan(cfg, base_rows, tools, evidence)
+    used = 0
+    if tp["missing"]:
+        log(f"stability: assessing {len(tp['missing'])} uncached failures under the baseline")
+        _, base_reg = version_setup(ledger.version(0))
+        before = {k for k in stability_of(tp["missing"], cfg)}
+        await assess_failures(tp["missing"], _paths(cfg)["stability"], store=store, provider=provider,
+                              user_llm=user_llm, registry=base_reg, n=cfg.stability_n,
+                              stable_max=cfg.stable_max, concurrency=cfg.concurrency, log=log)
+        new = stability_of(tp["missing"], cfg)
+        used += sum(rec.n for t, rec in new.items() if t not in before)
+        tp = skill_target_plan(cfg, base_rows, tools, evidence)
+    targets = [(r["task_id"], r["info"]["rewind"]["trace"], 0, 0) for r in tp["stable"]][:max_targets]
     pool = _pool(inc_rows, ledger.shown() | evidence | {t[0] for t in targets})
     round_no = ledger.bump_round()
     ledger.mark_shown(sorted(evidence), round_no, "skill_evidence")
-    log(f"skill library: {len(added)} skills ({', '.join(e.target for e in added)}), "
-        f"{len(targets)} held-out failures, pool {len(pool)}")
+    log(f"skill library: {len(added)} skills ({', '.join(e.target for e in added)}); "
+        f"{len(tp['failures'])} held-out failures, {len(tp['stable'])} stable -> {len(targets)} targets; "
+        f"pool {len(pool)}")
     if not targets:
-        return {"accepted": False, "reason": "no held-out failure of the covered task types", "episodes": 0}
+        return {"accepted": False, "reason": "no stable held-out failure of the covered task types",
+                "episodes": used}
 
+    gdir = _paths(cfg)["gate"]
     null, n_null = await efficacy(inc, targets, policy=cfg.gate, provider=provider, user_llm=user_llm,
-                                  store=store, log=lambda m: log("  [incumbent]" + m))
+                                  store=store, log=lambda m: log("  [incumbent]" + m),
+                                  rows_out=gdir / f"v{cand.version}_skills_eff_incumbent.json")
     cnd, n_cand = await efficacy(cand, targets, policy=cfg.gate, provider=provider, user_llm=user_llm,
-                                 store=store, log=lambda m: log("  [skills]" + m))
+                                 store=store, log=lambda m: log("  [skills]" + m),
+                                 rows_out=gdir / f"v{cand.version}_skills_eff_candidate.json")
+    used += n_null + n_cand
     p = fisher_greater(cnd.cand_passes, cnd.cand_n, null.cand_passes, null.cand_n)
     lift = cnd.cand_passes / cnd.cand_n - null.cand_passes / null.cand_n
     eff = Efficacy(tasks=[t[0] for t in targets], cand_passes=cnd.cand_passes, cand_n=cnd.cand_n,
@@ -592,16 +641,18 @@ async def gate_skill_library(cfg: EvolveConfig, ledger: EditLedger, edits: list,
                    passed=p < cfg.gate.alpha and lift >= cfg.gate.min_lift)
     log(f"  efficacy: skills {eff.cand_passes}/{eff.cand_n} vs incumbent {eff.null_passes}/{eff.null_n}, "
         f"p = {p:.4f}")
-    out = _paths(cfg)["gate"] / f"v{cand.version}_skills.json"
+    out = gdir / f"v{cand.version}_skills.json"
     v = await gate(cand, inc_rows, pool, split=cfg.split, out=out, provider=provider, user_llm=user_llm,
                    store=store, policy=cfg.gate, concurrency=cfg.concurrency, log=log, incumbent=inc,
                    prior_efficacy=eff)
-    v = v.model_copy(update={"episodes": v.episodes + n_null + n_cand})
+    v = v.model_copy(update={"episodes": v.episodes + used})
     data = v.model_dump()
+    data["efficacy_rows"] = [str(gdir / f"v{cand.version}_skills_eff_{w}.json") for w in ("incumbent", "candidate")]
     for e in added:
         ledger.record(round_no, inc.version, e, "gate", v.accepted, v.reason, data, cluster=e.source_cluster)
     if v.accepted:
         ledger.commit(cand, added, str(out), data)
         log(f"  committed v{cand.version}")
     return {"accepted": v.accepted, "reason": v.reason, "episodes": v.episodes,
-            "version": cand.version if v.accepted else None, "skills": [e.target for e in added]}
+            "version": cand.version if v.accepted else None, "skills": [e.target for e in added],
+            "efficacy_rows": data["efficacy_rows"]}
