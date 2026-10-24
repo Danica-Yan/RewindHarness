@@ -170,12 +170,15 @@ def main() -> None:
             return
         if not ask("one LLM call to propose new lessons? [y/N] "):
             return
-        new, why, err = asyncio.run(meta.reflect(led, deepseek_json_llm(model=a.model, temperature=0.3)))
-        if err:
-            print(f"refused: {err}")
-            return
+        new, why, note, raw = asyncio.run(meta.reflect(led, deepseek_json_llm(model=a.model, temperature=0.3)))
         out = Path(a.run_dir) / "meta" / "proposed_lessons.json"
         out.parent.mkdir(parents=True, exist_ok=True)
+        (out.parent / "last_reflection_raw.txt").write_text(raw, encoding="utf-8")  # never lose a call
+        if note:
+            print(note)
+        if not new:
+            print(f"nothing adoptable; raw output kept in {out.parent / 'last_reflection_raw.txt'}")
+            return
         out.write_text(json.dumps({"lessons": new, "rationale": why}, ensure_ascii=False, indent=1))
         print("proposed lessons:\n" + "\n".join(f"  - {x}" for x in new) + f"\n\nrationale: {why}\n\n"
               f"wrote {out}; `meta-eval` decides whether they are adopted")
@@ -185,9 +188,9 @@ def main() -> None:
         src = Path(a.run_dir) / "meta" / "proposed_lessons.json"
         if not src.exists():
             sys.exit("no proposed lessons: run `reflect` first")
-        new, err = meta.validate_lessons(json.loads(src.read_text())["lessons"])
-        if err:
-            sys.exit(f"proposed lessons invalid: {err}")
+        new, note = meta.validate_lessons(json.loads(src.read_text())["lessons"])
+        if not new:
+            sys.exit(f"proposed lessons invalid: {note}")
         cl = meta.meta_clusters(led, cfg)[: a.meta_clusters]
         if not cl:
             print("no cluster with a recorded A/B split to compare on")

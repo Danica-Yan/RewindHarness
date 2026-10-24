@@ -91,11 +91,19 @@ def test_consolidation_keeps_a_rule_that_earns_its_place_and_drops_one_that_does
 
 def test_lessons_are_validated():
     from rewind.evolve.meta import validate_lessons
-    ok, err = validate_lessons(["Prefer a tool_note when the failure is about one tool."])
-    assert err is None and ok
-    assert "case-specific" in validate_lessons(["Order #W1234567 needs care."])[1]
-    assert "evaluation" in validate_lessons(["Write edits that pass the gate's Fisher test."])[1]
-    assert "more than" in validate_lessons([f"lesson {i}" for i in range(9)])[1]
+    good = "Prefer a tool_note when the failure is about one tool."
+    ok, note = validate_lessons([good])
+    assert ok == [good] and note is None
+    # mentioning what happened at a stage is fine; being about beating the tests is not
+    stage = "When a rule passes screening but harms unseen tasks, narrow its trigger to the failing situation."
+    kept, note = validate_lessons([stage, "Order #W1234567 needs care.",
+                                   "Write edits that pass the gate's Fisher test.", good])
+    assert kept == [stage, good]
+    assert "case-specific" in note and "beating the evaluation" in note
+    none, note = validate_lessons(["Tune wording until the p-value is small."])
+    assert none == [] and note.startswith("all lessons refused")
+    kept, note = validate_lessons([f"Lesson number {i} about scope." for i in range(10)])
+    assert len(kept) == 8 and "over the limit" in note
 
 
 def test_meta_eval_adopts_lessons_only_when_they_win(setup):
@@ -115,8 +123,8 @@ def test_meta_eval_adopts_lessons_only_when_they_win(setup):
         assert POISON in messages[1]["content"] and "screen stopped" in messages[1]["content"]
         return json.dumps({"lessons": ["For exchange failures, ask the agent to confirm the exchange items."],
                            "rationale": "the only proposal stopped the agent from acting"})
-    new, why, err = asyncio.run(meta.reflect(ledger, reflect_llm))
-    assert err is None and new and why
+    new, why, note, raw = asyncio.run(meta.reflect(ledger, reflect_llm))
+    assert note is None and new and why and raw
 
     async def proposer_llm(messages):
         system = messages[0]["content"]
