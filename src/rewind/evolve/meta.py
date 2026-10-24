@@ -33,7 +33,11 @@ from .surface import leak_reasons
 JsonLLM = Callable[[list[dict]], Awaitable[str]]
 KEY = "proposer_lessons"
 MAX_LESSONS = 8
-_GAMING = re.compile(r"\b(gate|p-?value|fisher|threshold|screen(ing)?|null rate|bypass|game|pass the test)\b", re.I)
+# Lessons may mention what happened at each stage ("passed screening but harmed other tasks");
+# they may not be about beating the tests themselves.
+_GAMING = re.compile(r"(p-?values?|fisher|thresholds?|null rates?|bypass|\bgam(e|ing)\b|\btrick\b|"
+                     r"pass(es|ing)? the (gate|test|screen(ing)?|check)|to (pass|get through) (the )?(gate|screen))",
+                     re.I)
 
 REFLECT_SYSTEM = """You improve the instructions of a PROPOSER: an LLM that reads failures of a retail
 customer-service agent and proposes edits to the agent's context (rules, tool notes, policy checks,
@@ -68,19 +72,26 @@ def adopt(ledger: EditLedger, new: list[str], why: dict) -> None:
 
 
 def validate_lessons(xs: Any) -> tuple[list[str], str | None]:
+    """(kept lessons, note). Offending lessons are dropped one by one (the
+    note says which and why); the set is refused only if none survive."""
     if not isinstance(xs, list) or not xs:
         return [], "no lessons"
     xs = [" ".join(str(x).split()) for x in xs if str(x).strip()]
-    if len(xs) > MAX_LESSONS:
-        return [], f"more than {MAX_LESSONS} lessons"
+    kept, dropped = [], []
     for x in xs:
         if len(x) > 220:
-            return [], f"lesson too long: {x[:60]}..."
-        if leak_reasons(x):
-            return [], f"lesson looks case-specific ({', '.join(leak_reasons(x))}): {x[:60]}"
-        if _GAMING.search(x):
-            return [], f"lesson talks about the evaluation, not about writing edits: {x[:60]}"
-    return xs, None
+            dropped.append(f"too long: {x[:60]}...")
+        elif leak_reasons(x):
+            dropped.append(f"case-specific ({', '.join(leak_reasons(x))}): {x[:60]}")
+        elif _GAMING.search(x):
+            dropped.append(f"about beating the evaluation, not writing edits: {x[:60]}")
+        else:
+            kept.append(x)
+    if len(kept) > MAX_LESSONS:
+        dropped += [f"over the limit of {MAX_LESSONS}: {x[:60]}" for x in kept[MAX_LESSONS:]]
+        kept = kept[:MAX_LESSONS]
+    note = ("dropped " + "; ".join(dropped)) if dropped else None
+    return kept, (note if kept or not dropped else "all lessons refused: " + "; ".join(dropped))
 
 
 def experience(ledger: EditLedger, exclude_clusters: set[str] = frozenset()) -> list[dict]:
@@ -113,18 +124,19 @@ def reflect_messages(exp: list[dict], current: list[str]) -> list[dict]:
 
 
 async def reflect(ledger: EditLedger, llm: JsonLLM, exclude_clusters: set[str] = frozenset()
-                  ) -> tuple[list[str], str, str | None]:
-    """(new lessons, rationale, error). One LLM call."""
+                  ) -> tuple[list[str], str, str | None, str]:
+    """(new lessons, rationale, note, raw output). One LLM call. `note` says
+    which lessons were dropped; lessons is empty only if none survived."""
     exp = experience(ledger, exclude_clusters)
     if not exp:
-        return [], "", "no proposal history to learn from"
+        return [], "", "no proposal history to learn from", ""
     text = await llm(reflect_messages(exp, lessons(ledger)))
     try:
         d = json.loads(text[text.find("{"): text.rfind("}") + 1])
     except (json.JSONDecodeError, ValueError):
-        return [], "", "unparseable reflection"
-    new, err = validate_lessons(d.get("lessons"))
-    return new, str(d.get("rationale", "")), err
+        return [], "", "unparseable reflection", text
+    new, note = validate_lessons(d.get("lessons"))
+    return new, str(d.get("rationale", "")), note, text
 
 
 class ArmResult(BaseModel):
