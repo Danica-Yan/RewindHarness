@@ -75,6 +75,7 @@ class GatePolicy(BaseModel):
     max_drop: float | None = None      # optional point-drop cap (miscalibrated at ~90% baselines)
     confirm_k: int = 2                 # re-runs per flipped task, per version
     max_confirmed_regressions: int = 1
+    regression_k: int = 3              # forks per regression-memory task, per version (0 = off)
     # superiority
     min_delta: float = 0.0
     # both
@@ -94,6 +95,7 @@ class Efficacy(BaseModel):
     p_value: float
     lift: float
     passed: bool
+    per_task: dict[int, int] = {}      # task -> candidate passes (of efficacy_n)
 
 
 class GateVerdict(BaseModel):
@@ -113,6 +115,7 @@ class GateVerdict(BaseModel):
     confirmed_regressions: list[int] = []
     confirmed_fixes: list[int] = []
     confirm_episodes: int = 0
+    regression_check: dict | None = None
     rows_path: str
 
 
@@ -136,6 +139,7 @@ async def efficacy(candidate: ContextVersion, targets: list[tuple[int, str, int,
     cfg, reg = version_setup(candidate)
     k1 = n1 = 0
     rows: list[dict] = []
+    per_task: dict[int, int] = {}
     for task_id, trace, _, _ in targets:
         events = load_trace(trace)
         passes = 0
@@ -152,14 +156,53 @@ async def efficacy(candidate: ContextVersion, targets: list[tuple[int, str, int,
             write_rows(rows_out, rows)
         k1 += passes
         n1 += policy.efficacy_n
+        per_task[task_id] = passes
         log(f"    efficacy task {task_id:3d}: {passes}/{policy.efficacy_n} pass")
     k0 = sum(t[2] for t in targets)
     n0 = sum(t[3] for t in targets)
     p = fisher_greater(k1, n1, k0, n0)
     lift = (k1 / n1 if n1 else 0.0) - (k0 / n0 if n0 else 0.0)
     eff = Efficacy(tasks=[t[0] for t in targets], cand_passes=k1, cand_n=n1, null_passes=k0, null_n=n0,
-                   p_value=p, lift=lift, passed=p < policy.alpha and lift >= policy.min_lift)
+                   p_value=p, lift=lift, passed=p < policy.alpha and lift >= policy.min_lift,
+                   per_task=per_task)
     return eff, n1
+
+
+async def regression_check(candidate: ContextVersion, incumbent: ContextVersion,
+                           suite: list[tuple[int, str]], *, k: int, provider: Any, user_llm: Any,
+                           store: Any, log: Callable[[str], None] = print) -> dict:
+    """Regression memory: every task an accepted version fixed is re-checked
+    by every later gate. Each suite task is forked from step 1, `k` times
+    under the candidate and `k` under the incumbent. A task counts as broken
+    when the incumbent still solves it (>= 2 of 3, scaled to k) and the
+    candidate never does; the suite as a whole fails on any broken task or
+    on a one-sided Fisher test (incumbent > candidate, p < 0.05)."""
+    from ..evolve.runner import version_setup as _vs
+    out = {"tasks": [], "broken": [], "cand_passes": 0, "inc_passes": 0, "n": 0, "episodes": 0}
+    need = max(1, round(2 * k / 3))
+    for task_id, trace in suite:
+        events = load_trace(trace)
+        res = {}
+        for name, ctx in (("candidate", candidate), ("incumbent", incumbent)):
+            cfg, reg = _vs(ctx)
+            passes = 0
+            for i in range(k):
+                ep = await fork_episode(events, 1, provider=provider, user_llm=user_llm, store=store,
+                                        registry=reg, system_prompt=cfg.system_prompt,
+                                        run_id=f"{events[0].run_id}~reg{ctx.version}-{i}")
+                passes += ep.reward.reward >= 1.0
+            res[name] = passes
+        out["tasks"].append({"task_id": task_id, **res})
+        out["cand_passes"] += res["candidate"]
+        out["inc_passes"] += res["incumbent"]
+        out["n"] += k
+        out["episodes"] += 2 * k
+        if res["candidate"] == 0 and res["incumbent"] >= need:
+            out["broken"].append(task_id)
+        log(f"    regression task {task_id:3d}: candidate {res['candidate']}/{k}, incumbent {res['incumbent']}/{k}")
+    out["p_value"] = fisher_greater(out["inc_passes"], out["n"], out["cand_passes"], out["n"]) if out["n"] else 1.0
+    out["passed"] = not out["broken"] and out["p_value"] >= 0.05
+    return out
 
 
 def _compare(inc: dict, cand: dict, tasks: list[int], policy: GatePolicy):
@@ -184,7 +227,8 @@ async def gate(candidate: ContextVersion, incumbent_rows: list[dict], pool: list
                policy: GatePolicy = GatePolicy(), targets: list[tuple[int, str, int, int]] = (),
                concurrency: int = 4, log: Callable[[str], None] = print,
                incumbent: ContextVersion | None = None,
-               prior_efficacy: Efficacy | None = None) -> GateVerdict:
+               prior_efficacy: Efficacy | None = None,
+               regression_suite: list[tuple[int, str]] = ()) -> GateVerdict:
     """`incumbent` enables flip confirmation (re-runs under the incumbent);
     `prior_efficacy` reuses an efficacy result instead of re-running it
     (re-gating a candidate under a revised policy)."""
@@ -248,6 +292,18 @@ async def gate(candidate: ContextVersion, incumbent_rows: list[dict], pool: list
         log(f"  confirmation: {len(conf_regs)}/{len(regs)} regressions and "
             f"{len(conf_fixes)}/{len(imps)} fixes reproduce")
 
+    reg_chk = None
+    early_reject = harmful or (len(conf_regs) > policy.max_confirmed_regressions) or (
+        policy.regression_budget is not None and len(regs) > policy.regression_budget) or (
+        policy.max_drop is not None and policy.mode == "targeted" and delta < -policy.max_drop)
+    suite = [s for s in regression_suite if not eff or s[0] not in eff.tasks]
+    if not early_reject and incumbent is not None and policy.regression_k > 0 and suite:
+        reg_chk = await regression_check(candidate, incumbent, suite, k=policy.regression_k,
+                                         provider=provider, user_llm=user_llm, store=store, log=log)
+        episodes += reg_chk["episodes"]
+        log(f"  regression memory: {len(suite)} tasks, candidate {reg_chk['cand_passes']}/{reg_chk['n']} vs "
+            f"incumbent {reg_chk['inc_passes']}/{reg_chk['n']}, broken {reg_chk['broken']}")
+
     if harmful:
         ok, why = False, f"significantly worse on the pool: CI upper bound {ci[1]:+.3f} < 0"
     elif policy.regression_budget is not None and len(regs) > policy.regression_budget:
@@ -257,6 +313,10 @@ async def gate(candidate: ContextVersion, incumbent_rows: list[dict], pool: list
     elif len(conf_regs) > policy.max_confirmed_regressions:
         ok, why = False, (f"{len(conf_regs)} confirmed regressions (tasks {conf_regs}) > "
                           f"{policy.max_confirmed_regressions}: the breakage reproduces")
+    elif reg_chk is not None and not reg_chk["passed"]:
+        ok, why = False, (f"breaks remembered fixes: tasks {reg_chk['broken']}" if reg_chk["broken"] else
+                          f"worse on remembered fixes: {reg_chk['cand_passes']}/{reg_chk['n']} vs "
+                          f"{reg_chk['inc_passes']}/{reg_chk['n']} (p = {reg_chk['p_value']:.3f})")
     elif policy.mode == "superiority" and ci[0] <= policy.min_delta:
         ok, why = False, f"CI lower bound {ci[0]:+.3f} <= {policy.min_delta:+.3f}"
     else:
@@ -272,7 +332,8 @@ async def gate(candidate: ContextVersion, incumbent_rows: list[dict], pool: list
                     delta=delta, ci=ci, incumbent_pass1=pooled_pass1(sub_inc)[0],
                     candidate_pass1=pooled_pass1(sub_cand)[0], regressions=regs, improvements=imps,
                     episodes=episodes, stopped_early=stopped, confirmed_regressions=conf_regs,
-                    confirmed_fixes=conf_fixes, confirm_episodes=conf_eps, rows_path=str(out))
+                    confirmed_fixes=conf_fixes, confirm_episodes=conf_eps, regression_check=reg_chk,
+                    rows_path=str(out))
 
 
 def confirm_paths(out: Path) -> tuple[Path, Path]:
