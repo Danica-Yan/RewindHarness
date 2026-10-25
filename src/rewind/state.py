@@ -27,6 +27,20 @@ class RunAbort(Exception):
 
 
 @dataclass
+class StepStart:
+    """Where a step began: what a checkpoint taken *during* the step (intent,
+    tool) must restore so that resuming re-enters the step exactly once --
+    the trace position before its first event, the conversation before the
+    model's reply, the counters before its tokens and tool calls were
+    counted, and the env as the step found it (the step's `step_start`
+    hash, which forks start from)."""
+    seq: int
+    messages: list[dict]
+    state: "LoopState"
+    env_hash: str
+
+
+@dataclass
 class LoopState:
     """Loop counters that must survive a fork/resume; rebuildable from events."""
     tokens: int = 0

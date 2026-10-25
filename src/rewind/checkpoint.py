@@ -36,7 +36,7 @@ from .coordination.store import CoordinatorStore
 from .coordination.types import Checkpoint, CheckpointKind
 from .providers import LLMResponse
 from .snapshot import SnapshotStore
-from .state import LoopState, RunAbort
+from .state import LoopState, RunAbort, StepStart
 from .trace import TraceWriter
 
 
@@ -57,14 +57,18 @@ class StepCheckpointer:
         self.blobs = blobs
 
     async def save(self, kind: CheckpointKind, step: int, trace: TraceWriter, env: Any, messages: list[dict],
-                   state: LoopState, action: LLMResponse | None = None) -> None:
+                   state: LoopState, action: LLMResponse | None = None, *,
+                   point: StepStart | None = None) -> None:
+        # env: always the CURRENT env (it carries the idempotency ledger).
+        # Mid-step kinds restore the step's start for everything else.
         env_hash = self.snapshots.put(env.snapshot())
-        bundle_ref = self.blobs.put({
-            "messages": messages, "loop_state": asdict(state),
-            "action": action.model_dump() if action is not None else None,
-        })
-        ckpt = Checkpoint(self.run_id, step, kind, trace.last_seq, self.fencing_token,
-                          env_hash, bundle_ref)
+        bundle = {"messages": messages, "loop_state": asdict(state),
+                  "action": action.model_dump() if action is not None else None}
+        if point is not None:
+            bundle["step_env_hash"] = point.env_hash
+        bundle_ref = self.blobs.put(bundle)
+        seq = point.seq if point is not None else trace.last_seq
+        ckpt = Checkpoint(self.run_id, step, kind, seq, self.fencing_token, env_hash, bundle_ref)
         ok = await self.coordinator.write_checkpoint(self.job_id, ckpt)
         if not ok:
             raise RunAbort("fenced_out",

@@ -1002,6 +1002,40 @@ python scripts/run_evolve.py status
 - loop 里的横切逻辑（预算、loop 检测、policy、trace、checkpoint）仍然内联在 `_loop` 里，还没有抽成 middleware；context compaction 计划作为第一个 middleware 来做，届时压缩必须作为事件记进 trace，否则 replay/fork 会和实际发给模型的内容不一致。
 - `flywheel/` 和 `evolve/` 的职责边界还没理清（两者都有聚类）。
 
+### 变异测试：测试能不能发现 bug，以及顺带找到的 3 个真 bug（本轮新增，0 次 API）
+
+**做法**：手写了 85 个"像真实改动会引入的 bug"（改比较符、删一步检查、换顺序、少拷贝一次），每个单独注入源码，跑测试，看测试能不能发现（"杀死"）。不是用工具自动生成成千上万个运算符变异，而是每个变异对应一种有意义的错误：fencing 没生效、恢复时重复执行、门禁接受了明显有害的修改等。覆盖 crash recovery / fencing / 幂等、loop 的预算与保护、replay / fork / snapshot、policy 检查、Benchmark 端口、Evolve 的统计和门禁。
+
+测试分三档：快档（核心 + τ-bench 离线测试，约 30 秒）、Postgres 档（真实 Postgres，约 10 秒）、evolve 档（Evolve 端到端测试，2 核机器上约 8 分钟）。先对所有变异跑快档和 Postgres 档；没被杀死的、且位于 evolve 测试会用到的文件里的，再跑 evolve 档。变异在独立的 git worktree 里跑，每个变异跑完都还原，最后检查源码树干净。
+
+**原测试套件的结果**（85 个变异）：
+
+| 结果 | 数量 |
+|---|---|
+| 快档或 Postgres 档杀死 | 48 |
+| 只有 evolve 档杀死 | 3（忽略回归记忆、A/B 两半重叠、回滚保留记忆） |
+| 整套测试都没发现 | 10（7 个门禁/效果判断的 bug 跑完了 evolve 档仍存活；3 个在 evolve 测试根本不 import 的文件里：claim 优先级、Postgres 的 complete 没校验 fencing、恢复时把已确认的 step 重做一遍） |
+| 快档存活、没跑 evolve 档 | 24（直接写了能杀死它们的测试，所以没再花 8 分钟确认 evolve 档能不能发现） |
+
+**存活的变异说明了什么**：大部分不是"没测到这行代码"，而是测试断言太粗。比如崩溃恢复测试只检查最终状态对不对、`cancel_order` 恰好执行一次——"恢复时把已确认的 step 重新问一遍模型"也能满足，因为脚本化的模型刚好返回了同样的动作。门禁的情况最明显：evolve 测试里的假 agent 从不产生"显著变差""噪声翻转""恰好超出预算一个"这些情形，所以门禁里一半的判断规则改坏了也没人发现——包括"显著有害的修改不拒绝"。
+
+**补的测试**：54 个新测试函数（10 个文件），每个都单独验证过能杀死它针对的变异。重点：
+- `tests/test_gate_toy.py`：一个完全可控的小 benchmark（哪些任务被候选上下文改坏、哪些在任何上下文下都会失败、记住的修复是否 2/3 能做对，都由测试决定），门禁的每条规则端到端测一遍，9 个测试不到 2 秒（evolve 测试 8 分钟都没覆盖到）。
+- `tests/test_toy_benchmark.py`：第二个 Benchmark 实现（基于离线玩具环境），`experiment.py` 和 Evolve 的 `run_batch` 不改一行就能跑——Benchmark 端口不是只能套 τ-bench 的第一个证据。
+- 效果检验和 A/B 切分抽成纯函数（`efficacy_verdict`、`split_ab`）再测；Fisher 检验对照独立实现的超几何分布逐格比对，并核对 README 里发表的 p = 0.008。
+
+**结果**：同一批变异 + 7 个针对本轮修复代码的新变异，共 92 个，**全部被新测试杀死**。测试数 224 → 283 通过，3 个跳过（仍然只是缺 Toxiproxy），Postgres / Redis 为真实服务。
+
+**顺带找到的 3 个真 bug**（读代码时发现，都先写了复现测试、确认在旧代码上失败，再修）：
+
+1. **恢复时重复一个 step（最严重）**：从 intent 或 tool checkpoint 恢复时，assistant 的 tool-call 消息被追加了两次。真实的 DeepSeek / OpenAI API 要求带 tool_calls 的 assistant 消息后面紧跟它的 tool 结果，所以会直接返回不可重试的 400——崩溃恢复这个核心卖点，恰恰在需要它的时候对真实模型失效。脚本化 provider 不校验输入，原测试发现不了。trace 里这个 step 也被记了两次（fork / replay 会继承重复的历史），token 也算了两次。原因：mid-step checkpoint 存的是"当前"的消息、计数器和 trace 位置，而恢复会重新进入这个 step。修法：checkpoint 存这个 step **开始时**的状态（`StepStart`：trace 位置、模型回复前的消息、计数器、起始 env hash），env 仍然存当前的（幂等账本在里面）。新测试对每个崩溃点断言：恢复后发给模型的每个请求（request hash）和每个 step 的起始 env，都和不崩溃的那次完全一样。
+2. **lease 从不续约**：`heartbeat()` 存在，DEVLOG 上文也写着它让慢但活着的 worker 不丢 lease，但没有任何代码调用它。真实的 τ-bench episode 跑几分钟，30 秒的 lease 早就过期：多 worker 时别的 worker 会中途抢走任务，原 worker 在下一次 checkpoint 时被 fence 掉，同样的 LLM 调用付两次钱。和 W5 修过的 gateway 锁没有心跳是同一类问题。修法：`run_worker_step` 在跑任务期间后台每 `lease/3` 秒续约一次，崩溃时（包括模拟崩溃）一定停止续约。
+3. **写到一半的最后一行让任务永远无法恢复**：worker 在 `write()` 中途被 kill 会留下半行 JSON。`resume_from` 解析每一行，半行直接抛异常；之后每个接手的 worker 都读同一个文件，任务卡死在"claim → 崩溃 → lease 过期 → 再 claim"里。修法：只容忍**最后一行**是坏的（它一定是 checkpoint 之后才开始写的事件，本来就会被丢弃）；中间行损坏仍然报错。
+
+**测试工具本身的一个坑**：快速单变异验证脚本一开始报告了一个错误的"存活"——两个变异把同一个文件缩短了相同的字节数，又在同一秒内运行，Python 的字节码缓存（按 mtime 秒 + 文件大小判断）直接用了上一个变异的 .pyc。之后所有验证都关掉了字节码写入（`PYTHONDONTWRITEBYTECODE=1`）。主变异流程不受影响：同一文件的两个变异之间至少隔 10 秒。
+
+**局限**：变异是手写的 85 + 7 个，不是穷举；"杀死"只说明这一种错误会被发现。24 个快档存活的变异没有跑 evolve 档，所以原套件的真实覆盖可能比上表略好。门禁测试用的是可控的玩具 benchmark，证明的是判断逻辑，不是真实 τ-bench 上的统计校准（那部分见上文"门禁校准"）。
+
 ## 已知局限（诚实版）
 
 - Fork 前缀是**复制**而非引用共享；blob 内联在事件里，未走对象存储。

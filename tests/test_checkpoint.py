@@ -137,6 +137,15 @@ def test_crash_at_every_point_recovers_to_correct_state(tag, step):
         assert grade(env), f"final state wrong after crash at {tag}@{step}"
         assert counter["n"] == 1, f"cancel_order ran {counter['n']} times after crash at {tag}@{step}"
         assert (await coord.get(job_id)).status == "completed"
+        # ...and it is the SAME run as an uninterrupted one, step for step. Added
+        # after mutation testing: resuming a confirmed step by asking the model
+        # again kept the final state right (the script happened to repeat the
+        # action) and passed every assertion above.
+        events = load_trace(Path(tmp) / "r1.jsonl")
+        starts = [e.step for e in events if e.type == "step_start"]
+        llm = [e.step for e in events if e.type == "llm_call"]
+        assert res.steps == 3 and starts == [1, 2, 3], (tag, step, starts)
+        assert llm == [1, 2, 3], f"a step was decided twice after crash at {tag}@{step}: {llm}"
     asyncio.run(go())
 
 
@@ -179,6 +188,121 @@ def test_torn_trace_events_are_truncated_on_resume():
         # seq is contiguous and strictly increasing across the truncate + resume boundary
         seqs = [e.seq for e in final_events]
         assert seqs == list(range(1, len(seqs) + 1)), seqs
+    asyncio.run(go())
+
+
+def test_half_written_last_line_does_not_brick_recovery():
+    """A worker killed inside `write()` leaves a truncated final JSON line.
+    Found by reading the code during mutation testing: resume parsed every
+    line, so the torn line raised, and every later worker that claimed the
+    job hit the same file -- the job could never be recovered."""
+    async def go():
+        registry, counter = counting_registry()
+        coord, snaps, blobs, tmp, job_id, clock = await _fresh_job(registry)
+
+        def crash_hook(t, s):
+            if (t, s) == ("after_step_checkpoint", 1):
+                raise SimulatedCrash()
+        with pytest.raises(SimulatedCrash):
+            await run_worker_step(coord, snaps, blobs, registry, ScriptedProvider(list(SCRIPT)),
+                                  ToyRetailEnv.restore, tmp, owner="A", clock=clock, debug_hook=crash_hook)
+        trace_path = Path(tmp) / "r1.jsonl"
+        last = trace_path.read_text().splitlines()[-1]
+        with trace_path.open("a") as f:
+            f.write(last[: len(last) // 2])           # the next event, cut off mid-write
+
+        clock.advance(31)
+        res, env = await run_worker_step(coord, snaps, blobs, registry, ScriptedProvider(SCRIPT[1:]),
+                                         ToyRetailEnv.restore, tmp, owner="B", clock=clock)
+        assert res.status == "completed" and grade(env) and counter["n"] == 1
+        seqs = [e.seq for e in load_trace(trace_path)]   # strict loader: no torn line left behind
+        assert seqs == list(range(1, len(seqs) + 1))
+    asyncio.run(go())
+
+
+def test_corruption_before_the_last_line_still_fails_loudly(tmp_path):
+    """Only a torn *tail* is a crash artifact; a bad line in the middle is
+    damage that resume must not silently paper over."""
+    p = tmp_path / "r1.jsonl"
+    tw = TraceWriter("r1", p)
+    for i in range(3):
+        tw.emit("message", 1, {"message": {"role": "user", "content": str(i)}})
+    tw.close()
+    lines = p.read_text().splitlines()
+    p.write_text("\n".join([lines[0], lines[1][:10], lines[2]]) + "\n")
+    with pytest.raises(ValueError):
+        TraceWriter.resume_from(p, "r1", upto_seq=3)
+
+
+class SlowProvider:
+    """A real LLM call: each response takes `delay` seconds of real time."""
+    def __init__(self, script, delay):
+        self.script, self.delay = list(script), delay
+
+    async def complete(self, messages, tools, params):
+        await asyncio.sleep(self.delay)
+        return self.script.pop(0)
+
+
+def test_a_slow_but_alive_worker_keeps_its_lease():
+    """Found by reading the code during mutation testing: `heartbeat()` existed
+    but nothing called it, so a worker whose run outlasted its lease lost the
+    job to another worker mid-run (and was fenced out at its next checkpoint),
+    paying for the same LLM calls twice."""
+    async def go():
+        registry, counter = counting_registry()
+        coord, snaps, blobs = Coordinator(), SnapshotStore(), SnapshotStore()   # real clock
+        await submit_job(coord, snaps, "r1", TASK, AgentConfig(system_prompt=SYS), ToyRetailEnv().state)
+        a = asyncio.create_task(run_worker_step(
+            coord, snaps, blobs, registry, SlowProvider(SCRIPT, 0.25), ToyRetailEnv.restore,
+            tempfile.mkdtemp(), owner="A", lease_seconds=0.3))
+        await asyncio.sleep(0.6)                          # A's original lease is long past due
+        assert await coord.claim("B", lease_seconds=30) is None, "a live worker's job was stolen"
+        res, env = await a
+        assert res.status == "completed" and grade(env) and counter["n"] == 1
+    asyncio.run(go())
+
+
+def test_a_crashed_worker_stops_renewing_its_lease():
+    """Guards the heartbeat fix itself: renewal must die with the worker, or a
+    crashed worker would hold its job forever and nobody could recover it."""
+    async def go():
+        registry, _ = counting_registry()
+        coord, snaps, blobs = Coordinator(), SnapshotStore(), SnapshotStore()
+        await submit_job(coord, snaps, "r1", TASK, AgentConfig(system_prompt=SYS), ToyRetailEnv().state)
+
+        def crash(t, s):
+            if (t, s) == ("after_step_checkpoint", 1):
+                raise SimulatedCrash()
+        with pytest.raises(SimulatedCrash):
+            await run_worker_step(coord, snaps, blobs, registry, SlowProvider(SCRIPT, 0.2),
+                                  ToyRetailEnv.restore, tempfile.mkdtemp(), owner="A",
+                                  lease_seconds=0.3, debug_hook=crash)
+        await asyncio.sleep(0.5)
+        assert await coord.claim("B", lease_seconds=30) is not None, "a dead worker still holds its lease"
+    asyncio.run(go())
+
+
+def test_renewal_stops_once_another_worker_owns_the_job():
+    """Guards the heartbeat fix itself: once another worker holds the job, the
+    old worker's renewals must not keep the new owner's lease alive, and the
+    old run ends `fenced_out` at its next checkpoint."""
+    async def go():
+        registry, _ = counting_registry()
+        coord, snaps, blobs = Coordinator(), SnapshotStore(), SnapshotStore()
+        await submit_job(coord, snaps, "r1", TASK, AgentConfig(system_prompt=SYS), ToyRetailEnv().state)
+        a = asyncio.create_task(run_worker_step(
+            coord, snaps, blobs, registry, SlowProvider(SCRIPT, 0.3), ToyRetailEnv.restore,
+            tempfile.mkdtemp(), owner="A", lease_seconds=30, heartbeat_every=0.05))
+        await asyncio.sleep(0.1)
+        coord.db.execute("UPDATE jobs SET lease_expires_at=0")   # partition: A's lease lapsed
+        coord.db.commit()
+        b = await coord.claim("B", lease_seconds=0.4)
+        assert b is not None
+        res, _ = await a
+        assert res.status == "fenced_out"
+        await asyncio.sleep(0.5)                               # B's short lease ran out; A must not renew it
+        assert await coord.claim("C", lease_seconds=30) is not None
     asyncio.run(go())
 
 
@@ -281,4 +405,79 @@ def test_complete_is_token_gated():
         assert await coord.complete(job.job_id, job.fencing_token, "completed") is False  # A is stale
         current = await coord.get(job.job_id)
         assert await coord.complete(job.job_id, current.fencing_token, "completed") is True
+    asyncio.run(go())
+
+
+def test_higher_priority_jobs_are_claimed_first_then_oldest_first():
+    """Added after mutation testing: reversing the priority order of claim()
+    left every test green."""
+    async def go():
+        clock = FakeClock()
+        coord, snaps = Coordinator(clock=clock), SnapshotStore()
+        cfg, st = AgentConfig(system_prompt=SYS), ToyRetailEnv().state
+        for run_id, prio in (("low-old", 0), ("high-old", 5), ("low-new", 0), ("high-new", 5)):
+            await submit_job(coord, snaps, run_id, TASK, cfg, st, priority=prio)
+            clock.advance(1)
+        order = [(await coord.claim("w", lease_seconds=60)).run_id for _ in range(4)]
+        assert order == ["high-old", "high-new", "low-old", "low-new"]
+    asyncio.run(go())
+
+
+async def _uninterrupted():
+    registry, _ = counting_registry()
+    coord, snaps, blobs, tmp, job_id, clock = await _fresh_job(registry)
+    await run_worker_step(coord, snaps, blobs, registry, ScriptedProvider(list(SCRIPT)),
+                          ToyRetailEnv.restore, tmp, owner="A", clock=clock)
+    return load_trace(Path(tmp) / "r1.jsonl")
+
+
+def _api_shape_errors(messages):
+    """What a real chat API rejects: an assistant tool-call message not
+    followed by exactly its tool results."""
+    out = []
+    for i, m in enumerate(messages):
+        if m["role"] == "assistant" and m.get("tool_calls"):
+            want = [c["id"] for c in m["tool_calls"]]
+            got = [x.get("tool_call_id") for x in messages[i + 1:i + 1 + len(want)]]
+            if got != want:
+                out.append(f"message {i}: tool calls {want} followed by {got}")
+    return out
+
+
+@pytest.mark.parametrize("tag,step", CRASH_POINTS, ids=[f"{t}@{s}" for t, s in CRASH_POINTS])
+def test_resumed_run_sends_the_model_exactly_what_an_uninterrupted_run_does(tag, step):
+    """Found by mutation testing (a strengthened assertion failed on the real
+    code): resuming from an intent or tool checkpoint re-appended the step's
+    assistant message, so the model saw that tool call twice -- which a real
+    chat API rejects with a 400, i.e. crash recovery failed on a real model
+    exactly when it was needed. The step's tokens and trace events were
+    duplicated too. Every request and every step's starting env must match
+    the uninterrupted run."""
+    async def go():
+        base = await _uninterrupted()
+        registry, _ = counting_registry()
+        coord, snaps, blobs, tmp, job_id, clock = await _fresh_job(registry)
+
+        def crash_hook(t, s):
+            if (t, s) == (tag, step):
+                raise SimulatedCrash()
+        with pytest.raises(SimulatedCrash):
+            await run_worker_step(coord, snaps, blobs, registry, ScriptedProvider(list(SCRIPT)),
+                                  ToyRetailEnv.restore, tmp, owner="A", clock=clock, debug_hook=crash_hook)
+        clock.advance(31)
+
+        sent = []
+
+        class Spy(ScriptedProvider):
+            async def complete(self, messages, tools, params):
+                sent.append(messages)
+                return await super().complete(messages, tools, params)
+        res, _ = await run_worker_step(coord, snaps, blobs, registry, Spy(SCRIPT[step:]),
+                                       ToyRetailEnv.restore, tmp, owner="B", clock=clock)
+        events = load_trace(Path(tmp) / "r1.jsonl")
+        pick = lambda evs, ty, k: [(e.step, e.data[k]) for e in evs if e.type == ty]  # noqa: E731
+        assert pick(events, "llm_call", "request_hash") == pick(base, "llm_call", "request_hash")
+        assert pick(events, "step_start", "env_hash") == pick(base, "step_start", "env_hash")
+        assert all(not _api_shape_errors(m) for m in sent), [_api_shape_errors(m) for m in sent]
+        assert res.tokens == 45
     asyncio.run(go())

@@ -77,3 +77,50 @@ def test_fork_bad_step_raises(make):
     with pytest.raises(ValueError):
         run(fork_run(trace.events, snaps, at_step=99, runner=runner,
                      env_factory=ToyRetailEnv.restore, trace=TraceWriter("x")))
+
+
+def test_fork_counts_every_tokens_spent_including_the_forced_action(make):
+    """Added after mutation testing: dropping the forced (counterfactual)
+    action's tokens, or not rebuilding the prefix's tokens, left every fast test
+    green. A fork must account for the parent's tokens before the fork point,
+    the forced action, and everything after -- otherwise its token budget is
+    wrong and a later resume of it sees a different count than the live run."""
+    from rewind import LLMResponse, LoopState, ToolCall
+    runner, env, trace, snaps, registry = make(ScriptedProvider(BAD))
+    run(runner.run(env, "cancel my order", trace))
+
+    prefix_events = [e for e in trace.events if e.step < 2]
+    state = LoopState.from_events(prefix_events)
+    assert state.tokens == 15                      # rebuilt from step 1's model call
+    forced = LLMResponse(tool_calls=[ToolCall(name="cancel_order", args=CANCEL_O1)],
+                         usage={"input_tokens": 7, "output_tokens": 3})
+    start = next(e for e in trace.events if e.type == "step_start" and e.step == 2)
+    child = TraceWriter("child-tokens")
+    child_runner = AgentRunner(ScriptedProvider([text("done")]), registry, runner.cfg, snaps,
+                               sleep=runner.sleep)
+    res = run(child_runner.resume(ToyRetailEnv.restore(snaps.get(start.data["env_hash"])),
+                                  [e.data["message"] for e in prefix_events if e.type == "message"],
+                                  state, 2, child, forced))
+    assert res.status == "completed"
+    assert res.tokens == 15 + 10 + 15              # prefix + forced action + step 3
+    # the child's own events (steps >= 2) rebuild to exactly what it spent
+    assert LoopState.from_events(child.events).tokens == 10 + 15
+
+
+def test_fork_under_a_new_system_prompt_sends_the_new_prompt(make):
+    """Added after mutation testing: a fork that silently kept the old system
+    prompt passed every fast test. Evolve screens every context edit this way
+    ("what if this prompt had been in effect"), so a no-op here would make
+    every screened edit look exactly as good as no edit."""
+    runner, env, trace, snaps, registry = make(ScriptedProvider(BAD))
+    run(runner.run(env, "cancel my order", trace))
+    sent = []
+
+    class Spy(ScriptedProvider):
+        async def complete(self, messages, tools, params):
+            sent.append(messages)
+            return await super().complete(messages, tools, params)
+    child_runner = AgentRunner(Spy([text("ok")]), registry, runner.cfg, snaps, sleep=runner.sleep)
+    run(fork_run(trace.events, snaps, at_step=2, runner=child_runner, env_factory=ToyRetailEnv.restore,
+                 trace=TraceWriter("c"), system_prompt="NEW POLICY"))
+    assert sent and sent[0][0] == {"role": "system", "content": "NEW POLICY"}

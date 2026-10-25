@@ -17,7 +17,7 @@ from .environment import DataBackedEnv, DialogueEnv, Environment, TerminatingEnv
 from .events import Event
 from .providers import LLMResponse, MalformedOutput, ProviderError, ToolCall
 from .snapshot import SnapshotStore
-from .state import ARG_ERRORS, LoopState, RunAbort  # noqa: F401  (re-exported)
+from .state import ARG_ERRORS, LoopState, RunAbort, StepStart  # noqa: F401  (re-exported)
 from .tools import ToolOutcome, ToolRegistry
 from .trace import TraceWriter
 from .util import SystemClock, request_hash, sha
@@ -70,7 +70,11 @@ class Checkpointer(Protocol):
 
     async def save(self, kind: str, step: int, trace: TraceWriter, env: Any,
                    messages: list[dict], state: LoopState,
-                   action: LLMResponse | None = None) -> None: ...
+                   action: LLMResponse | None = None, *, point: StepStart | None = None) -> None:
+        """`point` is given for the mid-step kinds (intent, tool): the
+        checkpoint must then record the step's start, not the current
+        messages/state/trace position, so that resume re-enters the step
+        once (see StepStart)."""
 
 
 class AgentRunner:
@@ -105,14 +109,19 @@ class AgentRunner:
         return await self._loop(env, messages, LoopState(), 1, trace, None)
 
     async def resume(self, env: Environment, messages: list[dict], state: LoopState, start_step: int,
-                     trace: TraceWriter, forced: LLMResponse | None = None) -> RunResult:
-        """Continue from a reconstructed state (used by fork). `forced` replaces the
-        first LLM call (counterfactual action)."""
-        return await self._loop(env, messages, state, start_step, trace, forced)
+                     trace: TraceWriter, forced: LLMResponse | None = None, *,
+                     step_env_hash: str | None = None) -> RunResult:
+        """Continue from a reconstructed state (used by fork and by a resumed
+        worker). `forced` replaces the first LLM call (counterfactual action,
+        or the recorded action of a step that crashed mid-way).
+        `step_env_hash` is the env the first step originally started from,
+        when `env` already carries some of that step's effects (resume after
+        a tool checkpoint); it is what that step's `step_start` records."""
+        return await self._loop(env, messages, state, start_step, trace, forced, step_env_hash)
 
     # ---- internals -------------------------------------------------------------
     async def _loop(self, env: Environment, messages, state: LoopState, step: int, trace: TraceWriter,
-                    forced: LLMResponse | None) -> RunResult:
+                    forced: LLMResponse | None, step_env_hash: str | None = None) -> RunResult:
         cfg = self.cfg
         rng = random.Random(int(sha(trace.run_id)[7:19], 16))
         t0 = self.clock.perf()
@@ -128,7 +137,10 @@ class AgentRunner:
                 if state.tokens > cfg.max_tokens:
                     raise RunAbort("budget_exceeded", "max_tokens")
 
-                trace.emit("step_start", step, {"env_hash": self.snapshots.put(env.snapshot())})
+                start_hash = step_env_hash or self.snapshots.put(env.snapshot())
+                step_env_hash = None
+                point = StepStart(trace.last_seq, list(messages), copy.deepcopy(state), start_hash)
+                trace.emit("step_start", step, {"env_hash": start_hash})
                 last_step = step
                 resp = await self._llm_step(messages, tools, step, trace, state, rng, forced)
                 forced = None
@@ -146,19 +158,22 @@ class AgentRunner:
                 # Durably record the chosen action *before* touching any tool. If the
                 # process dies before the matching "step" checkpoint, resume redoes
                 # this same recorded action rather than asking the model again.
-                # `pre_tool_messages` (not the growing `messages`) is what every
-                # checkpoint for this step stores: on resume the step is always
-                # replayed from idx 0 of `resp.tool_calls`, so restoring a message
-                # list that already contains tool-result messages would duplicate
-                # them. Mutating tools stay exactly-once anyway, because the "tool"
-                # checkpoints below advance the *env* (and with it env.applied, the
-                # idempotency ledger) after every call — a replayed idx whose
-                # action_id is already in env.applied returns the cached outcome
-                # instead of re-running the tool.
+                # Every mid-step checkpoint (intent, tool) records the step's START
+                # (`point`): the conversation before the model's reply, the counters
+                # before this step, the trace position before `step_start`. Resume
+                # then re-enters the step once, as the forced action, and nothing
+                # of the step is duplicated -- not the assistant message (which a
+                # real API rejects: a tool-call message must be followed by its
+                # results), not its tokens, not its trace events. Mutating tools stay
+                # exactly-once because the "tool" checkpoints save the *current* env
+                # (and with it env.applied, the idempotency ledger): a replayed idx
+                # whose action_id is already applied returns the cached outcome.
+                # `pre_tool_messages` (history including the reply) is what the
+                # policy checks see.
                 pre_tool_messages = list(messages)
                 if self.checkpointer is not None:
-                    await self.checkpointer.save("intent", step, trace, env, pre_tool_messages, state,
-                                                 action=resp)
+                    await self.checkpointer.save("intent", step, trace, env, point.messages, point.state,
+                                                 action=resp, point=point)
                 self.debug_hook("after_intent_checkpoint", step)
 
                 if not resp.tool_calls:
@@ -186,7 +201,7 @@ class AgentRunner:
                     step += 1
                     continue
 
-                outcomes = await self._run_tool_batch(env, resp, step, pre_tool_messages, state, trace, rng)
+                outcomes = await self._run_tool_batch(env, resp, step, pre_tool_messages, state, trace, rng, point)
                 for idx, call in enumerate(resp.tool_calls):
                     outcome = outcomes[idx]
                     tool_msg = {"role": "tool", "tool_call_id": call.id,
@@ -288,7 +303,8 @@ class AgentRunner:
             return resp
 
     async def _run_tool_batch(self, env, resp: LLMResponse, step: int, pre_tool_messages: list[dict],
-                              state: LoopState, trace: TraceWriter, rng) -> dict[int, ToolOutcome]:
+                              state: LoopState, trace: TraceWriter, rng,
+                              point: StepStart | None = None) -> dict[int, ToolOutcome]:
         """Execute every tool call from one LLM turn and checkpoint as needed.
         All of `resp.tool_calls` were produced in the SAME turn, before the model
         saw any of their results, so none can depend on another's outcome --
@@ -327,21 +343,21 @@ class AgentRunner:
                 outcomes[i] = outcome
             self.debug_hook("after_readonly_batch", step)
             if self.checkpointer is not None:
-                await self.checkpointer.save("tool", step, trace, env, pre_tool_messages, state,
-                                             action=resp)
+                await self.checkpointer.save("tool", step, trace, env, point.messages, point.state,
+                                             action=resp, point=point)
         else:
             for i, c in readonly:
                 outcomes[i] = await self._tool_step(env, c, step, i, state, trace, rng, pre_tool_messages)
                 if self.checkpointer is not None:
-                    await self.checkpointer.save("tool", step, trace, env, pre_tool_messages, state,
-                                                 action=resp)
+                    await self.checkpointer.save("tool", step, trace, env, point.messages, point.state,
+                                                 action=resp, point=point)
                 self.debug_hook("after_tool_call", step)
 
         for i, c in mutating:
             outcomes[i] = await self._tool_step(env, c, step, i, state, trace, rng, pre_tool_messages)
             if self.checkpointer is not None:
-                await self.checkpointer.save("tool", step, trace, env, pre_tool_messages, state,
-                                             action=resp)
+                await self.checkpointer.save("tool", step, trace, env, point.messages, point.state,
+                                             action=resp, point=point)
             self.debug_hook("after_tool_call", step)
 
         return outcomes

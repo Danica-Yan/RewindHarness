@@ -55,9 +55,15 @@ class TraceWriter:
         seq > upto_seq. Those events belong to a crashed attempt that never
         reached the checkpoint at upto_seq, so they were never durably
         confirmed — this is what makes a "torn write" (events on disk with no
-        checkpoint backing them) safe to just throw away."""
+        checkpoint backing them) safe to just throw away.
+
+        That includes a half-written last line: a process killed inside
+        `write()` leaves one. Its event was being written after the last
+        checkpoint, so its seq is above `upto_seq` and it would be dropped
+        anyway; it is skipped instead of parsed. A bad line anywhere else is
+        real corruption and still raises."""
         p = Path(path)
-        kept = [e for e in load_trace(p) if e.seq <= upto_seq] if p.exists() else []
+        kept = [e for e in _load_tolerating_torn_tail(p) if e.seq <= upto_seq] if p.exists() else []
         for e in kept:
             if e.run_id != run_id:
                 raise ValueError(f"trace at {p} belongs to run {e.run_id}, not {run_id}")
@@ -69,6 +75,19 @@ class TraceWriter:
         tw._seq = upto_seq
         tw._fh = p.open("a", encoding="utf-8")
         return tw
+
+
+def _load_tolerating_torn_tail(path: Path) -> list[Event]:
+    lines = [ln for ln in path.read_text(encoding="utf-8").split("\n") if ln.strip()]
+    out = []
+    for i, line in enumerate(lines):
+        try:
+            out.append(Event.model_validate_json(line))
+        except ValueError:
+            if i == len(lines) - 1:
+                break
+            raise
+    return out
 
 
 def load_trace(path: str | Path) -> list[Event]:

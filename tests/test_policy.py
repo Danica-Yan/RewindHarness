@@ -71,6 +71,12 @@ def test_confirmation_needs_a_yes_that_answers_the_agent():
     asked = SYS + [user("Cancel #W1."), agent("Cancel #W1 for 'no longer needed'. Confirm?")]
     assert not fired(c, asked + [user("Yes, please.")] + pending(*CANCEL), *CANCEL)
     assert fired(c, asked + [user("No, wait.")] + pending(*CANCEL), *CANCEL)
+    # a refusal that contains an affirmative word is still a refusal (added
+    # after mutation testing: without the negative-start rule these all
+    # counted as a yes and the write went through)
+    for refusal in ("No, I'm not sure yet.", "Don't, that's right for the other order only.",
+                    "Not yet -- okay, let me check first."):
+        assert fired(c, asked + [user(refusal)] + pending(*CANCEL), *CANCEL), refusal
     assert fired(c, asked + [user("What would the refund be?")] + pending(*CANCEL), *CANCEL)
     # reads between the yes and the write are fine
     h = asked + [user("yes")] + call("get_order_details", {"order_id": "#W1"}) + pending(*CANCEL)
@@ -386,3 +392,55 @@ def test_backtest_catches_an_off_gold_write(tmp_path):
     assert ok and data["cluster_caught"] == [idx], why
     ok, why, _ = backtest_edit(EvolveConfig(), e, [row], store, {idx + 1}, bench=TAU)
     assert not ok and "catches 0 of this cluster" in why
+
+
+def test_backtest_sees_each_calls_own_db_state_within_one_turn():
+    """Added after mutation testing: the loop's per-call `env_snapshot` event
+    could be dropped with every fast test green, because tau-bench runs one tool
+    call per turn. With several calls in one turn, the backtest must evaluate
+    the second call against the DB *after* the first one, exactly as the live
+    policy check did -- that state comes only from that event."""
+    import copy
+
+    from pydantic import BaseModel
+
+    from rewind import (AgentConfig, AgentRunner, LLMResponse, ScriptedProvider, SnapshotStore, Tool,
+                        ToolCall, TraceWriter)
+    from rewind.evolve.backtest import calls_with_context
+    from rewind.tools import ToolRegistry
+
+    class FlagEnv:
+        def __init__(self, state=None):
+            self.state = copy.deepcopy(state) if state else {"data": {"flags": []}, "_applied": {}}
+
+        @property
+        def data(self):
+            return self.state["data"]
+
+        @property
+        def applied(self):
+            return self.state["_applied"]
+
+        def snapshot(self):
+            return copy.deepcopy(self.state)
+
+    class Flag(BaseModel):
+        name: str
+
+    def set_flag(env, a):
+        env.data["flags"].append(a.name)
+        return "ok"
+
+    reg = ToolRegistry()
+    reg.register(Tool("set_flag", "set a flag", Flag, set_flag, mutating=True))
+    turn = LLMResponse(tool_calls=[ToolCall(id="c1", name="set_flag", args={"name": "a"}),
+                                   ToolCall(id="c2", name="set_flag", args={"name": "b"})])
+    store, trace = SnapshotStore(), TraceWriter("multi")
+    runner = AgentRunner(ScriptedProvider([turn, LLMResponse(text="done")]), reg,
+                         AgentConfig(system_prompt="sys"), store)
+    asyncio.run(runner.run(FlagEnv(), "set two flags", trace))
+    seen = [(name, args["name"], list(data.get("flags", [])))
+            for _step, name, args, _cid, data, _hist in calls_with_context(trace.events, store)]
+    # tool_call events are written after each call runs; the DB a call is
+    # checked against is the one before it ran
+    assert seen == [("set_flag", "a", []), ("set_flag", "b", ["a"])], seen

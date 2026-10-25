@@ -83,6 +83,14 @@ def _paths(cfg: EvolveConfig) -> dict[str, Path]:
     return {"stability": d / "stability.json", "gate": d / "gate", "rounds": d / "rounds"}
 
 
+def split_ab(stable: list) -> tuple[list, list]:
+    """Stable failures (sorted by task) alternate into A, shown to the
+    proposer, and B, held out for screening. Disjoint by construction: an
+    edit screened on the failures it was written from would always look
+    like it works."""
+    return stable[0::2], stable[1::2]
+
+
 def _pool(rows: list[ResultRow], shown: set[int]) -> list[int]:
     return sorted({r["task_id"] for r in rows} - shown)
 
@@ -184,8 +192,7 @@ async def run_round(cfg: EvolveConfig, ledger: EditLedger, *, bench: Benchmark, 
                           f"(need {cfg.prevalence.min_distinct_tasks})", cluster=cluster.key)
             note(f"  only {len(stable)} stable failures -- mostly noise, skip cluster")
             continue
-        a = [r for i, r in enumerate(stable) if i % 2 == 0]
-        b = [r for i, r in enumerate(stable) if i % 2 == 1]
+        a, b = split_ab(stable)
         ledger.mark_shown([r.task_id for r in a], round_no, "proposer")
         ledger.mark_shown([r.task_id for r in b], round_no, "screen")
         ledger.record(round_no, inc.version, None, "stability", True,

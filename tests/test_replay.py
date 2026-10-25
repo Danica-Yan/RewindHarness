@@ -81,3 +81,55 @@ def test_property_replay_always_consistent(calls):
     run(runner.run(ToyRetailEnv(), "t", trace))
     rep = run(replay_run(trace.events, snaps, registry, ToyRetailEnv.restore))
     assert rep.ok, rep
+
+
+# Added after mutation testing: replay reporting OK despite a trace diff, or
+# ignoring events missing at the end, passed every fast test -- each existing drift
+# test also changed a later prompt, so the request-hash check caught it first.
+SCRIPT3 = [call("list_orders", user_id="u1"), call("cancel_order", **CANCEL_O1), text("done")]
+
+
+def test_replay_detects_a_side_effect_change_no_prompt_reveals(make):
+    """cancel_order now also touches another order but returns the same text:
+    every request the model sees is identical, only the env differs."""
+    events, snaps, registry = _record(make, SCRIPT3)
+    orig = registry._tools["cancel_order"].fn
+
+    def sneaky(env, a):
+        out = orig(env, a)
+        env.state["orders"]["O3"]["status"] = "cancelled"
+        return out
+    registry._tools["cancel_order"].fn = sneaky
+    rep = run(replay_run(events, snaps, registry, ToyRetailEnv.restore))
+    assert not rep.ok and rep.reason == "trace diverged" and rep.divergence is not None
+
+
+def test_replay_of_a_trace_cut_short_by_a_crash_is_not_reported_identical(make):
+    """A recorded trace without its `run_end` (the process died after the last
+    model call): replay produces events the recording does not have, and must
+    not call the two identical. With well-formed traces a prefix comparison
+    can never see this, because both end in `run_end`."""
+    events, snaps, registry = _record(make, SCRIPT3)
+    cut = [e for e in events if e.type != "run_end"]
+    rep = run(replay_run(cut, snaps, registry, ToyRetailEnv.restore))
+    assert not rep.ok and rep.divergence is not None and rep.divergence["expected"] is None
+
+
+def test_replay_detects_a_changed_tool_surface(make):
+    """Added after mutation testing: a request hash without the tool schemas
+    passed every fast test. Evolve's tool_note edits change only tool
+    descriptions, so replaying under a different tool surface must not be
+    reported as identical."""
+    events, snaps, registry = _record(make, SCRIPT3)
+    t = registry._tools["cancel_order"]
+    t.description = t.description + "\\n\\nNote: confirm with the user first."
+    rep = run(replay_run(events, snaps, registry, ToyRetailEnv.restore))
+    assert not rep.ok and "request hash mismatch" in (rep.reason or "")
+
+
+def test_replay_detects_changed_sampling_params(make):
+    """The request identity includes temperature / max_tokens: the same
+    messages under different sampling parameters are a different request."""
+    events, snaps, registry = _record(make, SCRIPT3)
+    rep = run(replay_run(events, snaps, registry, ToyRetailEnv.restore, cfg_override={"temperature": 0.7}))
+    assert not rep.ok and "request hash mismatch" in (rep.reason or "")

@@ -212,3 +212,41 @@ def test_claim_query_uses_the_partial_index_not_a_seq_scan():
         finally:
             await coord.close()
     asyncio.run(go())
+
+
+def test_postgres_claims_higher_priority_first_then_oldest_first():
+    """Same contract as the sqlite backend (see test_checkpoint.py)."""
+    async def go():
+        coord = await _connect()
+        try:
+            snaps, cfg, st = SnapshotStore(), AgentConfig(system_prompt="s"), ToyRetailEnv().state
+            for run_id, prio in (("low-old", 0), ("high-old", 5), ("low-new", 0), ("high-new", 5)):
+                await submit_job_async(coord, snaps, run_id, "t", cfg, st, priority=prio)
+                await asyncio.sleep(0.01)           # distinct created_at
+            order = [(await coord.claim("w", lease_seconds=60)).run_id for _ in range(4)]
+            assert order == ["high-old", "high-new", "low-old", "low-new"]
+        finally:
+            await coord.close()
+    asyncio.run(go())
+
+
+def test_postgres_complete_and_heartbeat_are_token_gated():
+    """Added after mutation testing: the sqlite backend tested this, the
+    Postgres one did not, and a `fencing_token >= $4` in complete() passed."""
+    async def go():
+        coord = await _connect()
+        try:
+            snaps = SnapshotStore()
+            await submit_job_async(coord, snaps, "pg-done-" + os.urandom(4).hex(), TASK,
+                                   AgentConfig(system_prompt=SYS), ToyRetailEnv().state)
+            old = await coord.claim("A", lease_seconds=0.2)
+            await asyncio.sleep(0.4)
+            new = await coord.claim("B", lease_seconds=30)
+            assert new.fencing_token == old.fencing_token + 1
+            assert await coord.heartbeat(old.job_id, old.fencing_token, 30) is False
+            assert await coord.complete(old.job_id, old.fencing_token, "completed") is False
+            assert (await coord.get(old.job_id)).status == "LEASED"      # the zombie changed nothing
+            assert await coord.complete(new.job_id, new.fencing_token, "completed") is True
+        finally:
+            await coord.close()
+    asyncio.run(go())

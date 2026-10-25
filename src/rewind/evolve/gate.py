@@ -161,12 +161,21 @@ async def efficacy(candidate: ContextVersion, targets: list[tuple[int, str, int,
         log(f"    efficacy task {task_id:3d}: {passes}/{policy.efficacy_n} pass")
     k0 = sum(t[2] for t in targets)
     n0 = sum(t[3] for t in targets)
+    p, lift, passed = efficacy_verdict(k1, n1, k0, n0, policy)
+    eff = Efficacy(tasks=[t[0] for t in targets], cand_passes=k1, cand_n=n1, null_passes=k0, null_n=n0,
+                   p_value=p, lift=lift, passed=passed, per_task=per_task)
+    return eff, n1
+
+
+def efficacy_verdict(k1: int, n1: int, k0: int, n0: int, policy: GatePolicy) -> tuple[float, float, bool]:
+    """(p, lift, passed) for candidate passes k1/n1 vs null passes k0/n0 on
+    the held-out targets. Passing needs BOTH a significant difference
+    (one-sided Fisher p < alpha) and a big enough one (lift >= min_lift):
+    with many forks a tiny lift becomes significant, and with few forks a
+    big one may not be."""
     p = fisher_greater(k1, n1, k0, n0)
     lift = (k1 / n1 if n1 else 0.0) - (k0 / n0 if n0 else 0.0)
-    eff = Efficacy(tasks=[t[0] for t in targets], cand_passes=k1, cand_n=n1, null_passes=k0, null_n=n0,
-                   p_value=p, lift=lift, passed=p < policy.alpha and lift >= policy.min_lift,
-                   per_task=per_task)
-    return eff, n1
+    return p, lift, p < policy.alpha and lift >= policy.min_lift
 
 
 async def regression_check(candidate: ContextVersion, incumbent: ContextVersion,
