@@ -15,7 +15,7 @@ from .events import Event
 from .loop import AgentConfig, AgentRunner
 from .providers import LLMResponse, MalformedOutput, ProviderError
 from .snapshot import SnapshotStore
-from .tools import ToolRegistry
+from .tools import ToolOutcome, ToolRegistry
 from .trace import TraceWriter
 from .util import canonical_json, request_hash
 
@@ -46,6 +46,43 @@ class ReplayProvider:
                 raise MalformedOutput(err["message"])
             raise ProviderError(err["message"], err["retryable"], err.get("status"))
         return LLMResponse.model_validate(rec.data["response"])
+
+
+class RecordedExternalTools:
+    """Wraps a ToolRegistry for replay: tools marked `external` (MCP servers,
+    web APIs) are not called again -- their outcomes, transient failures
+    included, are served from the trace in the order they were recorded.
+    Everything else (schemas, local tools, access, quota, policy) is the
+    wrapped registry's."""
+
+    def __init__(self, registry: ToolRegistry, events: list[Event]) -> None:
+        self._inner = registry
+        self._queue: dict[str, list[ToolOutcome]] = {}
+        by_call = {e.data["call_id"]: e.data["action_id"] for e in events if e.type == "tool_call"}
+        for e in events:
+            if e.type == "error" and e.data.get("call_id") in by_call:
+                self._queue.setdefault(by_call[e.data["call_id"]], []).append(
+                    ToolOutcome(False, e.data["message"], e.data["class"], transient=True))
+            elif e.type == "tool_call":
+                d = e.data
+                self._queue.setdefault(d["action_id"], []).append(
+                    ToolOutcome(d["ok"], d["content"], d["error_class"]))
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    def execute(self, env, name: str, raw_args, action_id: str) -> ToolOutcome:
+        tool = self._inner.get(name)
+        if tool is None or not tool.external:
+            return self._inner.execute(env, name, raw_args, action_id)
+        q = self._queue.get(action_id)
+        if not q:
+            raise ReplayMismatch(f"external tool {name} at {action_id} has no recorded outcome")
+        out = q.pop(0)
+        if tool.mutating and out.ok:
+            env.applied[action_id] = {"ok": out.ok, "content": out.content,
+                                      "error_class": out.error_class, "transient": out.transient}
+        return out
 
 
 async def _no_sleep(_: float) -> None:
@@ -101,6 +138,8 @@ async def replay_run(events: list[Event], snapshots: SnapshotStore, registry: To
         # recorded ones rather than charging (or being refused by) the store.
         from .platform.quota import RecordedQuota
         quota = RecordedQuota(events)
+    if any(t.external for t in registry._tools.values()):
+        registry = RecordedExternalTools(registry, events)
     runner = AgentRunner(rp, registry, cfg, snapshots,
                          fallback=rp if d.get("has_fallback") else None, sleep=_no_sleep, router=router,
                          quota_meter=quota)

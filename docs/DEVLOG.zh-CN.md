@@ -1187,6 +1187,43 @@ v1 的门禁集（188 个任务，单次运行）里还有 15 个之前没给 pr
 
 **还没做的**：成本目前是每条规则固定值，没有按实际 token 或费用计；超额只会拒绝，没做降级（换便宜模型）或排队；旧窗口的桶行不会自动清理（热路径不读它们，清理应该是定时任务）；LLM 本身的 token 预算仍在 `dist/gateway.py` 的限流器里，没有和这里的配额统一。
 
+## Agent Platform P2：MCP 网关（`platform/mcp_gateway.py`、`platform/mcp_pins.py`）
+
+**目标**：第三方 MCP server 的工具，和本地工具一样受同一套访问控制、配额、审批和审计约束。网关负责把"别人家的工具"变成 rewind 里的一个 capability：`notes` server 的 `read_note` 是能力 `mcp.notes.read_note`，模型看到的名字是 `notes__read_note`。所以 P0 的规则（租户路径隔离、上下文污染后升级审批）和 P1 的配额不需要任何改动就能作用到 MCP 工具上，测试里就是同一套规则。
+
+**SDK**：装到的是 `mcp` 2.3（FastMCP 已改名 MCPServer、客户端统一成 `mcp.Client`），所以 extra 固定在 `mcp>=2.3,<3`。
+
+**设计点**：
+
+1. **固定（pinning）的是完整定义，不是工具名。** 指纹覆盖名字、描述、input schema、annotations——模型读到的每一个字。每次同步，工具分成 approved / new / changed / removed 四种状态，只有 approved 会注册成 rewind 工具。之后定义变了（rug pull，比如描述里被塞进"先调用 admin_reset"），这个工具进入隔离：server 还在列出它，网关拒绝调用，直到有人批准新定义。
+2. **重连时先核对定义，再让连接可用。** 冒烟测试发现的漏洞：最初只有手动 `sync()` 才会重新核对，server 被重启、带着新定义回来之后，到下一次 sync 之前，旧的批准仍然覆盖新的描述。现在每次（重新）连接都先列出工具、核对固定结果，核对完之前连接不可用；连接存活期间也会按 `recheck_interval_s` 定期复核。测试：`kill -9` 杀掉 stdio server，让它以新定义重启，**不手动 sync**，重连后第一次调用被篡改的工具就被拒绝。
+3. **server 自报的风险只能往上调，不能往下调。** MCP annotations（readOnlyHint、destructiveHint）是 server 自己的说法。demo server 有一个开关让 `write_note` 谎称自己只读。规则：管理员给每个 server 设一个风险下限（默认 `write`），annotations 只能把风险抬高（声明 destructive 就是 destructive），只有管理员的逐工具覆盖能把风险降到下限以下。风险高于 `read` 的工具注册为 mutating，于是在 loop 里串行执行、受幂等台账保护。MCP 输出默认不可信，这正是 P0 里"上下文污染 → 外部/破坏性调用需审批"规则的触发条件。
+4. **密钥：配置里只存引用。** `secret_env` / `secret_headers` 记的是引用名，连接时才解析成值，只交给对应的那个 server（stdio 的进程环境，或 HTTP 头），不进配置序列化、不进 trace、模型看不到。stdio server 只继承 SDK 的最小默认环境（PATH 等少数几个），不会拿到父进程里别的密钥——测试里父进程设了 `REWIND_SECRET_UNRELATED`，server 里查不到。
+5. **连接管理**：每个 server 一个 supervisor 任务持有客户端会话；传输断开后带上限的指数退避重连；每个 server 有并发上限和调用超时；输出截断到 `max_output_chars`。传输错误、超时 → `TransientToolError`（走 loop 已有的重试），工具自己报的错 → `ToolError`。
+6. **replay 不调用 server。** 网关注册的工具标记为 `external`，`replay_run` 遇到这类工具时从 trace 里按 action_id 取回当时的结果（包括中间的瞬时失败），不重新调用。测试：跑完之后把网关关掉、server 状态清空，replay 仍然逐字节一致。fork 会真的调用 server——外部系统的状态不在 env 快照里，这是给"碰过外部世界的 run"做 fork 的诚实边界。
+7. **崩溃续跑只调用一次**：可变的 MCP 工具受 `env.applied` 保护，在所有 checkpoint 位置模拟崩溃续跑，server 端 `write_note` 的调用计数都是 1。**局限**：如果崩溃恰好发生在"server 已经执行完"和"tool checkpoint 写入"之间，续跑会再调一次——对外部系统要真正 exactly-once，需要 server 支持幂等键（比如把 `run_id:action_id` 放进请求的 `_meta`），这一点没有做，和 W4 那条"幂等台账只对 env 内部状态成立"的局限是同一回事。
+
+**测试暴露、随后修掉的问题**：
+
+- 上面第 2 点的重连窗口。
+- 网关关闭后再调用会把协程交给已经停止的事件循环，然后干等到超时（每次 45 秒，一次变异测试跑了 140 秒才发现）。现在关闭后立刻失败，`close()` 幂等。
+- **3.10/3.11 上的超时竞争**：SDK 自己的读超时和网关的 `wait_for` 设成了同一个值，在 3.11 上 SDK 先触发，抛出 `MCPError(REQUEST_TIMEOUT)`，被当成了工具的永久错误。修复：SDK 超时设得比网关长，同时把 `REQUEST_TIMEOUT` 归为可重试。另外 3.10 上 `asyncio.TimeoutError`、`concurrent.futures.TimeoutError` 还不是内置 `TimeoutError` 的别名，统一显式捕获。现在在 3.10 / 3.11 / 3.13 上全量测试都通过，3.11 上 MCP 测试连跑 5 遍稳定。
+
+**测试**（`tests/test_platform_mcp.py`，20 个，全部本地、零 API，约 5 秒）：指纹与状态核对；annotations 只升不降（6 种组合）；未批准不暴露；定义变化被隔离；错误映射（缺参数在发出请求前就是 `TOOL_ARG_INVALID`、工具报错、超时、输出截断）；同一套访问规则作用于 MCP 参数（`/t1/../t2/plan` 被拒）；注入后的破坏性调用进入审批；replay 不碰 server；所有崩溃点只调用一次；真实 `kill -9` + 新定义重启；密钥只到达对应 server；HTTP server 重启后恢复。四个变异检查（不在连接时核对、信任 server 的风险声明、replay 调用 server、子进程继承全部环境）各自让测试失败。
+
+**测量**（`scripts/mcp_bench.py`，2 vCPU 沙箱，两遍）：
+
+| | p50 | p99 |
+|---|---|---|
+| 进程内调用 | 1.1 ms | 2.2–2.4 ms |
+| stdio 调用 | 2.0–2.3 ms | 4.3–5.6 ms |
+| Streamable HTTP 调用 | 3.3–3.5 ms | 6.2–6.3 ms |
+| `kill -9` 后恢复（10 次） | 660–754 ms | 最大 741–884 ms |
+
+恢复时间几乎全是新 server 进程的启动：单独冷启动导入 MCP SDK 就要 0.67–0.77 秒。网关自己的重连开销可以忽略；要缩短恢复时间，应该从 server 侧下手（常驻、预热），而不是网关。
+
+**还没做的**：MCP 的 resources / prompts 没有接（只接了 tools）；server 端幂等键（见上）；固定结果的审批目前是 API 调用，没有审批界面；HTTP server 的 OAuth 流程没接，只支持由密钥解析出的静态请求头。
+
 ## 已知局限（诚实版）
 
 - Fork 前缀是**复制**而非引用共享；blob 内联在事件里，未走对象存储。

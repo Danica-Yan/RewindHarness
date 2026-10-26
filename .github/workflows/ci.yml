@@ -26,7 +26,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install -e ".[dev]"
+      - run: pip install -e ".[dev,mcp]"
       - run: bash scripts/ci_pr_gate.sh
 
   nightly-full:
@@ -58,7 +58,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -e ".[dev,dist,chaos]"
+      - run: pip install -e ".[dev,dist,chaos,mcp]"
       - name: Fetch toxiproxy (static binary, no Docker needed)
         run: |
           mkdir -p "$RUNNER_TEMP/bin"

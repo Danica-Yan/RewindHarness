@@ -18,6 +18,8 @@ anthropic = ["anthropic>=0.40"]
 deepseek = ["openai>=1.0"]  # DeepSeek's API is OpenAI-compatible; see DeepSeekProvider
 dist = ["asyncpg>=0.29", "redis>=5.0"]
 chaos = ["requests>=2.31"]
+# MCP gateway (rewind.platform.mcp_gateway); the SDK changed a lot at 2.0, so pin the major.
+mcp = ["mcp>=2.3,<3"]
 # Not on PyPI -- this installs the real benchmark straight from its own repo.
 # See src/rewind/env/taubench_adapter.py's module docstring for what this
 # adapter does and doesn't do without a live LLM.

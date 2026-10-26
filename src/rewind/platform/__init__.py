@@ -15,6 +15,10 @@ P0 of the platform plan -- one enforcement point in front of every tool call:
   quota.QuotaMeter           how much: per tenant/user/agent/run limits,
                              charged all-or-nothing, exactly once per action
                              (in-memory and Postgres stores)
+  mcp_gateway.McpGateway     third-party MCP servers as governed capabilities:
+                             namespacing, definition pinning, risk floors,
+                             secrets, reconnects (import it directly; needs
+                             the [mcp] extra, so it is not imported here)
 
 Usage: attach `AccessControl` to the registry and put the principal in the
 agent config.
