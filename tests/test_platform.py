@@ -97,14 +97,14 @@ class RecordingProvider(ScriptedProvider):
         return await super().complete(messages, tools, params)
 
 
-def go(script, p: Principal | None, registry=None, env=None):
+def go(script, p: Principal | None, registry=None, env=None, run_id="p-1"):
     reg = registry or platform_registry()
     snaps = SnapshotStore()
     prov = RecordingProvider(script)
     cfg = AgentConfig(system_prompt="sys", principal=p.model_dump(mode="json") if p else None)
     runner = AgentRunner(prov, reg, cfg, snaps, sleep=_no_sleep)
     env = env or ToyRetailEnv()
-    trace = TraceWriter("p-1")
+    trace = TraceWriter(run_id)
     res = run(runner.run(env, "task", trace))
     return res, env, trace, prov, snaps, reg
 

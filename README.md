@@ -19,6 +19,7 @@ Most agent frameworks make it easy to *run* an agent and hard to answer the ques
 - **Gated self-improvement (Evolve)** — failures are clustered, filtered for reproducibility with null forks, an LLM proposes context edits, and an edit ships only after proving an effect on held-out failures *and* no harm on tasks it never saw. Model weights never change.
 - **Policy checks (rules → code)** — mechanical policies (explicit yes before a write, act only for the authenticated user, look an order up before changing it) run as declarative checks before a tool executes; a blocked call never runs and the agent gets the reason back. Checks are backtested on recorded traces with zero API calls before Evolve spends any episode on them.
 - **Access control for multi-tenant agents** — every tool call passes one enforcement point: a default-deny policy engine over tenant, roles, scopes and risk level, with argument-level conditions (tenant-scoped paths, host allowlists) and escalation to human approval once the context has taken in untrusted content. Approval pauses the run at its checkpoint and resumes it after a human decides; every decision is a trace event, so replay re-checks enforcement too.
+- **Quotas that hold under concurrency and crashes** — per tenant / user / agent / run limits, charged all-or-nothing in one conditional Postgres `UPDATE` (20 workers racing for 5 units: exactly 5 win) and exactly once per action, so a worker that crashed after charging is never charged again on resume. Replay serves recorded quota outcomes instead of touching the store.
 - **Skill library** — procedures induced from *successful* episodes (one LLM call per task type), shown to the agent as a one-line index and loaded on demand with `load_skill`, so the trace records when a skill was used. The whole library is gated as one version against the incumbent's freshly measured rate on held-out failures.
 - **Compounding without regressing** — regression memory (every task an accepted version fixed is re-checked by every later gate), consolidation by ablation (a learned item is removed when dropping it costs nothing on the fixes it is remembered for), and a meta level: the proposer's *lessons* are rewritten from the ledger history and adopted only if they produce more screened-in candidates than the old lessons on the same clusters. The gate itself is never editable by the loop.
 - **Red-teamed against its own judge** — a catalogue of specification-gaming attacks (hard-coded answers, real customer names, instruction overrides, grader talk, switching off confirmation, output stuffing, gaming lessons) is replayed by `scripts/redteam_evolve.py`; every one is stopped by offline validation, the backtest, or two new gate monitors (output stuffing; per-check policy-compliance replay, which catches paraphrased attacks that pass every regex). The judge's code and settings are fingerprinted in the ledger, and any change needs a recorded human reason.
@@ -37,6 +38,7 @@ Most agent frameworks make it easy to *run* an agent and hard to answer the ques
 | **Scaling** — 40 jobs on real Postgres, 1/2/4/8 workers | 64 → 91 → 116 → 102 jobs/s (peaks at 4 workers on 2 vCPUs) |
 | **Single-flight** — 6 identical concurrent LLM requests through Redis | upstream provider called **once** |
 | **Parallel tool calls** — 5 read-only calls in one turn, 0.2 s each | 1.00 s serial → **0.209 s**; mutating calls stay strictly ordered |
+| **Quota charging** — 2000 charges, 20 workers, local Postgres on 2 vCPUs | ~1.5k charges/s spread over buckets; ~620/s on one hot bucket (p99 ~110 ms, row-lock serialisation) |
 | **Postgres claim query** — 50k historical rows | 8.2 ms seq scan → 0.046 ms with a partial index (~180×), asserted from `EXPLAIN` |
 | **Attribution accuracy** — synthetic ground truth, 5 root-cause positions | 100% exact match, 2.4 oracle calls on average |
 | **Same benchmark inside rewind** — τ-bench test, 3 trials, rewind loop vs τ-bench's own `run.py` | pass^1 73.3% vs 72.2%, 95% CI [−3.5%, +5.8%]: indistinguishable (two `run.py` runs differ by [−8.4%, +5.5%]) |
@@ -253,7 +255,9 @@ src/rewind/
   flywheel/                           failure classification, attribution, data flywheel
   env/                                toy retail env; τ-bench plugin (adapter, dialogue env, failure
                                         classifier, TauBenchRetail benchmark)
-  platform/                           access control: principals, capability catalog, policy engine, approvals
+  flywheel/                           failure classification, attribution, data flywheel, τ-bench failure analysis
+  env/                                offline toy retail env, τ-bench adapter, real multi-turn τ-bench episodes
+  platform/                           access control (principals, capabilities, policy engine, approvals) and quotas
   evolve/                             self-improvement: surface, prevalence, stability, proposer, screen, gate, feedback, ledger, loop
 viewer/index.html                     offline viewer: rounds, versions, gate decisions, side-by-side episode comparison
 scripts/                              experiments, τ-bench runs and comparisons, CI entry points
@@ -278,6 +282,7 @@ Module docstrings refer to the milestones the project was built in:
 | Evolve P1 | Gated self-improvement loop and its first real round |
 | Layering | Ports between layers (environment, coordination, benchmark, result rows), enforced by `tests/test_layering.py` |
 | Platform P0 | Multi-tenant access control in front of every tool call; approval as a checkpoint pause |
+| Platform P1 | Quotas: all-or-nothing, exactly-once charging; recorded outcomes on replay |
 
 ## Limitations
 

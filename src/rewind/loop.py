@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import random
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -86,7 +87,7 @@ class AgentRunner:
                  snapshots: SnapshotStore, clock=None, fallback=None, sleep=None,
                  checkpointer: Checkpointer | None = None,
                  debug_hook: Callable[[str, int], None] | None = None,
-                 router: Any = None) -> None:
+                 router: Any = None, quota_meter: Any = None) -> None:
         self.provider = provider
         self.registry = registry
         self.cfg = cfg
@@ -97,6 +98,10 @@ class AgentRunner:
         self.checkpointer = checkpointer
         # Optional per-turn tool router (routing.ToolRouter). None = every tool, unmodified prompt.
         self.router = router
+        # Overrides `registry.quota` (rewind.platform.QuotaMeter). Replay
+        # passes a RecordedQuota here so it serves recorded outcomes instead
+        # of charging the real store again.
+        self.quota_meter = quota_meter
         # Test/debug seam only: lets tests simulate a process crash at an exact
         # point (e.g. "after this tool call, before the step checkpoint") by
         # raising from the hook. Never used in production wiring.
@@ -415,7 +420,7 @@ class AgentRunner:
         indexed = list(enumerate(resp.tool_calls))
         readonly = [(i, c) for i, c in indexed if not self.registry.is_mutating(c.name)]
         mutating = [(i, c) for i, c in indexed if self.registry.is_mutating(c.name)]
-        denied = self._authorize_batch(resp, step, pre_tool_messages, trace)
+        denied = await self._authorize_batch(resp, step, pre_tool_messages, trace)
 
         if len(readonly) >= 2:
             results = await asyncio.gather(
@@ -456,8 +461,8 @@ class AgentRunner:
         from .platform.identity import Principal   # local import: keeps the loop free of a hard dependency
         return access, Principal.model_validate(self.cfg.principal)
 
-    def _authorize_batch(self, resp: LLMResponse, step: int, history: list[dict],
-                         trace: TraceWriter) -> dict[int, ToolOutcome]:
+    async def _authorize_batch(self, resp: LLMResponse, step: int, history: list[dict],
+                               trace: TraceWriter) -> dict[int, ToolOutcome]:
         """Decide every call of this turn BEFORE any of them runs. Each
         decision becomes an `authz` event. Calls that may not run come back
         as ready-made error outcomes keyed by index (a hidden capability is
@@ -466,18 +471,34 @@ class AgentRunner:
         run stops with status `awaiting_approval`. The intent checkpoint for
         this step is already durable, so a resumed run redoes this same
         recorded action, finds the grant, and continues -- approval is just
-        another reason to pause at a checkpoint."""
+        another reason to pause at a checkpoint.
+
+        Then quotas: each allowed call is charged to every quota rule that
+        covers it (all-or-nothing, see platform/quota.py); a call without
+        room is answered with QUOTA_EXCEEDED and does not run. Charging only
+        starts once no call is waiting for approval, so a paused step has
+        spent nothing. The quota outcome goes into the same authz event."""
         access, principal = self._access()
         if access is None:
             return {}
+        verdicts = [access.check(principal, trace.run_id, f"s{step}:c{i}", c.name, c.args, history)
+                    for i, c in enumerate(resp.tool_calls)]
+        pending = [v.approval_key for v in verdicts if v.verdict == "pending_approval"]
+        meter = self.quota_meter if self.quota_meter is not None else getattr(self.registry, "quota", None)
         denied: dict[int, ToolOutcome] = {}
-        pending: list[str] = []
-        for i, c in enumerate(resp.tool_calls):
-            v = access.check(principal, trace.run_id, f"s{step}:c{i}", c.name, c.args, history)
-            trace.emit("authz", step, {"call_id": c.id, "idx": i, "name": c.name, **v.to_event()})
-            if v.verdict == "pending_approval":
-                pending.append(v.approval_key)
-            elif v.verdict == "deny":
+        for i, (c, v) in enumerate(zip(resp.tool_calls, verdicts)):
+            data = {"call_id": c.id, "idx": i, "name": c.name, **v.to_event()}
+            if v.verdict == "allow" and v.capability is not None and meter is not None and not pending:
+                q = meter.charge(principal, v.capability, trace.run_id, f"s{step}:c{i}")
+                if inspect.isawaitable(q):              # PgQuotaStore is async, the in-memory store is not
+                    q = await q
+                data["quota"] = q.to_event()
+                if not q.ok:
+                    wait = "" if q.retry_after is None else f"; it resets in {q.retry_after:.0f}s"
+                    denied[i] = ToolOutcome(False, f"usage limit reached for {c.name}{wait}. "
+                                                   "Do not retry it now; tell the user.", "QUOTA_EXCEEDED")
+            trace.emit("authz", step, data)
+            if v.verdict == "deny":
                 denied[i] = ToolOutcome(False, v.message, "ACCESS_DENIED")
             elif v.verdict in ("hidden", "unknown"):
                 denied[i] = ToolOutcome(False, v.message, "HALLUCINATED_TOOL")
