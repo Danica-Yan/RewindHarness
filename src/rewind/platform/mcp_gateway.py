@@ -57,9 +57,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from ..tools import Tool, ToolError, ToolRegistry, TransientToolError
 from .capability import CapabilityCatalog, CapabilityDescriptor, Risk
+from .context import current_call
 from .mcp_pins import PinStore, ToolStatus, derive_risk, fingerprint, reconcile
 
 SEP = "__"
+IDEMPOTENCY_META = "io.rewind/idempotency-key"
 # Python 3.10: asyncio.wait_for and Future.result raise their own TimeoutError
 # classes, which only became aliases of the builtin in 3.11.
 _TIMEOUTS = (TimeoutError, asyncio.TimeoutError, concurrent.futures.TimeoutError)
@@ -228,12 +230,12 @@ class _Conn:
         except Exception as e:                           # noqa: BLE001
             raise self._lost(e) from e
 
-    async def call(self, tool: str, args: dict) -> str:
+    async def call(self, tool: str, args: dict, meta: dict | None = None) -> str:
         from mcp.shared.exceptions import MCPError
         client = await self._client()
         async with self._sem:
             try:
-                res = await asyncio.wait_for(client.call_tool(tool, args), self.cfg.call_timeout_s)
+                res = await asyncio.wait_for(client.call_tool(tool, args, meta=meta), self.cfg.call_timeout_s)
             except _TIMEOUTS:
                 raise TransientToolError(f"{tool} on {self.cfg.id} timed out after "
                                          f"{self.cfg.call_timeout_s:g}s") from None
@@ -473,8 +475,14 @@ class McpGateway:
             raise ToolError(f"{server}{SEP}{tool} is unavailable: its definition is not approved"
                             + (" (it changed since approval)" if st == "changed" else ""))
         conn = self._conns[server]
+        # The same key on every attempt of one action -- including after a
+        # crash/resume -- so a server that honours it can deduplicate the
+        # case rewind's own ledger cannot cover (crash after the server acted,
+        # before the checkpoint).
+        ctx = current_call()
+        meta = {IDEMPOTENCY_META: ctx.idempotency_key} if ctx is not None else None
         try:
-            return self._run(conn.call(tool, args),
+            return self._run(conn.call(tool, args, meta),
                              conn.cfg.connect_timeout_s + conn.cfg.call_timeout_s + 5)
         except _TIMEOUTS:
             raise TransientToolError(f"{server}{SEP}{tool} did not answer in time") from None

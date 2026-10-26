@@ -557,23 +557,14 @@ class AgentRunner:
         elif (blocked := self._policy_block(env, call, step, history, trace)) is not None:
             outcome = blocked
         else:
-            attempt = 0
-            while True:
-                # Dispatched to a thread pool (not called directly) so that when
-                # `_run_tool_batch` gathers several of these coroutines at once
-                # for non-mutating calls, their actual work genuinely overlaps
-                # instead of running one-at-a-time on the event loop thread.
-                outcome = await asyncio.to_thread(self.registry.execute, env, call.name,
-                                                  call.args, action_id)
-                if outcome.transient and attempt < cfg.max_transient_tool_retries:
-                    trace.emit("error", step, {"class": outcome.error_class, "attempt": attempt,
-                                               "message": outcome.content, "call_id": call.id})
-                    delay = self._backoff(attempt, rng)
-                    attempt += 1
-                    await self.sleep(delay)
-                    continue
-                break
-
+            # Who is calling, for executors that need it (sandbox, MCP gateway).
+            # to_thread copies the context into the worker thread; reset after.
+            from .platform.context import CALL_CONTEXT, CallContext
+            ctx_token = CALL_CONTEXT.set(CallContext(self._access()[1], trace.run_id, action_id))
+            try:
+                outcome = await self._execute_with_retries(env, call, action_id, step, trace, rng)
+            finally:
+                CALL_CONTEXT.reset(ctx_token)
         state.note_result(outcome.error_class)
         trace.emit("tool_call", step, {
             **base, "ok": outcome.ok, "error_class": outcome.error_class,
@@ -581,3 +572,23 @@ class AgentRunner:
             "latency_ms": round((self.clock.perf() - t) * 1000, 3)})
         trace.emit("env_snapshot", step, {"env_hash": self.snapshots.put(env.snapshot())})
         return outcome
+
+    async def _execute_with_retries(self, env, call: ToolCall, action_id: str, step: int,
+                                    trace: TraceWriter, rng) -> ToolOutcome:
+        cfg = self.cfg
+        attempt = 0
+        while True:
+            # Dispatched to a thread pool (not called directly) so that when
+            # `_run_tool_batch` gathers several of these coroutines at once
+            # for non-mutating calls, their actual work genuinely overlaps
+            # instead of running one-at-a-time on the event loop thread.
+            outcome = await asyncio.to_thread(self.registry.execute, env, call.name,
+                                              call.args, action_id)
+            if outcome.transient and attempt < cfg.max_transient_tool_retries:
+                trace.emit("error", step, {"class": outcome.error_class, "attempt": attempt,
+                                           "message": outcome.content, "call_id": call.id})
+                delay = self._backoff(attempt, rng)
+                attempt += 1
+                await self.sleep(delay)
+                continue
+            return outcome

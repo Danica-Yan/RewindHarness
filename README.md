@@ -21,6 +21,7 @@ Most agent frameworks make it easy to *run* an agent and hard to answer the ques
 - **Access control for multi-tenant agents** — every tool call passes one enforcement point: a default-deny policy engine over tenant, roles, scopes and risk level, with argument-level conditions (tenant-scoped paths, host allowlists) and escalation to human approval once the context has taken in untrusted content. Approval pauses the run at its checkpoint and resumes it after a human decides; every decision is a trace event, so replay re-checks enforcement too.
 - **Quotas that hold under concurrency and crashes** — per tenant / user / agent / run limits, charged all-or-nothing in one conditional Postgres `UPDATE` (20 workers racing for 5 units: exactly 5 win) and exactly once per action, so a worker that crashed after charging is never charged again on resume. Replay serves recorded quota outcomes instead of touching the store.
 - **MCP gateway** — third-party MCP servers (stdio or Streamable HTTP) become governed capabilities under the same access rules, quotas and approvals as local tools. Only tool definitions an admin approved are exposed, pinned by a fingerprint of everything the model reads; a definition that changes later is quarantined — re-verified on every reconnect, so a server killed and restarted with new tool text is refused from its first call. Server risk annotations can raise risk, never lower it. Secrets reach only their server. Replay serves recorded MCP results and never calls a server.
+- **Sandboxed tool code** — tenant- or agent-written code runs in a container with no network interface but loopback, a read-only root, an unprivileged user with no capabilities, memory/CPU/process limits and a timeout, and only the calling tenant's workspace mounted. Pre-started containers are single-use, so warm calls never share state. Secrets go to one call by name, never through argv or the container config. Each attack (network, writes, memory bomb, fork bomb, infinite loop, cross-tenant read) has a test that runs it in a real container.
 - **Skill release management** — skills as immutable versions with a manifest of the capabilities they require; candidate/stable channels with gated promotion (static checks, plus a quality gate such as Evolve's statistical one), rollback with yank, and an append-only audit log. A skill is offered to an agent only if policy allows it and the agent could use everything it requires; each run is pinned to exact versions, so a later release never changes what a run — or its replay — saw.
 - **Skill library** — procedures induced from *successful* episodes (one LLM call per task type), shown to the agent as a one-line index and loaded on demand with `load_skill`, so the trace records when a skill was used. The whole library is gated as one version against the incumbent's freshly measured rate on held-out failures.
 - **Compounding without regressing** — regression memory (every task an accepted version fixed is re-checked by every later gate), consolidation by ablation (a learned item is removed when dropping it costs nothing on the fixes it is remembered for), and a meta level: the proposer's *lessons* are rewritten from the ledger history and adopted only if they produce more screened-in candidates than the old lessons on the same clusters. The gate itself is never editable by the loop.
@@ -42,6 +43,7 @@ Most agent frameworks make it easy to *run* an agent and hard to answer the ques
 | **Parallel tool calls** — 5 read-only calls in one turn, 0.2 s each | 1.00 s serial → **0.209 s**; mutating calls stay strictly ordered |
 | **Quota charging** — 2000 charges, 20 workers, local Postgres on 2 vCPUs | ~1.5k charges/s spread over buckets; ~620/s on one hot bucket (p99 ~110 ms, row-lock serialisation) |
 | **MCP gateway** — demo server, 300 calls per transport | p50 1.1 ms in-process, ~2 ms stdio, ~3.4 ms Streamable HTTP; after a real `kill -9`, recovery p50 ~0.7 s (≈ the server's own cold start) |
+| **Sandboxed tool call** — local Docker, 2 vCPUs | p50 ~260 ms with a fresh container per call; ~130 ms from the single-use warm pool when calls have think time between them (~185 ms back-to-back) |
 | **Postgres claim query** — 50k historical rows | 8.2 ms seq scan → 0.046 ms with a partial index (~180×), asserted from `EXPLAIN` |
 | **Attribution accuracy** — synthetic ground truth, 5 root-cause positions | 100% exact match, 2.4 oracle calls on average |
 | **Same benchmark inside rewind** — τ-bench test, 3 trials, rewind loop vs τ-bench's own `run.py` | pass^1 73.3% vs 72.2%, 95% CI [−3.5%, +5.8%]: indistinguishable (two `run.py` runs differ by [−8.4%, +5.5%]) |
@@ -242,6 +244,7 @@ Connection strings can be overridden with `REWIND_PG_DSN` and `REWIND_REDIS_URL`
 - **An approval rule is an obligation, not a grant.** The first version let a broad "external calls need approval once the context is tainted" rule count as permission: an agent with no email rights could get `send_email` queued for approval just by reading a web page first. Only `allow` grants now; `require_approval` can only add a gate on top of one. A capability the principal cannot see is answered exactly like a made-up tool name.
 - **Re-verify on reconnect, not only on demand.** The first gateway re-checked MCP tool definitions only when `sync()` was called, so a server restarted with new definitions had a window in which the old approval covered the new text. Every (re)connect now lists and checks definitions before the connection is usable.
 - **Wrappers must carry everything they wrap.** Evolve's `patch_registry` rebuilt the tool registry and kept only the policy checks; once access control, quotas and external tools existed, a single learned tool note would silently switch them off. Found when the two lines of work first met, fixed, and pinned by a regression test.
+- **A test that something did not happen must also show that its premise did.** The warm-pool test asserted that a second call could not see a file the first one wrote to /tmp — and passed, because the first write had failed (the tmpfs was root-owned). It now asserts the write. The network test was tightened the same way: not "a connection failed" (this host's own egress filter could cause that) but "the only interface is loopback".
 - **Rules must say when they apply.** Every learned rule carries a trigger and is written as "When …: …"; a rule about one tool must be a note on that tool. Blanket instructions are refused before any episode is spent.
 
 ## Project layout
@@ -262,7 +265,7 @@ src/rewind/
                                         classifier, TauBenchRetail benchmark)
   flywheel/                           failure classification, attribution, data flywheel, τ-bench failure analysis
   env/                                offline toy retail env, τ-bench adapter, real multi-turn τ-bench episodes
-  platform/                           access control (principals, capabilities, policy engine, approvals), quotas, MCP gateway, skill registry
+  platform/                           access control (principals, capabilities, policy engine, approvals), quotas, MCP gateway, skill registry, container sandbox
   evolve/                             self-improvement: surface, prevalence, stability, proposer, screen, gate, feedback, ledger, loop
 viewer/index.html                     offline viewer: rounds, versions, gate decisions, side-by-side episode comparison
 scripts/                              experiments, τ-bench runs and comparisons, CI entry points
@@ -290,6 +293,7 @@ Module docstrings refer to the milestones the project was built in:
 | Platform P1 | Quotas: all-or-nothing, exactly-once charging; recorded outcomes on replay |
 | Platform P2 | MCP gateway: definition pinning, risk floors, secrets, reconnects; external results recorded for replay |
 | Platform P3 | Skill registry: manifests, gated release, rollback/yank, load-time authorisation, per-run version pins |
+| Platform P4 | Container sandbox for untrusted tool code; per-call caller context; idempotency keys on MCP calls |
 
 ## Limitations
 

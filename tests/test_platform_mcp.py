@@ -200,6 +200,17 @@ def test_replay_never_calls_the_server(gw):
     assert demo_server.CALLS["write_note"] == 1
 
 
+def test_each_mcp_call_carries_a_stable_idempotency_key(gw):
+    """The case rewind's ledger cannot cover -- a crash after the server
+    acted but before the checkpoint -- needs the server's help. Every call
+    carries run_id:action_id, which a resumed run reproduces exactly."""
+    add_notes(gw, trust_on_first_use=True)
+    demo_server.SEEN_KEYS.clear()
+    go([call("notes__write_note", path="/t1/a", text="x"), call("notes__write_note", path="/t1/b", text="y"),
+        text("done")], principal(), registry=governed(gw), run_id="run-42")
+    assert demo_server.SEEN_KEYS == ["run-42:s1:c0", "run-42:s2:c0"]
+
+
 def test_closed_gateway_fails_fast(gw):
     add_notes(gw, trust_on_first_use=True)
     gw.close()
