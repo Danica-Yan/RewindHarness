@@ -15,6 +15,10 @@ P0 of the platform plan -- one enforcement point in front of every tool call:
   quota.QuotaMeter           how much: per tenant/user/agent/run limits,
                              charged all-or-nothing, exactly once per action
                              (in-memory and Postgres stores)
+  skills.SkillStore          versioned skills with manifests (required
+                             capabilities), candidate/stable channels, gated
+                             promotion, rollback + yank; bind_skills offers a
+                             principal only what it may load, pinned per run
   mcp_gateway.McpGateway     third-party MCP servers as governed capabilities:
                              namespacing, definition pinning, risk floors,
                              secrets, reconnects (import it directly; needs
@@ -35,6 +39,9 @@ from .access import (AccessControl, ApprovalRequest, ApprovalStore, CallVerdict,
 from .authz import CONDITIONS, AuthzContext, Cond, Decision, PolicyEngine, Rule
 from .capability import CapabilityCatalog, CapabilityDescriptor
 from .identity import AttenuationError, Principal
+from .skills import (Gate, GateVerdict, PromotionRejected, SkillBinding, SkillManifest, SkillStore,
+                     SkillVersion, StaticSkillGate, bind_skills, manifest_from_evolve, principal_for_skill,
+                     verdict_from_evolve)
 from .quota import (Charge, InMemoryQuotaStore, PgQuotaStore, QuotaMeter, QuotaResult, QuotaRule,
                     RecordedQuota)
 
@@ -43,4 +50,6 @@ __all__ = [
     "CONDITIONS", "CallVerdict", "CapabilityCatalog", "CapabilityDescriptor", "Cond", "Decision",
     "Charge", "InMemoryApprovalStore", "InMemoryQuotaStore", "PgQuotaStore", "PolicyEngine", "Principal",
     "QuotaMeter", "QuotaResult", "QuotaRule", "RecordedQuota", "Rule", "approval_key",
+    "Gate", "GateVerdict", "PromotionRejected", "SkillBinding", "SkillManifest", "SkillStore", "SkillVersion",
+    "StaticSkillGate", "bind_skills", "manifest_from_evolve", "principal_for_skill", "verdict_from_evolve",
 ]

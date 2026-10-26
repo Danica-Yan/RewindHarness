@@ -57,6 +57,9 @@ class CapabilityCatalog:
     def resolve(self, name: str) -> CapabilityDescriptor | None:
         return self._by_name.get(name)
 
+    def by_id(self, cap_id: str) -> CapabilityDescriptor | None:
+        return next((c for c in self._by_name.values() if c.id == cap_id), None)
+
     def __iter__(self):
         return iter(self._by_name.values())
 

@@ -1224,6 +1224,29 @@ v1 的门禁集（188 个任务，单次运行）里还有 15 个之前没给 pr
 
 **还没做的**：MCP 的 resources / prompts 没有接（只接了 tools）；server 端幂等键（见上）；固定结果的审批目前是 API 调用，没有审批界面；HTTP server 的 OAuth 流程没接，只支持由密钥解析出的静态请求头。
 
+## Agent Platform P3：Skill 管理（`platform/skills.py`）
+
+**和已有代码的关系**：`rewind.skills` 定义了 skill 对 agent 来说是什么（`load_skill` 背后的步骤）；Evolve 的 `ContextVersion` 管的是一个 benchmark agent 的整套上下文。P3 不重做这两件事，而是在平台层补上多租户需要的部分：每个 skill 独立的不可变版本、声明所需能力的 manifest、发布通道、门控、回滚，以及加载时鉴权。Evolve 的产出通过适配函数走同一条发布管线。
+
+**先修的一个集成 bug（P0 起就存在）**：Evolve 的 `patch_registry()` 新建 `ToolRegistry` 再逐个拷贝工具，只带走了 `policy`，没带走 `registry.access` / `registry.quota`，重建 `Tool` 时还丢了 P2 加的 `external`。后果：Evolve 一旦加一条 tool note，访问控制和配额就悄悄失效，MCP 工具在 replay 时会被真实调用。用测试复现后修复（带上平台层，`dataclasses.replace` 保留其余字段），加了回归测试。这类"包一层再重建对象时漏字段"的问题，只有在两条独立开发的功能线第一次交汇时才会暴露。
+
+**设计**：
+
+1. **manifest 声明所需能力**：`requires` 必须是具体的能力 id（不允许通配），可选 `tenants` 限定可见租户。名字、描述、步骤用和 agent skill 完全相同的规则校验。
+2. **版本不可变**：同名同版本内容不同直接拒绝；同内容重复注册是幂等的；版本号必须递增。
+3. **通道状态由只追加的事件日志推导出来**：每次 promote、被拒的 promote、rollback、yank 都记一条带操作人和门控结果的事件，`candidate` / `stable` 的当前位置从日志重放得到，所以审计日志和当前状态不可能不一致。
+4. **门控**：进 candidate 需要通过静态门（所需能力都存在；文本里没有提到未声明的工具；没有订单号、邮箱这类具体数据，复用 Evolve 的泄露检查）。进 stable 需要它当前就是 candidate，并且至少有一个静态检查以外的质量门。Evolve 的统计门控结果通过 `verdict_from_evolve` 转成门控结果。离线测试里没有真正的质量门可跑：skill 的质量只能靠真实模型的 episode 来衡量，那正是 Evolve 门控做的事，这里只负责接收它的结论，不假装自己能判断。
+5. **"文本里提到了未声明的工具"是一条安全检查**：如果 skill 写着"先调用 cancel_order"，却没有在 requires 里声明它，加载时的鉴权就看不到这个依赖——没有这项权限的 agent 照样能加载这个 skill，然后去尝试一个调用。这个调用会被策略引擎拦住，所以不是越权，但它让 manifest 说了假话，因此在发布时就拒绝。
+6. **回滚 + 撤回（yank）**：回滚就是弹出 stable 栈；被回滚的版本默认被撤回：新的 run 不能再绑定它，也不能再被 promote，但对 replay 仍然可读（`allow_yanked`），因为审计要求旧 run 能复现。
+7. **租户私有 skill 对其他租户就像不存在**：报错和"没有这个 skill"一样，不泄露它存在。
+8. **加载时鉴权**（`bind_skills`）：一个 skill 只有在策略允许 `skill.<name>`、**并且**主体能用它要求的每一个能力时才会提供给 agent；被排除的 skill 带着原因（缺哪个能力、哪条规则拒绝）。`load_skill` 工具按这次绑定重建，只认这次提供的版本。skill 本身不授予任何权限：加载只是让 agent 看到一段文字，之后的每个调用仍然由策略引擎判定。
+9. **每次 run 固定版本**：绑定结果是精确版本（`cancel_flow@1.0.0`），写进 `AgentConfig.skill_pins`，随 `run_start` 记录。之后 stable 换了版本、甚至旧版本被撤回，新 run 拿到新版本，旧 run 用记录下来的版本重新绑定后仍然逐字节 replay；用当前 stable 去 replay 旧 run 会失败——这正是应该的。
+10. **"Agent 授权 ∩ Skill 声明"落在子 agent 上**：`principal_for_skill` 给专门执行某个 skill 的子 agent 派生身份，scope 等于 skill 的 requires，复用 P0 的 `attenuate`。测试里父 agent 有发邮件的权限，skill 没声明，子 agent 就看不到也调不了。
+
+**测试**（`tests/test_platform_skills.py`，11 个，零 API）：版本不可变与递增；静态门（未声明的工具、未知能力、泄露）；stable 的流程要求和 Evolve 结论适配；回滚与撤回；租户私有；绑定时排除并给出原因；agent 只能加载绑定的 skill；跨发布的版本固定与 replay；子 agent 的交集权限；Evolve skill 转 manifest；`patch_registry` 回归。五个变异检查（静态门不查未声明工具、绑定不查所需能力、撤回的版本仍可解析、不是 candidate 也能进 stable、Evolve 丢掉平台层）各自让测试失败。
+
+**还没做的**：存储是 sqlite，多 worker 部署需要换成共享库（接口不变）；没有灰度（按比例把一部分 run 绑定到 candidate），这是下一步最自然的扩展，配合 Evolve 的门控可以做成"小流量验证再全量"；skill 之间的依赖没有建模。
+
 ## 已知局限（诚实版）
 
 - Fork 前缀是**复制**而非引用共享；blob 内联在事件里，未走对象存储。

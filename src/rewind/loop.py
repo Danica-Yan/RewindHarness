@@ -53,6 +53,10 @@ class AgentConfig:
     # when the registry carries an AccessControl; kept in the config so the
     # identity is recorded in run_start and replay/fork/resume rebuild it.
     principal: dict | None = None
+    # Exact skill versions this run was bound to ("name@1.2.0"), from
+    # rewind.platform.skills.bind_skills(...).pins(); recorded with the config
+    # so a later release cannot change what this run -- or its replay -- saw.
+    skill_pins: list[str] | None = None
 
 
 @dataclass
