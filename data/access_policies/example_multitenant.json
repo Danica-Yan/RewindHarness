@@ -1,0 +1,44 @@
+[
+  {
+    "id": "support-orders",
+    "effect": "allow",
+    "roles": ["support"],
+    "capabilities": ["local.list_orders", "local.get_order", "local.cancel_order"],
+    "description": "Support agents handle orders."
+  },
+  {
+    "id": "files-editor",
+    "effect": "allow",
+    "roles": ["editor"],
+    "capabilities": ["local.read_file", "local.write_file"],
+    "description": "Editors use the file tools (where is limited by the next rule)."
+  },
+  {
+    "id": "files-outside-own-workspace",
+    "effect": "deny",
+    "capabilities": ["local.read_file", "local.write_file"],
+    "when": [{"kind": "arg_prefix", "params": {"arg": "path", "prefix": "/workspaces/${tenant_id}/"}, "negate": true}],
+    "description": "Tenant isolation: any path that does not normalise to the caller's own workspace is denied, whatever else allows it."
+  },
+  {
+    "id": "web-docs-only",
+    "effect": "allow",
+    "capabilities": ["local.fetch_url"],
+    "when": [{"kind": "arg_host_in", "params": {"arg": "url", "hosts": ["docs.example.com"]}}],
+    "description": "Anyone may read the docs site; every other host is default-denied."
+  },
+  {
+    "id": "support-email",
+    "effect": "allow",
+    "roles": ["support"],
+    "capabilities": ["local.send_email"]
+  },
+  {
+    "id": "external-after-untrusted-input",
+    "effect": "require_approval",
+    "capabilities": ["*"],
+    "risk": ["external", "destructive"],
+    "when": [{"kind": "context_tainted", "params": {}}],
+    "description": "Once the conversation has taken in untrusted content, anything that leaves the system or cannot be undone needs a human."
+  }
+]

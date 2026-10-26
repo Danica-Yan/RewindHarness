@@ -1131,6 +1131,32 @@ v1 的门禁集（188 个任务，单次运行）里还有 15 个之前没给 pr
 第二个候选是格式问题，不是想法问题，直接拒绝等于浪费一个候选名额。现在只点名一个工具的规则会被**自动转换**为那个工具的说明（文字和触发条件不变），再走后面的检验；同时涉及多个工具的仍是规则。
 
 另：第 3 轮的整理（消融）测试过 v1 规则——去掉它，目标任务 6/15 → 1/15（p = 0.04），所以保留。这是"规则仍在起作用"的直接证据。
+## Agent Platform P0：访问控制（`rewind.platform`）
+
+**目标**：把 rewind 从"单用户跑 benchmark 的 runtime"推向"多用户、多 agent 的服务端"。P0 只做一件事：所有工具调用前面有且只有一个执行点（PEP），由一个默认拒绝的策略引擎（PDP）做决定。MCP、Skill 版本管理、配额、沙箱都在后面的阶段，接口已为它们留好位置。
+
+**和已有 `policy.py` 的区别**：`policy.py` 管的是**业务规则**（写操作前要用户明确同意、只能替已认证用户操作），本模块管的是**访问控制**（谁、属于哪个租户、有什么角色、能不能调这个能力）。两者在 loop 里串联：循环检测 → 访问控制 → 业务规则 → 执行。
+
+**模块**：
+
+- `identity.Principal`：tenant / user / agent / roles / scopes。放在 `AgentConfig.principal` 里，因此会随配置写进 `run_start`，replay、fork、worker 续跑都自动拿到同一个身份，不需要额外传参。`attenuate()` 给子 agent 派生身份，只能收窄：角色必须是父角色子集，scope 必须被父 scope 覆盖（覆盖判断是保守的：通配的子 scope 只接受 `前缀*` 形式的父 scope）。
+- `capability.CapabilityDescriptor`：工具的统一描述——id（`local.<name>`，以后是 `mcp.<server>.<tool>`）、风险等级（read / write / external / destructive）、输出是否不可信、schema 哈希（P2 做 MCP schema pinning 用）。
+- `authz.PolicyEngine`：规则是数据（JSON），条件来自固定的小函数库（`arg_prefix`、`arg_in`、`arg_host_in`、`context_tainted`，可取反），与 `policy.py` 同样的思路：策略能组合、不能写代码。每个条件都是（身份、能力、参数、上下文是否被污染）的纯函数，所以 replay 能复现、以后也能离线对历史 trace 重新判决。策略内容哈希成 `policy_version`，每条决策都带着它。
+- `access.AccessControl`：挂在 `registry.access`（和 `registry.policy` 同一个位置，理由也一样：所有构造 AgentRunner 的路径都会带上它）。
+
+**几个设计点**：
+
+1. **决策顺序**：scope 之外直接拒绝 → 有 deny 就拒（deny 优先）→ 没有 allow 就拒（默认拒绝）→ 有 require_approval 就要审批 → 否则放行。
+2. **require_approval 只是叠加在授权之上的义务，本身不授权。** 这一条是测试抓出来的真 bug：最初的实现里"上下文被污染后，所有 external 能力都要审批"这条规则（作用域是 `*`）本身就算一次授权——一个**完全没有邮件权限**的 agent 只要先读一个网页，`send_email` 就会进入审批队列、被人点一下就执行了。规则越宽，越会把"加一道门"变成"开一扇门"。现在只有 allow 授权，审批规则不能单独生效；回归测试固定了这一点。
+3. **按批预授权**：同一轮里的所有调用先全部判决、再执行任何一个。只要有一个需要审批且尚未批准，整步一个都不执行，run 以 `awaiting_approval` 状态停下。这一步的 intent checkpoint 在判决之前已经落盘，所以审批通过后 `Coordinator.requeue()` 把任务放回队列，worker 按崩溃恢复的同一条路径续跑：重放这一步**已记录的动作**（不重新问模型），按 `(run, action_id, tool, args)` 找到审批记录，执行。审批不需要新的挂起机制，就是"在 checkpoint 处暂停"的又一个理由。被暂停那一次的 authz 事件和 run_end 在续跑时随 torn-write 截断一起丢弃，最终 trace 的 seq 连续、只有一个 run_end（测试断言）。
+4. **看不到的能力，和不存在的工具回答得一模一样。** 模型只会被展示它可能被允许用的工具（上下文里的最小权限）；如果它还是调了一个隐藏工具（猜的，或被注入诱导的），返回的错误类别和措辞与随口编的工具名完全相同，不泄露"这个工具存在但你没权限"。真实原因只写在审计事件里。注意 registry 原本的"未知工具"错误会列出**所有**已注册工具，在访问控制模式下这本身就是泄露，所以由 AccessControl 只列可见工具。
+5. **Fail closed**：registry 带访问控制但配置里没有 principal → 直接以 `access_denied` 结束，一个工具都不执行；catalog 建好之后才注册进 registry 的工具不可调用、也不可见。
+6. **路径前缀先规范化再比较**：`/workspaces/t1/../t2/x` 不算在 t1 下面，`/workspaces/t10/` 也不算在 `/workspaces/t1/` 下面（按路径段比较，不是字符串前缀）。前缀可以用 `${tenant_id}` 等身份变量，所以一条规则就能表达所有租户的隔离。
+7. **replay 同时验证访问控制**：每条决策都是一个 `authz` 事件。策略不变时 replay 逐字节一致；把租户隔离规则删掉再 replay，原来的 deny 变成 allow，replay 失败——策略变更会表现为"这个 run 不能复现"，而不是悄悄改变行为。这是 P5"用新策略回放历史 trace、输出差异报告"的基础。
+
+**测试**（`tests/test_platform.py`，33 个，全部离线、零 API）：引擎语义（默认拒绝、deny 优先、审批不授权、scope、URL host 匹配的边界如 `docs.example.com.evil.net`、条件校验、版本哈希）；loop 里的威胁场景（隐藏工具与未知工具不可区分、8 个路径/租户组合、子 agent scope、无身份 fail closed、后注册工具、被污染后无授权 agent 被拒而不是进审批队列）；完整的审批流程（worker → 暂停 → 人工批准/拒绝 → requeue → 续跑，模型调用次数不变）；replay。另外做了三个变异检查确认测试真的会失败：去掉路径规范化（1 个失败）、审批不暂停（2 个）、拒绝后仍执行（10 个）。
+
+**还没做的（P0 范围之外）**：审批存储只有进程内实现，多 worker 需要共享存储（接口很小：get / request / decide）；MCP 网关、Skill manifest 与版本发布、配额、沙箱分别是 P1–P4；`awaiting_approval` 的 run 用 fork 续跑时 run_id 不同，审批记录不匹配（按设计，审批只对同一个 run 有效）。
 
 ## 已知局限（诚实版）
 

@@ -18,6 +18,7 @@ Most agent frameworks make it easy to *run* an agent and hard to answer the ques
 - **Real multi-turn episodes inside the runtime** — τ-bench's LLM user simulator is part of the env snapshot, so real conversations can be replayed and forked like any other run.
 - **Gated self-improvement (Evolve)** — failures are clustered, filtered for reproducibility with null forks, an LLM proposes context edits, and an edit ships only after proving an effect on held-out failures *and* no harm on tasks it never saw. Model weights never change.
 - **Policy checks (rules → code)** — mechanical policies (explicit yes before a write, act only for the authenticated user, look an order up before changing it) run as declarative checks before a tool executes; a blocked call never runs and the agent gets the reason back. Checks are backtested on recorded traces with zero API calls before Evolve spends any episode on them.
+- **Access control for multi-tenant agents** — every tool call passes one enforcement point: a default-deny policy engine over tenant, roles, scopes and risk level, with argument-level conditions (tenant-scoped paths, host allowlists) and escalation to human approval once the context has taken in untrusted content. Approval pauses the run at its checkpoint and resumes it after a human decides; every decision is a trace event, so replay re-checks enforcement too.
 - **Skill library** — procedures induced from *successful* episodes (one LLM call per task type), shown to the agent as a one-line index and loaded on demand with `load_skill`, so the trace records when a skill was used. The whole library is gated as one version against the incumbent's freshly measured rate on held-out failures.
 - **Compounding without regressing** — regression memory (every task an accepted version fixed is re-checked by every later gate), consolidation by ablation (a learned item is removed when dropping it costs nothing on the fixes it is remembered for), and a meta level: the proposer's *lessons* are rewritten from the ledger history and adopted only if they produce more screened-in candidates than the old lessons on the same clusters. The gate itself is never editable by the loop.
 - **Red-teamed against its own judge** — a catalogue of specification-gaming attacks (hard-coded answers, real customer names, instruction overrides, grader talk, switching off confirmation, output stuffing, gaming lessons) is replayed by `scripts/redteam_evolve.py`; every one is stopped by offline validation, the backtest, or two new gate monitors (output stuffing; per-check policy-compliance replay, which catches paraphrased attacks that pass every regex). The judge's code and settings are fingerprinted in the ledger, and any change needs a recorded human reason.
@@ -233,6 +234,7 @@ Connection strings can be overridden with `REWIND_PG_DSN` and `REWIND_REDIS_URL`
 - **A targeted gate, not a whole-pool superiority test.** At a ~90% baseline a 9-task cluster moves pass^1 by ~2.5 pt — below what one trial over ~190 tasks can resolve — and a no-op re-run already "breaks" several passing tasks. So the gate asks separate questions: is there an effect on held-out targets (Fisher test), and is there no harm elsewhere?
 - **Calibrate the gate against noise before trusting its verdicts.** My first safety rule ("drop ≤ 2 pt") looked reasonable and rejected the first real edit; simulating harmless edits showed it rejects ~1 in 5 of them. The replacement re-runs only the flipped tasks and asks whether the breakage reproduces — the same stable-vs-flaky idea as the stability filter. A first version of that rule was itself miscalibrated (13% false rejections on coin-flip tasks) and was tightened after simulation.
 - **Ports between layers, enforced by a test.** Evolve receives the benchmark the same way it receives an LLM provider: as an explicit dependency typed by a Protocol. Result rows have a written, validated contract (`ResultRow`), and a benchmark that breaks it is rejected when it produces the row, not three modules later. The kernel asks an env for capabilities (`isinstance(env, DialogueEnv)`) instead of probing attribute names, and both coordination backends implement one async `CoordinatorStore`, so there is a single calling convention.
+- **An approval rule is an obligation, not a grant.** The first version let a broad "external calls need approval once the context is tainted" rule count as permission: an agent with no email rights could get `send_email` queued for approval just by reading a web page first. Only `allow` grants now; `require_approval` can only add a gate on top of one. A capability the principal cannot see is answered exactly like a made-up tool name.
 - **Rules must say when they apply.** Every learned rule carries a trigger and is written as "When …: …"; a rule about one tool must be a note on that tool. Blanket instructions are refused before any episode is spent.
 
 ## Project layout
@@ -251,6 +253,7 @@ src/rewind/
   flywheel/                           failure classification, attribution, data flywheel
   env/                                toy retail env; τ-bench plugin (adapter, dialogue env, failure
                                         classifier, TauBenchRetail benchmark)
+  platform/                           access control: principals, capability catalog, policy engine, approvals
   evolve/                             self-improvement: surface, prevalence, stability, proposer, screen, gate, feedback, ledger, loop
 viewer/index.html                     offline viewer: rounds, versions, gate decisions, side-by-side episode comparison
 scripts/                              experiments, τ-bench runs and comparisons, CI entry points
@@ -274,6 +277,7 @@ Module docstrings refer to the milestones the project was built in:
 | Evolve P0 | τ-bench user simulator inside the runtime, fork fidelity, null-fork calibration |
 | Evolve P1 | Gated self-improvement loop and its first real round |
 | Layering | Ports between layers (environment, coordination, benchmark, result rows), enforced by `tests/test_layering.py` |
+| Platform P0 | Multi-tenant access control in front of every tool call; approval as a checkpoint pause |
 
 ## Limitations
 

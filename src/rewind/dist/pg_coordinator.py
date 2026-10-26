@@ -175,3 +175,11 @@ class PgCoordinator:
                 "  AND status='LEASED'",
                 status, json.dumps(result or {}), job_id, fencing_token)
             return _rowcount(st) > 0
+
+    async def requeue(self, job_id: str, from_status: str = "awaiting_approval") -> bool:
+        """See `CoordinatorStore.requeue`."""
+        async with self.pool.acquire() as conn:
+            st = await conn.execute(
+                "UPDATE jobs SET status='PENDING', lease_owner=NULL, lease_expires_at=NULL "
+                "WHERE job_id=$1 AND status=$2", job_id, from_status)
+            return _rowcount(st) > 0

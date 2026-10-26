@@ -48,6 +48,10 @@ class AgentConfig:
     # failures as "Error: <msg>"); defaults keep rewind's native behaviour
     single_tool_call: bool = False
     tool_error_format: str = "ERROR[{cls}]: {msg}"
+    # Who this run acts as (rewind.platform.Principal, JSON form). Only read
+    # when the registry carries an AccessControl; kept in the config so the
+    # identity is recorded in run_start and replay/fork/resume rebuild it.
+    principal: dict | None = None
 
 
 @dataclass
@@ -102,11 +106,15 @@ class AgentRunner:
     async def run(self, env: Environment, task: str, trace: TraceWriter) -> RunResult:
         messages = [{"role": "system", "content": self.cfg.system_prompt},
                     {"role": "user", "content": task}]
-        trace.emit("run_start", 0, {
+        start = {
             "task": task, "cfg": asdict(self.cfg),
             "initial_env_hash": self.snapshots.put(env.snapshot()),
             "has_fallback": self.fallback is not None,
-        })
+        }
+        access = getattr(self.registry, "access", None)
+        if access is not None:
+            start["access_policy_version"] = access.version
+        trace.emit("run_start", 0, start)
         for m in messages:
             trace.emit("message", 0, {"message": m})
         return await self._loop(env, messages, LoopState(), 1, trace, None)
@@ -129,9 +137,17 @@ class AgentRunner:
         rng = random.Random(int(sha(trace.run_id)[7:19], 16))
         t0 = self.clock.perf()
         tools = self.registry.schemas()
+        access, principal = self._access()
+        if access is not None and principal is not None:
+            # Least privilege for the context window: the model is only shown
+            # capabilities it could be allowed to use. Enforcement itself is
+            # per call, in _authorize_batch.
+            tools = access.filter_schemas(principal, tools)
         status, reason, final_text = "completed", None, None
         last_step = step - 1
         try:
+            if access is not None and principal is None:
+                raise RunAbort("access_denied", "registry has access control but the config has no principal")
             while True:
                 if step > cfg.max_steps:
                     raise RunAbort("budget_exceeded", "max_steps")
@@ -399,10 +415,12 @@ class AgentRunner:
         indexed = list(enumerate(resp.tool_calls))
         readonly = [(i, c) for i, c in indexed if not self.registry.is_mutating(c.name)]
         mutating = [(i, c) for i, c in indexed if self.registry.is_mutating(c.name)]
+        denied = self._authorize_batch(resp, step, pre_tool_messages, trace)
 
         if len(readonly) >= 2:
             results = await asyncio.gather(
-                *(self._tool_step(env, c, step, i, state, trace, rng, pre_tool_messages) for i, c in readonly))
+                *(self._tool_step(env, c, step, i, state, trace, rng, pre_tool_messages, denied.get(i))
+                  for i, c in readonly))
             for (i, _c), outcome in zip(readonly, results):
                 outcomes[i] = outcome
             self.debug_hook("after_readonly_batch", step)
@@ -411,20 +429,61 @@ class AgentRunner:
                                              action=resp, point=point)
         else:
             for i, c in readonly:
-                outcomes[i] = await self._tool_step(env, c, step, i, state, trace, rng, pre_tool_messages)
+                outcomes[i] = await self._tool_step(env, c, step, i, state, trace, rng, pre_tool_messages,
+                                                   denied.get(i))
                 if self.checkpointer is not None:
                     await self.checkpointer.save("tool", step, trace, env, point.messages, point.state,
                                                  action=resp, point=point)
                 self.debug_hook("after_tool_call", step)
 
         for i, c in mutating:
-            outcomes[i] = await self._tool_step(env, c, step, i, state, trace, rng, pre_tool_messages)
+            outcomes[i] = await self._tool_step(env, c, step, i, state, trace, rng, pre_tool_messages,
+                                                   denied.get(i))
             if self.checkpointer is not None:
                 await self.checkpointer.save("tool", step, trace, env, point.messages, point.state,
                                              action=resp, point=point)
             self.debug_hook("after_tool_call", step)
 
         return outcomes
+
+    def _access(self):
+        """(AccessControl, Principal) when access control is on, else (None, None)."""
+        access = getattr(self.registry, "access", None)
+        if access is None:
+            return None, None
+        if not self.cfg.principal:
+            return access, None
+        from .platform.identity import Principal   # local import: keeps the loop free of a hard dependency
+        return access, Principal.model_validate(self.cfg.principal)
+
+    def _authorize_batch(self, resp: LLMResponse, step: int, history: list[dict],
+                         trace: TraceWriter) -> dict[int, ToolOutcome]:
+        """Decide every call of this turn BEFORE any of them runs. Each
+        decision becomes an `authz` event. Calls that may not run come back
+        as ready-made error outcomes keyed by index (a hidden capability is
+        answered exactly like an unknown tool). If any call needs a human
+        approval that has not been granted yet, nothing in the step runs: the
+        run stops with status `awaiting_approval`. The intent checkpoint for
+        this step is already durable, so a resumed run redoes this same
+        recorded action, finds the grant, and continues -- approval is just
+        another reason to pause at a checkpoint."""
+        access, principal = self._access()
+        if access is None:
+            return {}
+        denied: dict[int, ToolOutcome] = {}
+        pending: list[str] = []
+        for i, c in enumerate(resp.tool_calls):
+            v = access.check(principal, trace.run_id, f"s{step}:c{i}", c.name, c.args, history)
+            trace.emit("authz", step, {"call_id": c.id, "idx": i, "name": c.name, **v.to_event()})
+            if v.verdict == "pending_approval":
+                pending.append(v.approval_key)
+            elif v.verdict == "deny":
+                denied[i] = ToolOutcome(False, v.message, "ACCESS_DENIED")
+            elif v.verdict in ("hidden", "unknown"):
+                denied[i] = ToolOutcome(False, v.message, "HALLUCINATED_TOOL")
+        if pending:
+            raise RunAbort("awaiting_approval", ",".join(pending))
+        return denied
 
     def _policy_block(self, env, call: ToolCall, step: int, history: list[dict] | None,
                       trace: TraceWriter) -> ToolOutcome | None:
@@ -446,7 +505,8 @@ class AgentRunner:
         return blocked
 
     async def _tool_step(self, env, call: ToolCall, step: int, idx: int, state: LoopState,
-                         trace: TraceWriter, rng, history: list[dict] | None = None) -> ToolOutcome:
+                         trace: TraceWriter, rng, history: list[dict] | None = None,
+                         denied: ToolOutcome | None = None) -> ToolOutcome:
         cfg = self.cfg
         args_hash = sha(call.args)
         n = state.bump_call(call.name, args_hash)
@@ -467,6 +527,8 @@ class AgentRunner:
             outcome = ToolOutcome(
                 False, f"you have called {call.name} with identical arguments {n} times. "
                        "Change your approach or give a final answer.", "LOOP_DETECTED")
+        elif denied is not None:
+            outcome = denied                       # access control said no: never executed
         elif (blocked := self._policy_block(env, call, step, history, trace)) is not None:
             outcome = blocked
         else:
