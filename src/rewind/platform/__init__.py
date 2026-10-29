@@ -19,6 +19,8 @@ P0 of the platform plan -- one enforcement point in front of every tool call:
                              capabilities), candidate/stable channels, gated
                              promotion, rollback + yank; bind_skills offers a
                              principal only what it may load, pinned per run
+  whatif.what_if             re-judge recorded runs under a new policy, no
+                             model calls; fork to confirm a divergence
   mcp_gateway.McpGateway     third-party MCP servers as governed capabilities:
                              namespacing, definition pinning, risk floors,
                              secrets, reconnects (import it directly; needs

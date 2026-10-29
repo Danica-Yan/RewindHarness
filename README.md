@@ -21,6 +21,7 @@ Most agent frameworks make it easy to *run* an agent and hard to answer the ques
 - **Access control for multi-tenant agents** — every tool call passes one enforcement point: a default-deny policy engine over tenant, roles, scopes and risk level, with argument-level conditions (tenant-scoped paths, host allowlists) and escalation to human approval once the context has taken in untrusted content. Approval pauses the run at its checkpoint and resumes it after a human decides; every decision is a trace event, so replay re-checks enforcement too.
 - **Quotas that hold under concurrency and crashes** — per tenant / user / agent / run limits, charged all-or-nothing in one conditional Postgres `UPDATE` (20 workers racing for 5 units: exactly 5 win) and exactly once per action, so a worker that crashed after charging is never charged again on resume. Replay serves recorded quota outcomes instead of touching the store.
 - **MCP gateway** — third-party MCP servers (stdio or Streamable HTTP) become governed capabilities under the same access rules, quotas and approvals as local tools. Only tool definitions an admin approved are exposed, pinned by a fingerprint of everything the model reads; a definition that changes later is quarantined — re-verified on every reconnect, so a server killed and restarted with new tool text is refused from its first call. Server risk annotations can raise risk, never lower it. Secrets reach only their server. Replay serves recorded MCP results and never calls a server.
+- **Policy what-if before a change ships** — every access decision is a pure function of what the trace records, so a new policy is re-judged on every recorded run with no model calls: which executed writes it would block or send for approval, which blocked calls it would let through, which runs it would interrupt. Only the first change in a run is a clean answer; the fork confirms it — on the test corpus, the live decision matched the offline prediction for 15/15 first divergences. `scripts/policy_diff.py --fail-on loosened` turns it into a CI check on policy pull requests.
 - **Sandboxed tool code** — tenant- or agent-written code runs in a container with no network interface but loopback, a read-only root, an unprivileged user with no capabilities, memory/CPU/process limits and a timeout, and only the calling tenant's workspace mounted. Pre-started containers are single-use, so warm calls never share state. Secrets go to one call by name, never through argv or the container config. Each attack (network, writes, memory bomb, fork bomb, infinite loop, cross-tenant read) has a test that runs it in a real container.
 - **Skill release management** — skills as immutable versions with a manifest of the capabilities they require; candidate/stable channels with gated promotion (static checks, plus a quality gate such as Evolve's statistical one), rollback with yank, and an append-only audit log. A skill is offered to an agent only if policy allows it and the agent could use everything it requires; each run is pinned to exact versions, so a later release never changes what a run — or its replay — saw.
 - **Skill library** — procedures induced from *successful* episodes (one LLM call per task type), shown to the agent as a one-line index and loaded on demand with `load_skill`, so the trace records when a skill was used. The whole library is gated as one version against the incumbent's freshly measured rate on held-out failures.
@@ -44,6 +45,7 @@ Most agent frameworks make it easy to *run* an agent and hard to answer the ques
 | **Quota charging** — 2000 charges, 20 workers, local Postgres on 2 vCPUs | ~1.5k charges/s spread over buckets; ~620/s on one hot bucket (p99 ~110 ms, row-lock serialisation) |
 | **MCP gateway** — demo server, 300 calls per transport | p50 1.1 ms in-process, ~2 ms stdio, ~3.4 ms Streamable HTTP; after a real `kill -9`, recovery p50 ~0.7 s (≈ the server's own cold start) |
 | **Sandboxed tool call** — local Docker, 2 vCPUs | p50 ~260 ms with a fresh container per call; ~130 ms from the single-use warm pool when calls have think time between them (~185 ms back-to-back) |
+| **Policy what-if** — 2202 recorded runs, 4503 calls, 15.4 MB of traces | ~20k calls/s in memory, ~9k/s parsing JSONL (whole corpus in ~0.5 s); 15/15 first divergences confirmed by live forks |
 | **Postgres claim query** — 50k historical rows | 8.2 ms seq scan → 0.046 ms with a partial index (~180×), asserted from `EXPLAIN` |
 | **Attribution accuracy** — synthetic ground truth, 5 root-cause positions | 100% exact match, 2.4 oracle calls on average |
 | **Same benchmark inside rewind** — τ-bench test, 3 trials, rewind loop vs τ-bench's own `run.py` | pass^1 73.3% vs 72.2%, 95% CI [−3.5%, +5.8%]: indistinguishable (two `run.py` runs differ by [−8.4%, +5.5%]) |
@@ -265,7 +267,7 @@ src/rewind/
                                         classifier, TauBenchRetail benchmark)
   flywheel/                           failure classification, attribution, data flywheel, τ-bench failure analysis
   env/                                offline toy retail env, τ-bench adapter, real multi-turn τ-bench episodes
-  platform/                           access control (principals, capabilities, policy engine, approvals), quotas, MCP gateway, skill registry, container sandbox
+  platform/                           access control (principals, capabilities, policy engine, approvals), quotas, MCP gateway, skill registry, container sandbox, policy what-if
   evolve/                             self-improvement: surface, prevalence, stability, proposer, screen, gate, feedback, ledger, loop
 viewer/index.html                     offline viewer: rounds, versions, gate decisions, side-by-side episode comparison
 scripts/                              experiments, τ-bench runs and comparisons, CI entry points
@@ -294,6 +296,7 @@ Module docstrings refer to the milestones the project was built in:
 | Platform P2 | MCP gateway: definition pinning, risk floors, secrets, reconnects; external results recorded for replay |
 | Platform P3 | Skill registry: manifests, gated release, rollback/yank, load-time authorisation, per-run version pins |
 | Platform P4 | Container sandbox for untrusted tool code; per-call caller context; idempotency keys on MCP calls |
+| Platform P5 | Offline what-if of a policy change over recorded runs; fork confirmation; CI check |
 
 ## Limitations
 

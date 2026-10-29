@@ -29,7 +29,7 @@ from .authz import AuthzContext, Decision, PolicyEngine
 from .capability import CapabilityCatalog, CapabilityDescriptor
 from .identity import Principal
 
-Verdict = Literal["allow", "deny", "hidden", "unknown", "pending_approval"]
+Verdict = Literal["allow", "deny", "hidden", "unknown", "pending_approval", "require_approval"]
 
 
 # ---------------------------------------------------------------------------
@@ -146,34 +146,45 @@ class AccessControl:
                 return True
         return False
 
-    def check(self, principal: Principal, run_id: str, action_id: str, name: str,
-              args: dict, history: list[dict]) -> CallVerdict:
+    def evaluate(self, principal: Principal, name: str, args: dict, history: list[dict]) -> CallVerdict:
+        """The policy's answer for one call, with no side effects: never reads
+        or writes the approval store. Verdict is unknown / hidden / allow /
+        deny / require_approval. `check` builds on it; offline re-evaluation
+        of recorded traces (platform/whatif.py) uses it directly."""
         if name in self.meta_tools:
             return CallVerdict("allow", None, None, extra={"meta": True})
         cap = self.catalog.resolve(name)
+        tainted = self.tainted(history)
         if cap is None or not self.engine.visible(principal, cap):
             shown = ", ".join(sorted(self.visible_names(principal)))
             return CallVerdict("unknown" if cap is None else "hidden", cap,
                                None if cap is None else self.engine.decide(
-                                   AuthzContext(principal, cap, args or {}, self.tainted(history))),
+                                   AuthzContext(principal, cap, args or {}, tainted)),
                                message=f"unknown tool '{name}'. Available tools: {shown}")
-        tainted = self.tainted(history)
         d = self.engine.decide(AuthzContext(principal, cap, args or {}, tainted))
         extra = {"tainted": tainted}
-        if d.effect == "allow":
-            return CallVerdict("allow", cap, d, extra=extra)
         if d.effect == "deny":
             return CallVerdict("deny", cap, d, extra=extra,
                                message=f"permission denied: this agent may not call {name}"
                                        + (" with these arguments" if d.reason.startswith("rule:") else ""))
+        return CallVerdict(d.effect, cap, d, extra=extra)       # allow / require_approval
+
+    def check(self, principal: Principal, run_id: str, action_id: str, name: str,
+              args: dict, history: list[dict]) -> CallVerdict:
+        """`evaluate`, plus resolving require_approval against the approval
+        store (and filing a request when there is none yet)."""
+        v = self.evaluate(principal, name, args, history)
+        if v.verdict != "require_approval":
+            return v
+        cap, d = v.capability, v.decision
         key = approval_key(run_id, action_id, name, args or {})
         req = self.approvals.get(key)
         if req is not None and req.status == "granted":
-            return CallVerdict("allow", cap, d, key, extra={**extra, "approved_by": req.decided_by})
+            return CallVerdict("allow", cap, d, key, extra={**v.extra, "approved_by": req.decided_by})
         if req is not None and req.status == "rejected":
-            return CallVerdict("deny", cap, d, key, extra={**extra, "rejected_by": req.decided_by},
+            return CallVerdict("deny", cap, d, key, extra={**v.extra, "rejected_by": req.decided_by},
                                message=f"a human reviewer rejected this call to {name}; "
                                        "do not retry it, tell the user")
         self.approvals.request(ApprovalRequest(key, run_id, action_id, cap.id, dict(args or {}),
                                                principal.model_dump(mode="json")))
-        return CallVerdict("pending_approval", cap, d, key, extra=extra)
+        return CallVerdict("pending_approval", cap, d, key, extra=v.extra)
