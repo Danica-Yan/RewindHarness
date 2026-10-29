@@ -20,6 +20,7 @@ Most agent frameworks make it easy to *run* an agent and hard to answer the ques
 - **Policy checks (rules → code)** — mechanical policies (explicit yes before a write, act only for the authenticated user, look an order up before changing it) run as declarative checks before a tool executes; a blocked call never runs and the agent gets the reason back. Checks are backtested on recorded traces with zero API calls before Evolve spends any episode on them.
 - **Skill library** — procedures induced from *successful* episodes (one LLM call per task type), shown to the agent as a one-line index and loaded on demand with `load_skill`, so the trace records when a skill was used. The whole library is gated as one version against the incumbent's freshly measured rate on held-out failures.
 - **Compounding without regressing** — regression memory (every task an accepted version fixed is re-checked by every later gate), consolidation by ablation (a learned item is removed when dropping it costs nothing on the fixes it is remembered for), and a meta level: the proposer's *lessons* are rewritten from the ledger history and adopted only if they produce more screened-in candidates than the old lessons on the same clusters. The gate itself is never editable by the loop.
+- **Red-teamed against its own judge** — a catalogue of specification-gaming attacks (hard-coded answers, real customer names, instruction overrides, grader talk, switching off confirmation, output stuffing, gaming lessons) is replayed by `scripts/redteam_evolve.py`; every one is stopped by offline validation, the backtest, or two new gate monitors (output stuffing; per-check policy-compliance replay, which catches paraphrased attacks that pass every regex). The judge's code and settings are fingerprinted in the ledger, and any change needs a recorded human reason.
 
 > The Python package is named `rewind`, so the CLI and imports use that name.
 
@@ -42,6 +43,7 @@ Most agent frameworks make it easy to *run* an agent and hard to answer the ques
 | **Null-fork calibration** — 20 parents × 4 fork points × 5 continuations | passing parents re-pass 86–96%; failing parents split into *stable* failures (≤1/5 pass) and *flaky* ones (mostly pass) — only stable ones are worth an edit |
 | **Evolve, first real edit** — LLM-written rule on train (v0 pass^1 89.5%) | proven effect on 3 held-out stable failures (0/15 → 6/15, Fisher p = 0.008). First rejected by the original safety rule (188 unseen tasks, −3.7 pt, 12 broken vs 5 fixed); that rule turned out to be miscalibrated (next row). Re-gated with flip confirmation: **0 of 12 regressions and 0 of 5 fixes reproduce** on re-runs under both versions, so the pool flips were run-to-run noise. **Accepted as v1**, the first edit to pass the gate |
 | **Gate audit** — simulated harmless edits, per-task flakiness fitted to the null-fork data | the "≤ 2 pt drop" rule rejected 18–24% of harmless edits. Replaced by flip confirmation (re-run flipped tasks under both versions): ~3% false rejections, ~99% power against 5 truly broken tasks |
+| **Red team** — 10 gaming attacks against the loop | before: 3/10 stopped; after: 10/10 (offline validation, backtest, lesson filter, gate monitors); a paraphrased "skip confirmation" rule passes every regex but is caught by the policy-compliance monitor (12/18 → 18/18 violations at equal reward) |
 
 The τ-bench evaluation and the Evolve gate are the parts I would point to first: the obvious single-run story ("my patch improved pass^1 by 2 points") turned out not to hold up once the noise floor was measured. The full write-up is in the [dev log](docs/DEVLOG.zh-CN.md).
 
@@ -173,6 +175,9 @@ python scripts/run_evolve.py regate                                    # re-deci
 python scripts/run_evolve.py consolidate                               # does each learned item still earn its place?
 python scripts/run_evolve.py reflect                                   # 1 LLM call: proposed proposer lessons
 python scripts/run_evolve.py meta-eval                                 # adopt them only if they beat the old ones
+python scripts/run_evolve.py report                                    # funnel, cost per accepted edit, what each stage saved (no API)
+python scripts/redteam_evolve.py                                      # replay the gaming attacks (no API)
+python scripts/gate_simulation.py                                     # reproduce the gate audit (no API)
 python scripts/backtest_checks.py --results runs/p1/train_base.json --store-dir runs/p1/snapshots  # where policy checks would fire (no API)
 python scripts/induce_skills.py plan --base runs/p1/train_base.json      # skill groups + cost of induce/gate (no API)
 python scripts/export_viewer.py --run-dir runs/p1                      # free: then open viewer/index.html

@@ -57,6 +57,8 @@ def main() -> None:
     ap.add_argument("--model", default="deepseek-chat")
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--yes", action="store_true")
+    ap.add_argument("--accept-judge-change", metavar="REASON",
+                    help="gate code/settings changed on purpose: record why and continue")
     a = ap.parse_args()
 
     run = Path(a.run_dir)
@@ -146,6 +148,11 @@ def main() -> None:
         return
 
     # gate
+    from rewind.evolve import integrity
+    try:
+        integrity.verify(led, cfg, a.accept_judge_change)
+    except integrity.JudgeChanged as e:
+        sys.exit(str(e))
     if not cand_path.exists():
         sys.exit(f"no candidates at {cand_path}: run `induce` first")
     edits = [Edit.model_validate(c["edit"]) for c in json.loads(cand_path.read_text(encoding="utf-8"))

@@ -166,3 +166,37 @@ def test_overturned_rejections_teach_nothing(setup):
     first = next(x for x in exp if x["reason"].startswith("OVERTURNED"))
     assert first["feedback"] == "" and "did not reproduce" in first["reason"]
     assert "OVERTURNED" in meta.reflect_messages(exp, [])[0]["content"]
+
+
+def test_run_report_accounts_for_the_funnel_and_cost(setup):
+    from rewind.evolve.report import build, report
+    from rewind.evolve.loop import _paths
+    store, ledger, cfg = setup
+    from rewind.evolve.loop import run_round
+    asyncio.run(run_round(cfg, ledger, provider=FakeAgent(), user_llm=fake_user, store=store,
+                          proposer=FakeProposer([rule("poison", f"You must {POISON}."),
+                                                 rule("leaky", "For #W1234567 do an exchange."),
+                                                 rule("exchange_confirm", GOOD)]), log=lambda m: None))
+    r = build(ledger, _paths(cfg)["stability"])
+    assert r["proposed"] == 3 and r["accepted"] == 1
+    assert r["funnel"] == {"gate: passed": 1, "invalid: stopped": 1, "screen: stopped": 1}
+    e = r["episodes"]
+    assert e["stability"] > 0 and e["screening"] > 0 and e["gate"] > 0
+    assert e["total"] == r["per_accepted_edit"] == sum(v for k, v in e.items() if k != "total")
+    md = report(ledger, cfg)
+    assert "per accepted edit" in md and "screening" in md and "1 candidates stopped before the gate" in md
+
+
+def test_gate_simulation_reproduces_the_audit():
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        "gate_simulation", Path(__file__).resolve().parents[1] / "scripts" / "gate_simulation.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    r = mod.sim(pool=188, runs=400, broken=5, seed=1)
+    h, b = r["harmless"], r["broken"]
+    assert h["old: drop > 2 pt"] / 400 > 0.12                     # the miscalibrated rule
+    assert h["confirm all, k=2 (used)"] / 400 < 0.06              # the rule in use
+    assert b["confirm all, k=2 (used)"] / 400 > 0.95
+    assert h["confirm any, k=2"] > h["confirm all, k=2 (used)"] > h["confirm all, k=3"]

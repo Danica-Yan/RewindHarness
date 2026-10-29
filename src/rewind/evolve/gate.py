@@ -116,6 +116,7 @@ class GateVerdict(BaseModel):
     confirmed_fixes: list[int] = []
     confirm_episodes: int = 0
     regression_check: dict | None = None
+    monitors: list[dict] | None = None
     rows_path: str
 
 
@@ -228,7 +229,8 @@ async def gate(candidate: ContextVersion, incumbent_rows: list[dict], pool: list
                concurrency: int = 4, log: Callable[[str], None] = print,
                incumbent: ContextVersion | None = None,
                prior_efficacy: Efficacy | None = None,
-               regression_suite: list[tuple[int, str]] = ()) -> GateVerdict:
+               regression_suite: list[tuple[int, str]] = (),
+               monitors: Callable[[list[dict], list[dict]], list[dict]] | None = None) -> GateVerdict:
     """`incumbent` enables flip confirmation (re-runs under the incumbent);
     `prior_efficacy` reuses an efficacy result instead of re-running it
     (re-gating a candidate under a revised policy)."""
@@ -284,7 +286,13 @@ async def gate(candidate: ContextVersion, incumbent_rows: list[dict], pool: list
     conf_fixes: list[int] = []
     conf_eps = 0
     harmful = stopped or ci[1] < 0
-    if not harmful and incumbent is not None and policy.confirm_k > 0 and (regs or imps):
+    mon = None
+    if not harmful and monitors is not None and rows:
+        mon = monitors([r for r in incumbent_rows if r["task_id"] in set(common)], rows)
+        for m in mon:
+            log(f"  monitor {m['name']}: {'FLAG' if m['flagged'] else 'ok'} -- {m['detail']}")
+    flagged = [m for m in (mon or []) if m["flagged"]]
+    if not harmful and not flagged and incumbent is not None and policy.confirm_k > 0 and (regs or imps):
         conf_regs, conf_fixes, conf_eps = await confirm_flips(
             candidate, incumbent, regs, imps, split=split, out=Path(out), k=policy.confirm_k,
             provider=provider, user_llm=user_llm, store=store, concurrency=concurrency, log=log)
@@ -293,7 +301,7 @@ async def gate(candidate: ContextVersion, incumbent_rows: list[dict], pool: list
             f"{len(conf_fixes)}/{len(imps)} fixes reproduce")
 
     reg_chk = None
-    early_reject = harmful or (len(conf_regs) > policy.max_confirmed_regressions) or (
+    early_reject = bool(flagged) or harmful or (len(conf_regs) > policy.max_confirmed_regressions) or (
         policy.regression_budget is not None and len(regs) > policy.regression_budget) or (
         policy.max_drop is not None and policy.mode == "targeted" and delta < -policy.max_drop)
     suite = [s for s in regression_suite if not eff or s[0] not in eff.tasks]
@@ -313,6 +321,9 @@ async def gate(candidate: ContextVersion, incumbent_rows: list[dict], pool: list
     elif len(conf_regs) > policy.max_confirmed_regressions:
         ok, why = False, (f"{len(conf_regs)} confirmed regressions (tasks {conf_regs}) > "
                           f"{policy.max_confirmed_regressions}: the breakage reproduces")
+    elif flagged:
+        ok, why = False, ("possible reward hacking, needs a human look: "
+                          + "; ".join(f"{m['name']} ({m['detail']})" for m in flagged))
     elif reg_chk is not None and not reg_chk["passed"]:
         ok, why = False, (f"breaks remembered fixes: tasks {reg_chk['broken']}" if reg_chk["broken"] else
                           f"worse on remembered fixes: {reg_chk['cand_passes']}/{reg_chk['n']} vs "
@@ -332,7 +343,7 @@ async def gate(candidate: ContextVersion, incumbent_rows: list[dict], pool: list
                     delta=delta, ci=ci, incumbent_pass1=pooled_pass1(sub_inc)[0],
                     candidate_pass1=pooled_pass1(sub_cand)[0], regressions=regs, improvements=imps,
                     episodes=episodes, stopped_early=stopped, confirmed_regressions=conf_regs,
-                    confirmed_fixes=conf_fixes, confirm_episodes=conf_eps, regression_check=reg_chk,
+                    confirmed_fixes=conf_fixes, confirm_episodes=conf_eps, regression_check=reg_chk, monitors=mon,
                     rows_path=str(out))
 
 

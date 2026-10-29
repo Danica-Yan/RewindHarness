@@ -19,6 +19,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from .gate import GatePolicy, gate
+from .monitors import taubench_monitors
 from .ledger import EditLedger
 from .prevalence import PrevalencePolicy, clusters, describe, eligible, evidence_rows
 from .runner import load_rows, version_setup
@@ -349,7 +350,8 @@ async def _try_edits(cfg: EvolveConfig, ledger: EditLedger, round_no: int, inc: 
         out = _paths(cfg)["gate"] / f"v{cand.version}_{e.edit_id}.json"
         v = await gate(cand, rows, pool, split=cfg.split, out=out, provider=provider,
                        user_llm=user_llm, store=store, policy=cfg.gate, targets=targets,
-                       concurrency=cfg.concurrency, log=log, incumbent=inc, regression_suite=suite)
+                       concurrency=cfg.concurrency, log=log, incumbent=inc, regression_suite=suite,
+                       monitors=taubench_monitors(store, cfg.split))
         budget.spend(v.episodes)
         rep.gate = v.model_dump()
         _record_gate(ledger, round_no, inc, e, v, rows, cfg.split)
@@ -495,7 +497,7 @@ async def regate(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, user_l
         v = await gate(cand, rows, pool, split=cfg.split, out=Path(old["rows_path"]), provider=provider,
                        user_llm=user_llm, store=store, policy=cfg.gate, concurrency=cfg.concurrency,
                        log=log, incumbent=inc, prior_efficacy=Efficacy(**old["efficacy"]),
-                       regression_suite=ledger.regression_suite())
+                       regression_suite=ledger.regression_suite(), monitors=taubench_monitors(store, cfg.split))
         _record_gate(ledger, c["round"], inc, e, v, rows, cfg.split,
                      {"regate_of": c["decision_id"]})
         ledger.mark_regated(c["decision_id"])
@@ -558,7 +560,8 @@ async def gate_pending(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, 
         out = _paths(cfg)["gate"] / f"v{cand.version}_{e.edit_id}.json"
         v = await gate(cand, rows, pool, split=cfg.split, out=out, provider=provider, user_llm=user_llm,
                        store=store, policy=cfg.gate, targets=p["targets"],
-                       concurrency=cfg.concurrency, log=log, incumbent=inc, regression_suite=suite)
+                       concurrency=cfg.concurrency, log=log, incumbent=inc, regression_suite=suite,
+                       monitors=taubench_monitors(store, cfg.split))
         budget.spend(v.episodes)
         _record_gate(ledger, p["round"], inc, e, v, rows, cfg.split)
         log(f"  gate: {'ACCEPT' if v.accepted else 'reject'} -- {v.reason}")
@@ -698,7 +701,8 @@ async def gate_skill_library(cfg: EvolveConfig, ledger: EditLedger, edits: list,
     out = gdir / f"v{cand.version}_skills.json"
     v = await gate(cand, inc_rows, pool, split=cfg.split, out=out, provider=provider, user_llm=user_llm,
                    store=store, policy=cfg.gate, concurrency=cfg.concurrency, log=log, incumbent=inc,
-                   prior_efficacy=eff, regression_suite=ledger.regression_suite())
+                   prior_efficacy=eff, regression_suite=ledger.regression_suite(),
+                   monitors=taubench_monitors(store, cfg.split))
     v = v.model_copy(update={"episodes": v.episodes + used})
     data = v.model_dump()
     data["efficacy_rows"] = [str(gdir / f"v{cand.version}_skills_eff_{w}.json") for w in ("incumbent", "candidate")]

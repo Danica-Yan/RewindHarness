@@ -28,7 +28,7 @@ from typing import Any, Awaitable, Callable
 from pydantic import BaseModel
 
 from .ledger import EditLedger
-from .surface import leak_reasons
+from .surface import integrity_reasons, leak_reasons
 
 JsonLLM = Callable[[list[dict]], Awaitable[str]]
 KEY = "proposer_lessons"
@@ -86,7 +86,7 @@ def validate_lessons(xs: Any) -> tuple[list[str], str | None]:
             dropped.append(f"too long: {x[:60]}...")
         elif leak_reasons(x):
             dropped.append(f"case-specific ({', '.join(leak_reasons(x))}): {x[:60]}")
-        elif _GAMING.search(x):
+        elif _GAMING.search(x) or integrity_reasons(x):
             dropped.append(f"about beating the evaluation, not writing edits: {x[:60]}")
         else:
             kept.append(x)

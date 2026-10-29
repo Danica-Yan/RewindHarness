@@ -16,6 +16,8 @@
             history -> <run-dir>/meta/proposed_lessons.json (not adopted yet)
   meta-eval old vs proposed lessons on recorded clusters (validation +
             screening); adopts the proposed lessons only if they win
+  report    funnel, episodes per stage and per accepted edit, and what each
+            filter saved -- NO API calls (--out file.md to save it)
 
 Regression memory: every task an accepted version fixed is re-checked by
 every later gate; `status` lists them (versions from before it existed are
@@ -48,7 +50,7 @@ from rewind.evolve.loop import (  # noqa: E402
     plan, regate, regate_candidates, retry_candidates, retry_cluster, run_round,
 )
 from rewind.evolve import consolidate as consol  # noqa: E402
-from rewind.evolve import meta  # noqa: E402
+from rewind.evolve import integrity, meta  # noqa: E402
 from rewind.evolve.prevalence import PrevalencePolicy  # noqa: E402
 from rewind.evolve.proposer import LLMProposer, deepseek_json_llm  # noqa: E402
 from rewind.evolve.screen import ScreenPolicy  # noqa: E402
@@ -83,7 +85,7 @@ def open_ledger(a: argparse.Namespace) -> EditLedger:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["plan", "round", "status", "rollback", "gate-pending", "retry",
-                                    "regate", "consolidate", "reflect", "meta-eval"])
+                                    "regate", "consolidate", "reflect", "meta-eval", "report"])
     ap.add_argument("--base", help="baseline results json (registered as v0 on first use)")
     ap.add_argument("--run-dir", default="runs/p1")
     ap.add_argument("--store-dir", default="runs/p1/snapshots")
@@ -107,7 +109,10 @@ def main() -> None:
     ap.add_argument("--max-attempts", type=int, default=3, help="retry: proposer batches per cluster")
     ap.add_argument("--regression-k", type=int, default=3, help="forks per remembered fix, per version (0 = off)")
     ap.add_argument("--item", help="consolidate: only this rule/note/check/skill")
+    ap.add_argument("--accept-judge-change", metavar="REASON",
+                    help="the gate/screening code or settings changed on purpose: record why and continue")
     ap.add_argument("--meta-clusters", type=int, default=2, help="meta-eval: clusters to compare on")
+    ap.add_argument("--out", help="report: also write the markdown here")
     ap.add_argument("--regression-budget", type=int, default=None,
                     help="optional hard cap on raw regressions (noisy at high baselines)")
     ap.add_argument("--candidates", type=int, default=3)
@@ -121,9 +126,23 @@ def main() -> None:
     cfg = make_cfg(a)
     if (n := backfill_memory(led, cfg)):
         print(f"regression memory: backfilled {n} fixed task(s) from earlier versions")
+    if a.cmd == "report":
+        from rewind.evolve.report import report
+        md = report(led, cfg)
+        print(md)
+        if a.out:
+            Path(a.out).write_text(md, encoding="utf-8")
+        return
+    if a.cmd not in ("status", "plan", "rollback", "reflect"):
+        try:
+            integrity.verify(led, cfg, a.accept_judge_change)
+        except integrity.JudgeChanged as e:
+            sys.exit(str(e))
     if a.cmd == "status":
         cur = led.current()
         print(f"current version: v{cur.version}")
+        jh = integrity.history(led)
+        print(f"judge: {jh[-1]['id'] if jh else 'not recorded yet'} ({len(jh)} recorded change(s))")
         print(f"regression memory: {[t for t, _ in led.regression_suite()] or 'empty'}")
         print("proposer lessons: " + ("none" if not meta.lessons(led) else ""))
         for x in meta.lessons(led):
