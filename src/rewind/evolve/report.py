@@ -40,7 +40,7 @@ def build(ledger: EditLedger, stability_path: str | Path) -> dict:
         final[d["edit"]["edit_id"]] = d
     funnel = Counter()
     for d in final.values():
-        st = d["stage"]
+        st = d["stage"] + (" (skill library)" if d["edit"].get("kind") == "skill" else "")
         funnel[f"{st}: {'passed' if d['accepted'] else 'stopped'}"] += 1
 
     stab = load_records(stability_path)
@@ -48,7 +48,17 @@ def build(ledger: EditLedger, stability_path: str | Path) -> dict:
     stab_forks = sum(r.n for r in stab.values())
     screen_forks = sum(d["data"].get("forks", 0) for d in ds if d["stage"] == "screen")
     meta_forks = sum(d["data"].get("forks", 0) for d in ds if d["stage"] == "meta_screen")
-    gates = [d for d in ds if d["stage"] == "gate"]
+    # one gate run can be recorded once per edit (a skill library is gated as
+    # ONE version but logged for each of its skills): count each run once
+    gates, seen_runs = [], set()
+    for d in ds:
+        if d["stage"] != "gate":
+            continue
+        key = (d["round"], d["data"].get("rows_path"), d["reason"])
+        if key in seen_runs:
+            continue
+        seen_runs.add(key)
+        gates.append(d)
     gate_eps = sum(d["data"].get("episodes", 0) for d in gates if d["data"].get("regate_of") is None) + \
         sum(d["data"].get("confirm_episodes", 0) for d in gates if d["data"].get("regate_of") is not None)
     abl_eps = sum(d["data"].get("n", 0) * 2 for d in ds if d["stage"] == "ablation")

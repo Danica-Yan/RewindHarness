@@ -200,3 +200,18 @@ def test_gate_simulation_reproduces_the_audit():
     assert h["confirm all, k=2 (used)"] / 400 < 0.06              # the rule in use
     assert b["confirm all, k=2 (used)"] / 400 > 0.95
     assert h["confirm any, k=2"] > h["confirm all, k=2 (used)"] > h["confirm all, k=3"]
+
+
+def test_report_counts_a_library_gate_once(setup):
+    """A skill library is gated as ONE version but recorded once per skill."""
+    from rewind.evolve.report import build
+    from rewind.evolve.loop import _paths
+    from rewind.evolve.surface import Edit
+    store, ledger, cfg = setup
+    data = {"episodes": 80, "n_tasks": 0, "rows_path": "runs/gate/v2_skills.json"}
+    for name in ("a_skill", "b_skill", "c_skill"):
+        e = Edit(kind="skill", target=name, op="add", text="{}", source_cluster="skill:x")
+        ledger.record(1, 0, e, "gate", False, "no proven effect", data, cluster=e.source_cluster)
+    r = build(ledger, _paths(cfg)["stability"])
+    assert r["episodes"]["gate"] == 80
+    assert r["funnel"] == {"gate (skill library): stopped": 3}
