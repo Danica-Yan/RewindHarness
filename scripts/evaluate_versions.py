@@ -7,6 +7,10 @@ versions on a split the loop never saw.
            of a version you already have can be reused with --reuse)
   compare  pass^1 per version, paired bootstrap CI of the change (tasks are
            the resampling unit), and the change by task type -- NO API calls
+  targeted the few tasks where a learned rule's situation actually occurs:
+           fork each from step 1 of a recorded episode, --forks times per
+           version, one-sided Fisher test (the overall score cannot show a
+           narrow rule's effect)
 
 The loop never reads test results: they are written under
 <run-dir>/eval/, which no Evolve command looks at.
@@ -48,7 +52,12 @@ def rows_for(a: argparse.Namespace, v: int) -> list[dict]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["plan", "run", "compare"])
+    ap.add_argument("cmd", choices=["plan", "run", "compare", "targeted"])
+    ap.add_argument("--tasks", type=int, nargs="*", help="targeted: task ids (default: tasks whose gold "
+                    "swaps an item for itself -- the situation the first learned rule targets)")
+    ap.add_argument("--forks", type=int, default=5, help="targeted: forks per task per version")
+    ap.add_argument("--traces-from", help="targeted: results json whose traces to fork from "
+                    "(default: the first --reuse file)")
     ap.add_argument("--versions", type=int, nargs="+", required=True)
     ap.add_argument("--run-dir", default="runs/p1")
     ap.add_argument("--store-dir", default="runs/p1/snapshots")
@@ -94,6 +103,46 @@ def main() -> None:
                                   user_llm=litellm_user_llm(model=a.model, provider="deepseek"),
                                   store=SnapshotStore(a.store_dir), concurrency=a.concurrency,
                                   log=lambda m: print(m, flush=True)))
+        return
+
+    if a.cmd == "targeted":
+        from rewind.env.taubench_dialogue import load_task
+        tasks_t = a.tasks or [i for i in tasks if any(
+            x == y for act in load_task(a.split, i).actions
+            if act.name in ("modify_pending_order_items", "exchange_delivered_order_items")
+            for x, y in zip(act.kwargs.get("item_ids", []), act.kwargs.get("new_item_ids", [])))]
+        src = a.traces_from or (a.reuse_map and next(iter(a.reuse_map.values())))
+        if not src:
+            sys.exit("targeted: give --traces-from <results json with traces>")
+        trace_of = {}
+        for r in sorted(load_rows(src), key=lambda r: r["trial"]):
+            tr = ((r.get("info") or {}).get("rewind") or {}).get("trace")
+            if tr and Path(tr).exists() and r["task_id"] not in trace_of:
+                trace_of[r["task_id"]] = tr
+        targets = [(t, trace_of[t], 0, 0) for t in tasks_t if t in trace_of]
+        missing = [t for t in tasks_t if t not in trace_of]
+        print(f"targeted tasks {[t[0] for t in targets]}" + (f" (no trace on disk: {missing})" if missing else ""))
+        print(f"cost: {len(targets)} tasks x {a.forks} forks x {len(a.versions)} versions = "
+              f"{len(targets) * a.forks * len(a.versions)} episodes")
+        if not targets or not (a.yes or input("run? [y/N] ").strip().lower() == "y"):
+            return
+        from rewind.env.taubench_dialogue import litellm_user_llm
+        from rewind.evolve.gate import GatePolicy, efficacy, fisher_greater
+        from rewind.providers import DeepSeekProvider
+        from rewind.snapshot import SnapshotStore
+        pol = GatePolicy(efficacy_n=a.forks)
+        res = {}
+        for v in a.versions:
+            eff, _ = asyncio.run(efficacy(led.version(v), targets, policy=pol, provider=DeepSeekProvider(model=a.model),
+                                          user_llm=litellm_user_llm(model=a.model, provider="deepseek"),
+                                          store=SnapshotStore(a.store_dir), log=lambda m: print(f"  [v{v}]" + m)))
+            res[v] = eff
+            print(f"v{v}: {eff.cand_passes}/{eff.cand_n} pass on the targeted tasks")
+        b = a.versions[0]
+        for v in a.versions[1:]:
+            p = fisher_greater(res[v].cand_passes, res[v].cand_n, res[b].cand_passes, res[b].cand_n)
+            print(f"v{v} vs v{b}: {res[v].cand_passes}/{res[v].cand_n} vs {res[b].cand_passes}/{res[b].cand_n}, "
+                  f"one-sided Fisher p = {p:.3f}")
         return
 
     # compare
