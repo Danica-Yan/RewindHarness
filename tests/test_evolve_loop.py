@@ -370,3 +370,26 @@ def test_checks_are_backtested_offline_before_any_fork(setup):
     assert all("catches 0 of this cluster" in d["reason"] for d in bt.values())
     assert not [d for d in ledger.decisions() if d["stage"] == "screen"]
     assert rep.version_to is None
+
+
+def test_a_tried_cluster_with_unassessed_failures_is_tried_again_on_new_members(setup):
+    """After `extend`, a cluster name seen before can hold new failures. The
+    next round must assess THOSE (not re-sample known-noisy members by task
+    id), and a cluster whose members are all assessed is not retried."""
+    from rewind.evolve.loop import plan
+    from rewind.evolve.stability import load_records
+    store, ledger, cfg = setup
+    cfg = cfg.model_copy(update={"max_members_per_cluster": 3, "max_clusters_per_round": 1})
+    prop = FakeProposer([rule("poison", f"You must {POISON}.")])
+    asyncio.run(run_round(cfg, ledger, provider=FakeAgent(), user_llm=fake_user, store=store,
+                          proposer=prop, log=lambda m: None))
+    first = {r.task_id for r in load_records(cfg.run_dir + "/stability.json").values()}
+    assert len(first) == 3
+    text = plan(cfg, ledger)
+    assert "unassessed failures sampled" in text
+    asyncio.run(run_round(cfg, ledger, provider=FakeAgent(), user_llm=fake_user, store=store,
+                          proposer=prop, log=lambda m: None))
+    second = {r.task_id for r in load_records(cfg.run_dir + "/stability.json").values()}
+    assert len(second) > len(first)                       # new members were assessed
+    stab = [d for d in ledger.decisions() if d["stage"] == "stability"]
+    assert len(stab) >= 2                                  # the cluster was tried again, not skipped

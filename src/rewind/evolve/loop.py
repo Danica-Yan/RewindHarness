@@ -106,25 +106,64 @@ def _dedupe(cs: list) -> list:
     return out
 
 
+def _round_clusters(cfg: EvolveConfig, inc: Any, pool_rows: list[dict]):
+    """(all cluster stats, eligible clusters worth a round, assessed(task)).
+
+    A cluster is worth (re)trying while some member was never assessed for
+    stability at this version: after `extend` the same cluster key can hold
+    many new failures, and keying "already tried" on the name alone skipped
+    two whole clusters in the first extended round."""
+    from .stability import _key, load_records
+    stats, _ = clusters(pool_rows, cfg.split)
+    cache = load_records(_paths(cfg)["stability"])
+    failed = {}
+    for r in sorted(pool_rows, key=lambda r: (r["task_id"], r["trial"])):
+        if r["reward"] < 1.0:
+            failed.setdefault(r["task_id"], r)
+
+    def assessed(t: int) -> Any:
+        row = failed.get(t)
+        return cache.get(_key(t, row["trial"], inc.version)) if row else None
+    uniq = _dedupe([c for c in stats if eligible(c, cfg.prevalence)[0]
+                    and any(assessed(t) is None for t in c.tasks)])
+    return stats, uniq, assessed
+
+
+def _members(cfg: EvolveConfig, cluster: Any, assessed: Any) -> list[int]:
+    """Every known-stable member (they count without new forks) plus up to
+    `max_members_per_cluster` never-assessed ones. Members already found flaky
+    or unclear are left out: they cannot become stable, and taking members by
+    task id let them crowd new failures out of the sample. Stable failures
+    thus accumulate across rounds until a cluster has enough for an A/B split."""
+    known = [t for t in cluster.tasks if assessed(t) is not None and assessed(t).label == "stable"]
+    new = [t for t in cluster.tasks if assessed(t) is None]
+    return known + new[: cfg.max_members_per_cluster]
+
+
 def plan(cfg: EvolveConfig, ledger: EditLedger) -> str:
     """Worst-case API use of the next round. No API calls."""
     inc = ledger.current()
     rows = load_rows(ledger.rows_path(inc.version))
     shown = ledger.shown()
     pool_rows = [r for r in rows if r["task_id"] not in shown]
-    stats, sigs = clusters(pool_rows, cfg.split)
-    elig = _dedupe([c for c in stats if eligible(c, cfg.prevalence)[0]])[: cfg.max_clusters_per_round]
+    _stats, sigs = clusters(pool_rows, cfg.split)
+    stats, elig, assessed = _round_clusters(cfg, inc, pool_rows)
+    elig = elig[: cfg.max_clusters_per_round]
     lines = [f"incumbent v{inc.version}: {len({r['task_id'] for r in rows})} tasks, "
              f"{len(sigs)} failed in the unseen pool ({len(shown)} tasks already shown)",
              "clusters (* = eligible):", describe(stats, cfg.prevalence), ""]
     worst = 0
     for c in elig:
-        m = min(len(c.tasks), cfg.max_members_per_cluster)
-        st = m * cfg.stability_n
+        mem = _members(cfg, c, assessed)
+        m = len(mem)
+        n_new = sum(assessed(t) is None for t in mem)
+        st = n_new * cfg.stability_n
         b = m // 2
         sc = cfg.n_candidates * b * cfg.screen.n
         worst += st + sc
-        lines.append(f"cluster {c.key}: stability <= {st} forks, screening <= {sc} forks")
+        done = sum(assessed(t) is not None for t in c.tasks)
+        lines.append(f"cluster {c.key}: {n_new} unassessed failures sampled ({done} of {len(c.tasks)} already "
+                     f"assessed at v{inc.version}): stability <= {st} forks, screening <= {sc} forks")
     pool_after = len(_pool(rows, shown, cfg.max_pool)) - (min(len(elig[0].tasks), cfg.max_members_per_cluster) if elig else 0)
     n_reg = len(ledger.regression_suite())
     g = pool_after * cfg.gate.trials + 2 * cfg.gate.confirm_k * max(4, round(0.15 * pool_after)) \
@@ -157,10 +196,7 @@ async def run_round(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, use
     rows = load_rows(ledger.rows_path(inc.version))
     shown = ledger.shown()
     pool_rows = [r for r in rows if r["task_id"] not in shown]
-    stats, _ = clusters(pool_rows, cfg.split)
-    tried = {d["cluster"] for d in ledger.decisions()
-             if d["stage"] == "stability" and d["version_from"] == inc.version}
-    uniq = _dedupe([c for c in stats if eligible(c, cfg.prevalence)[0] and c.key not in tried])
+    stats, uniq, assessed = _round_clusters(cfg, inc, pool_rows)
     _, inc_registry = version_setup(inc)
 
     def note(msg: str) -> None:
@@ -174,7 +210,7 @@ async def run_round(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, use
 
     for cluster in uniq[: cfg.max_clusters_per_round]:
         rep.clusters_considered.append(cluster.key)
-        members = evidence_rows(pool_rows, cluster.tasks)[: cfg.max_members_per_cluster]
+        members = evidence_rows(pool_rows, _members(cfg, cluster, assessed))
         cost = len(members) * cfg.stability_n
         if not budget.can(cost):
             note(f"budget: stability for {cluster.key} needs <= {cost}, {budget.left} left -- stop")
@@ -191,7 +227,9 @@ async def run_round(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, use
             ledger.record(round_no, inc.version, None, "stability", False,
                           f"{len(stable)} stable of {len(mine)} assessed "
                           f"(need {cfg.prevalence.min_distinct_tasks})", cluster=cluster.key)
-            note(f"  only {len(stable)} stable failures -- mostly noise, skip cluster")
+            note(f"  {len(stable)} stable of {len(mine)} assessed (need {cfg.prevalence.min_distinct_tasks})"
+                 + (" -- mostly noise" if len(stable) * 2 < len(mine) else " -- too few yet; more next round")
+                 + ", skip cluster")
             continue
         a = [r for i, r in enumerate(stable) if i % 2 == 0]
         b = [r for i, r in enumerate(stable) if i % 2 == 1]
