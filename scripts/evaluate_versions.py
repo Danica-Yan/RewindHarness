@@ -61,6 +61,11 @@ def main() -> None:
     ap.add_argument("--yes", action="store_true")
     a = ap.parse_args()
     a.reuse_map = {int(k): v for k, v in (x.split("=", 1) for x in a.reuse)}
+    for v, path in a.reuse_map.items():
+        if not Path(path).exists():
+            sys.exit(f"--reuse {v}={path}: no such file (find it with: find runs -name '*.json' | grep -i test)")
+        if not load_rows(path):
+            sys.exit(f"--reuse {v}={path}: no result rows in this file")
     if a.split == "train":
         sys.exit("evaluate on a split the loop did not learn from (e.g. test)")
     led = EditLedger(Path(a.run_dir) / "ledger.sqlite")
