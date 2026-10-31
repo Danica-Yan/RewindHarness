@@ -178,6 +178,7 @@ python scripts/run_evolve.py meta-eval                                 # adopt t
 python scripts/run_evolve.py report                                    # funnel, cost per accepted edit, what each stage saved (no API)
 python scripts/redteam_evolve.py                                      # replay the gaming attacks (no API)
 python scripts/gate_simulation.py                                     # reproduce the gate audit (no API)
+python scripts/evaluate_versions.py compare --versions 0 3 --split test   # does what was learned on train hold on test?
 python scripts/backtest_checks.py --results runs/p1/train_base.json --store-dir runs/p1/snapshots  # where policy checks would fire (no API)
 python scripts/induce_skills.py plan --base runs/p1/train_base.json      # skill groups + cost of induce/gate (no API)
 python scripts/export_viewer.py --run-dir runs/p1                      # free: then open viewer/index.html
