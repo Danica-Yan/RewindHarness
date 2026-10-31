@@ -215,3 +215,24 @@ def test_report_counts_a_library_gate_once(setup):
     r = build(ledger, _paths(cfg)["stability"])
     assert r["episodes"]["gate"] == 80
     assert r["funnel"] == {"gate (skill library): stopped": 3}
+
+
+def test_gate_pool_cap_is_a_stable_subset_that_grows_with_the_task_range():
+    from rewind.evolve.loop import _pool
+    rows = [{"task_id": t} for t in range(200)]
+    assert _pool(rows, set(), None) == list(range(200))
+    a = _pool(rows, {1, 2}, 50)
+    assert len(a) == 50 and a == _pool(rows, {1, 2}, 50) and not {1, 2} & set(a)
+    more = _pool(rows + [{"task_id": t} for t in range(200, 500)], {1, 2}, 150)
+    assert len(more) == 150                                   # cost stays flat as tasks are added
+    assert set(_pool(rows, {1, 2}, 150)) - set(more) <= set(range(200))
+
+
+def test_extending_a_version_points_it_at_more_tasks(tmp_path):
+    from rewind.evolve.ledger import EditLedger
+    led = EditLedger(tmp_path / "l.sqlite")
+    (tmp_path / "base.json").write_text(json.dumps([{"task_id": 0, "trial": 0, "reward": 1.0}]))
+    led.init_base(str(tmp_path / "base.json"))
+    (tmp_path / "more.json").write_text(json.dumps([{"task_id": t, "trial": 0, "reward": 1.0} for t in range(3)]))
+    led.set_rows_path(0, str(tmp_path / "more.json"))
+    assert led.rows_path(0) == str(tmp_path / "more.json") and led.current().version == 0

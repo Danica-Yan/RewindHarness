@@ -49,6 +49,7 @@ class EvolveConfig(BaseModel):
     budget_episodes: int = 300          # hard cap on episodes (runs + forks) per round
     concurrency: int = 4
     backtest: BacktestPolicy = Field(default_factory=BacktestPolicy)
+    max_pool: int | None = 200          # gate pool cap: keeps gate cost flat as the task range grows
 
 
 class RoundReport(BaseModel):
@@ -83,8 +84,16 @@ def _paths(cfg: EvolveConfig) -> dict[str, Path]:
     return {"stability": d / "stability.json", "gate": d / "gate", "rounds": d / "rounds"}
 
 
-def _pool(rows: list[dict], shown: set[int]) -> list[int]:
-    return sorted({r["task_id"] for r in rows} - shown)
+def _pool(rows: list[dict], shown: set[int], cap: int | None = None) -> list[int]:
+    """Unseen tasks for the gate. With `cap`, a fixed subset of that size:
+    tasks ranked by a hash of their id, so the same task set comes back on
+    every call (gate, re-gate, plan) and grows predictably as tasks are added."""
+    import hashlib
+    pool = sorted({r["task_id"] for r in rows} - shown)
+    if cap is not None and len(pool) > cap:
+        rank = sorted(pool, key=lambda t: hashlib.sha256(f"pool-{t}".encode()).hexdigest())
+        pool = sorted(rank[:cap])
+    return pool
 
 
 def _dedupe(cs: list) -> list:
@@ -116,7 +125,7 @@ def plan(cfg: EvolveConfig, ledger: EditLedger) -> str:
         sc = cfg.n_candidates * b * cfg.screen.n
         worst += st + sc
         lines.append(f"cluster {c.key}: stability <= {st} forks, screening <= {sc} forks")
-    pool_after = len(_pool(rows, shown)) - (min(len(elig[0].tasks), cfg.max_members_per_cluster) if elig else 0)
+    pool_after = len(_pool(rows, shown, cfg.max_pool)) - (min(len(elig[0].tasks), cfg.max_members_per_cluster) if elig else 0)
     n_reg = len(ledger.regression_suite())
     g = pool_after * cfg.gate.trials + 2 * cfg.gate.confirm_k * max(4, round(0.15 * pool_after)) \
         + 2 * cfg.gate.regression_k * n_reg
@@ -338,7 +347,7 @@ async def _try_edits(cfg: EvolveConfig, ledger: EditLedger, round_no: int, inc: 
         if not sr.passed:
             continue
 
-        pool = _pool(rows, ledger.shown())
+        pool = _pool(rows, ledger.shown(), cfg.max_pool)
         targets = [(r.task_id, r.trace, r.passes, r.n) for r in b]
         suite = ledger.regression_suite()
         cost = _gate_reserve(cfg, pool, len(targets), len(suite))
@@ -488,7 +497,7 @@ async def regate(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, user_l
         rows = load_rows(ledger.rows_path(inc.version))
         old = c["verdict"]
         pool = sorted({r["task_id"] for r in load_rows(old["rows_path"])}) if Path(old["rows_path"]).exists() \
-            else _pool(rows, ledger.shown())
+            else _pool(rows, ledger.shown(), cfg.max_pool)
         e = c["edit"]
         _, reg = version_setup(inc)
         cand = inc.apply(e, known_tools=set(reg._tools)).model_copy(
@@ -546,7 +555,7 @@ async def gate_pending(cfg: EvolveConfig, ledger: EditLedger, *, provider: Any, 
     for p in pending_candidates(ledger, cfg):
         inc = ledger.current()
         rows = load_rows(ledger.rows_path(inc.version))
-        pool = _pool(rows, ledger.shown())
+        pool = _pool(rows, ledger.shown(), cfg.max_pool)
         e = p["edit"]
         suite = ledger.regression_suite()
         cost = _gate_reserve(cfg, pool, len(p["targets"]), len(suite))
@@ -673,7 +682,7 @@ async def gate_skill_library(cfg: EvolveConfig, ledger: EditLedger, edits: list,
         used += sum(rec.n for t, rec in new.items() if t not in before)
         tp = skill_target_plan(cfg, base_rows, tools, evidence)
     targets = [(r["task_id"], r["info"]["rewind"]["trace"], 0, 0) for r in tp["stable"]][:max_targets]
-    pool = _pool(inc_rows, ledger.shown() | evidence | {t[0] for t in targets})
+    pool = _pool(inc_rows, ledger.shown() | evidence | {t[0] for t in targets}, cfg.max_pool)
     round_no = ledger.bump_round()
     ledger.mark_shown(sorted(evidence), round_no, "skill_evidence")
     log(f"skill library: {len(added)} skills ({', '.join(e.target for e in added)}); "

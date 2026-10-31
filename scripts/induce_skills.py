@@ -113,7 +113,7 @@ def main() -> None:
         tp = skill_target_plan(cfg, base_rows, {g.tool for g in groups}, evidence)
         n_t = min(a.max_targets, len(tp["stable"]) + len(tp["missing"]))
         pool = _pool(load_rows(led.rows_path(inc.version)), led.shown() | evidence
-                     | {r["task_id"] for r in tp["failures"]})
+                     | {r["task_id"] for r in tp["failures"]}, cfg.max_pool)
         print(f"\ninduce: {len(groups)} LLM calls (~{prompt_chars // 4} prompt tokens in total), no episodes")
         print(target_summary(tp, n_t, pool))
         return
@@ -162,7 +162,7 @@ def main() -> None:
     tp = skill_target_plan(cfg, base_rows, tools_cov, evidence)
     n_t = min(a.max_targets, len(tp["stable"]) + len(tp["missing"]))
     pool = _pool(load_rows(led.rows_path(inc.version)), led.shown() | evidence
-                 | {r["task_id"] for r in tp["failures"]})
+                 | {r["task_id"] for r in tp["failures"]}, cfg.max_pool)
     print(f"gate {len(edits)} skills as one version on top of v{inc.version}: {[e.target for e in edits]}\n"
           f"  known stable targets: {[r['task_id'] for r in tp['stable']]}\n" + target_summary(tp, n_t, pool))
     if not (a.yes or input("gate now? [y/N] ").strip().lower() == "y"):

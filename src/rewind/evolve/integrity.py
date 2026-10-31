@@ -43,7 +43,7 @@ def fingerprint(cfg: Any) -> dict:
         files[f.name] = _sha(f.read_bytes()) if f.exists() else "missing"
     settings = {"gate": cfg.gate.model_dump(), "screen": cfg.screen.model_dump(),
                 "backtest": cfg.backtest.model_dump(), "stability_n": cfg.stability_n,
-                "stable_max": cfg.stable_max}
+                "stable_max": cfg.stable_max, "max_pool": getattr(cfg, "max_pool", None)}
     return {"files": files, "settings": settings,
             "id": _sha(json.dumps([files, settings], sort_keys=True).encode())}
 
