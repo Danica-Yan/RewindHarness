@@ -393,3 +393,18 @@ def test_a_tried_cluster_with_unassessed_failures_is_tried_again_on_new_members(
     assert len(second) > len(first)                       # new members were assessed
     stab = [d for d in ledger.decisions() if d["stage"] == "stability"]
     assert len(stab) >= 2                                  # the cluster was tried again, not skipped
+
+
+def test_a_rule_about_one_tool_becomes_a_tool_note_instead_of_being_refused():
+    from rewind.evolve.surface import ContextVersion, normalize_edit, validate_edit
+    tools = {"exchange_delivered_order_items", "get_order_details", "cancel_pending_order"}
+    e = rule("x_exchange", "Call exchange_delivered_order_items once with every item the customer listed.")
+    assert "make it a tool_note" in validate_edit(e, ContextVersion(), known_tools=tools, max_tokens=1500)
+    n = normalize_edit(e, ContextVersion(), tools)
+    assert (n.kind, n.target, n.op, n.text, n.trigger) == ("tool_note", "exchange_delivered_order_items", "add",
+                                                           e.text, e.trigger)
+    assert validate_edit(n, ContextVersion(), known_tools=tools, max_tokens=1500) is None
+    v = ContextVersion().apply(n, known_tools=tools)
+    assert normalize_edit(e, v, tools).op == "replace"          # a note already there is replaced
+    two = rule("x_two", "Use get_order_details before cancel_pending_order.")
+    assert normalize_edit(two, ContextVersion(), tools) is two  # spans tools: stays a rule

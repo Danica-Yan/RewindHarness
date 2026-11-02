@@ -25,7 +25,7 @@ from .prevalence import PrevalencePolicy, clusters, describe, eligible, evidence
 from .runner import load_rows, version_setup
 from .screen import ScreenPolicy, screen
 from .stability import assess_failures
-from .surface import parse_check, validate_edit
+from .surface import normalize_edit, parse_check, validate_edit
 
 
 class BacktestPolicy(BaseModel):
@@ -354,6 +354,12 @@ async def _try_edits(cfg: EvolveConfig, ledger: EditLedger, round_no: int, inc: 
     for e in edits:
         if e.edit_id in ledger.tried_edit_ids():
             continue
+        conv = normalize_edit(e, inc, tools)
+        if conv is not e:
+            note(f"  rule {e.target} names one tool -- converted to a tool_note on {conv.target}")
+            e = conv
+            if e.edit_id in ledger.tried_edit_ids():
+                continue
         why = validate_edit(e, inc, known_tools=tools, max_tokens=cfg.gate.max_ctx_tokens)
         if why:
             ledger.record(round_no, inc.version, e, "invalid", False, why, cluster=cluster_key)

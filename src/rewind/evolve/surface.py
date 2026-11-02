@@ -270,6 +270,23 @@ def entity_reasons(text: str) -> list[str]:
     return out
 
 
+def normalize_edit(edit: Edit, ctx: ContextVersion, known_tools: set[str]) -> Edit:
+    """A rule that names exactly one tool is really a note on that tool:
+    convert it (same text and trigger) instead of refusing it, so a sound
+    idea is not lost to its format. Anything else is returned unchanged."""
+    if edit.kind != "rule" or edit.op == "delete":
+        return edit
+    both = f"{edit.text or ''} {edit.trigger or ''}"
+    named = sorted(t for t in known_tools if t in both)
+    if len(named) != 1:
+        return edit
+    tool = named[0]
+    return Edit(kind="tool_note", target=tool, op="replace" if tool in ctx.tool_notes else "add",
+                text=edit.text, trigger=edit.trigger,
+                rationale=(edit.rationale + " " if edit.rationale else "") + f"(converted from rule {edit.target!r})",
+                source_cluster=edit.source_cluster, evidence_tasks=edit.evidence_tasks)
+
+
 def validate_edit(edit: Edit, ctx: ContextVersion, *, known_tools: set[str],
                   max_tokens: int) -> str | None:
     """None if the edit may be tried, else the reason it is refused before

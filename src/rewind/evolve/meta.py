@@ -222,6 +222,8 @@ async def meta_eval(cfg: Any, ledger: EditLedger, new: list[str], clusters: list
             edits = await prop.propose(c["cluster"], a_rows, cfg.split, inc, rejected, cfg.n_candidates)
             res.proposed += len(edits)
             for e in edits:
+                from .surface import normalize_edit
+                e = normalize_edit(e, inc, tools)
                 why = validate_edit(e, inc, known_tools=tools, max_tokens=cfg.gate.max_ctx_tokens)
                 if why is None and e.kind == "check" and e.op != "delete":
                     ok, why2, _ = backtest_edit(cfg, e, rows, store, {r.task_id for r in c["A"] + c["B"]})
