@@ -19,6 +19,7 @@ EventType = Literal[
     "env_snapshot",
     "guard",       # loop warning/kill, repair prompt, fallback switch
     "user_turn",   # a dialogue env's reply to an agent text turn (+ whether it ended the episode)
+    "route",       # tool-routing decision: current tools / routed prompt ref (see routing.py)
     "error",       # transient tool errors etc.
     "run_end",
 ]

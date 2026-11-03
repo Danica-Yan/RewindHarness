@@ -79,6 +79,9 @@ class ToolRegistry:
             for t in sorted(self._tools.values(), key=lambda t: t.name)
         ]
 
+    def has(self, name: str) -> bool:
+        return name in self._tools
+
     def is_mutating(self, name: str) -> bool:
         t = self._tools.get(name)
         return bool(t and t.mutating)

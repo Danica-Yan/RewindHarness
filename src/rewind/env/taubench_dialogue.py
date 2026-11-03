@@ -365,14 +365,15 @@ class Episode:
 
 async def run_episode(split: str, index: int, *, provider: Any, user_llm: UserLLM,
                       store: SnapshotStore, cfg: Any = None, registry: ToolRegistry | None = None,
-                      run_id: str | None = None, trace_path: str | None = None) -> Episode:
+                      run_id: str | None = None, trace_path: str | None = None,
+                      router: Any = None) -> Episode:
     from ..loop import AgentRunner
     from ..trace import TraceWriter
     cfg = cfg or faithful_config()
     registry = registry or build_dialogue_registry()
     env = TauBenchDialogueEnv(store, TauUserSim(user_llm), split, index)
     first = await env.start()
-    runner = AgentRunner(provider, registry, cfg, store)
+    runner = AgentRunner(provider, registry, cfg, store, router=router)
     with TraceWriter(run_id or f"tau-{split}-{index}", path=trace_path) as trace:
         rr = await runner.run(env, first, trace)
         events = list(trace.events)

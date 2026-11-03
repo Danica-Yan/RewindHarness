@@ -228,12 +228,37 @@ python scripts/run_baselines.py
 5. **End-to-end** only once replay looks good: treatment arm on τ test with the existing multi-trial + bootstrap CI;
    the unpatched 3-trial run is the control (rerun one control trial first to check DeepSeek hasn't drifted).
 
-## Integration sketch (rewind, later, on a new branch)
-- Router node before each agent step: `route_t = route_{t-1} ∪ classify(user_turn_t)`. Routes only grow within a
-  conversation, so a later turn can't take away a tool the agent is already using.
-- Escalation: add an `escalate_to_full_toolset` tool to every routed prompt. Calling it, or calling a tool that
-  isn't in the route, switches the conversation to the full prompt for its remaining turns.
-- Write the route + probabilities to the trace, so replay/fork reuse the recorded route instead of re-running
-  the classifier (deterministic replay).
-- Flywheel: a new failure label `misroute` (escalation fired, or a failed task whose needed tool was missing
-  from the route) feeds the router's next training round.
+## Integration into rewind (done; end-to-end run pending)
+- `src/rewind/routing.py`: a generic `ToolRouter` protocol, the `request_full_toolset` escalation tool, and
+  `RecordedRouter` for replay. rewind itself knows nothing about intents.
+- `AgentRunner(router=...)`: on every new user turn the router updates the route. Each LLM call then gets only
+  the routed tool schemas (+ escalation tool) and the routed system prompt; the history keeps the canonical
+  prompt. Routes only grow within a run. The run falls back to the full toolset when the router is unsure, when
+  the agent calls `request_full_toolset`, or when it calls a registered tool outside its route (the call still runs).
+- Route state lives in `LoopState` (checkpoint/resume/fork carry it). Every decision is a `route` trace event.
+  The routed prompt goes to the SnapshotStore, so `replay_run` re-serves recorded routes and needs no router
+  model. Covered by `tests/test_routing.py`; with no router the loop is unchanged (full suite passes).
+- `intent_funnel/rewind_router.py`: `TauRouter`, with thresholds from the frozen proposal-rules file.
+  `build_router("tfidf")` is CPU-only; `build_router("hybrid", qwen_adapters=[3 dirs])` adds the Qwen avg.
+  Only the wiki text inside the prompt is pruned, so Evolve rules are kept verbatim. Extra non-retail
+  tools (e.g. the skill loader) are never hidden.
+- `scripts/router_parity.py`: drives the live `TauRouter` through replays exactly as the loop does. It reproduces
+  the offline numbers (dev 100% / 0.659, gpt-4o 100% / 0.666, Sonnet 99.8% / 0.672 vs offline 0.658 / 0.665 / 0.670).
+  The escalation tool's schema adds ~72 tokens (0.019) per routed step on top of that.
+
+### Running it
+```bash
+export DEEPSEEK_API_KEY=... REWIND_TAUBENCH_SRC=../tau-bench
+# pilot (3 tasks): check traces for route events, escalations, crashes
+python scripts/run_taubench_rewind.py --split test --task-ids 0-2 --router tfidf --out runs/router/pilot.json
+# treatment arm
+python scripts/run_taubench_rewind.py --split test --num-trials 1 --router tfidf --out runs/router/test_tfidf.json
+# report vs the existing rewind control run (same harness)
+python experiments/intent_funnel/scripts/router_e2e_report.py --control runs/p0/test_rewind.json \
+    --treatment runs/router/test_tfidf.json --paired [--price-miss .. --price-hit .. --price-out ..]
+python scripts/taubench_multitrial_compare.py runs/p0/test_rewind.json runs/router/test_tfidf.json
+```
+
+### Still open
+- Flywheel: add a `misroute` failure label (escalation fired, or a failed task whose needed tool was missing
+  from the route) so misroutes feed the router's next training round.
