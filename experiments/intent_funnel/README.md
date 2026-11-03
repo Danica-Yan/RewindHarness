@@ -7,12 +7,13 @@ rewind agent loop (see *Integration sketch*).
 - *Offline* (held-out τ-bench retail conversations from gpt-4o / Claude 3.5 Sonnet agents, 915 trajectories, thresholds
   frozen in advance): the router keeps **99.7–100% of required write-tool calls** while removing **35–38% of the
   static prompt** (tool schemas + policy).
-- *End-to-end on DeepSeek* (3-task pilot inside rewind): routing cuts processed input tokens by **27%** but raises the
-  billed cost by **82%**. DeepSeek's prefix cache bills hits at 1/50 of misses, and a route change invalidates the
+- *End-to-end on DeepSeek* (full τ-bench retail test split, 115 tasks × 3 trials inside rewind): routing cuts processed
+  input tokens by **22.5%** but raises the billed cost by **24.4%** (the 3-task pilot showed +82%). Task success is
+  statistically unchanged: pass^1 72.2% vs 73.3%, paired-bootstrap 95% CI on the delta [−5.5, +3.5] pts. DeepSeek's prefix cache bills hits at 1/50 of misses, and a route change invalidates the
   cached prefix, so the whole conversation so far is re-billed at the miss price. From the same traces, **no**
   cache-friendly design could save more than **4.2%** of the bill at these prices. On a cache-discounted API,
   per-turn prompt pruning is not a cost lever. Token count is not cost.
-- Still open: whether routing changes task success (accuracy run below), and the no-cache setting (to-do).
+- Still open: the no-cache setting, where routing could pay (to-do; blocked by hardware).
 
 ## Results so far
 
@@ -286,18 +287,33 @@ Why:
   `return` when the agent's confirmation of an exchange mentioned the refund/payment method. Those tools were never
   called. The offline "zero misses" of those rules was paid for with false positives that only the bill shows.
 
-### Accuracy (pending): does routing change task success?
-Fewer tools and less policy text could also change how well the agent works. Run (≈$0.002/episode, ≈$0.7 total):
-```bash
-python scripts/run_taubench_rewind.py --split test --num-trials 3 --router tfidf --out runs/router/test_tfidf_3t.json
-python scripts/taubench_multitrial_compare.py runs/p0/test_rewind.json runs/router/test_tfidf_3t.json \
-    --label-a control --label-b routed
-python experiments/intent_funnel/scripts/router_e2e_report.py --control runs/p0/test_rewind.json \
-    --treatment runs/router/test_tfidf_3t.json --paired --price-miss 0.14 --price-hit 0.0028 --price-out 0.28
-```
-The router config is the frozen one used in the pilot (no changes after seeing the pilot), so the comparison stays
-clean. The second command gives the paired bootstrap CI on pass^1. The third confirms the cost result at full
-scale, where routed static prefixes also get cached across episodes.
+### Full-scale run: accuracy and cost (115 test tasks × 3 trials)
+Routed run: `--router tfidf` with the frozen pilot config (nothing changed after the pilot). Control: the existing rewind
+run `runs/p0/test_rewind.json`, also 115 × 3 and served as `deepseek-flash`.
+
+| | control | routed |
+|---|---|---|
+| pooled pass^1 (345 episodes) | 73.3% | 72.2% |
+| pass^3 | 59.1% | 54.8% |
+| Δ pass^1, paired bootstrap 95% CI | | −1.2 pts **[−5.5, +3.5]** |
+| LLM calls / episode | 13.2 | 13.3 |
+| input tokens / episode | 79,473 | 61,607 (**−22.5%**) |
+| cache-hit share | 94.5% | 88.7% |
+| cache-miss tokens / episode | 4,350 | 6,975 (1.6×) |
+| billed cost / episode | $0.00123 | $0.00153 (**+24.4%**) |
+| episodes that fell back (router unsure) | – | 2.9% |
+| episodes that escalated (`request_full_toolset`) | – | 2.0% |
+| route violations | – | 0 |
+
+Reading:
+- **Accuracy:** no detectable change. The CI includes 0. This is "not enough evidence either way", not "no effect":
+  pass^3 dropped 4.3 pts, which hints at slightly less consistent behaviour but wasn't tested for significance.
+  The safety net worked as designed: 2% of episodes escalated, and no tool was called outside a route.
+- **Cost:** at full scale, routed static prefixes are also cached across episodes, so the penalty shrinks from
+  +82% (pilot) to +24%. It is still a loss. Route changes mid-conversation re-bill the history at the miss price,
+  and the most a cache-friendly design could save at these prices is ~4% (`scripts/cache_bound.py`).
+- Caveat: the control run is from October and the routed run from November. Both report `deepseek-flash`, but
+  provider-side changes in between can't be excluded.
 
 ## To-do
 - [ ] **No-cache / small-discount setting** (where routing could save up to ~23% of the bill): serve the agent
