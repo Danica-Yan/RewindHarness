@@ -1,0 +1,14 @@
+[{"task_id": 3, "reward": 1.0, "trial": 0, "traj": [
+ {"role":"system","content":"policy"},
+ {"role":"user","content":"Hi, I want to return a keyboard and cancel another order."},
+ {"role":"assistant","content":"Sure, can you give me your email?"},
+ {"role":"user","content":"It's yusuf@example.com"},
+ {"role":"assistant","content":null,"tool_calls":[{"function":{"name":"find_user_id_by_email","arguments":"{}"}}]},
+ {"role":"tool","content":"yusuf_1"},
+ {"role":"assistant","content":"Confirm return of item X?"},
+ {"role":"user","content":"Yes please"},
+ {"role":"assistant","content":null,"tool_calls":[{"function":{"name":"return_delivered_order_items","arguments":"{}"}}]},
+ {"role":"user","content":"Now the cancellation, reason is ordered by mistake."},
+ {"role":"assistant","content":null,"tool_calls":[{"function":{"name":"cancel_pending_order","arguments":"{}"}}]},
+ {"role":"user","content":"###STOP###"}]},
+ {"task_id": 4, "reward": 0.0, "traj": [{"role":"user","content":"where is my order"}]}]

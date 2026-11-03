@@ -1,0 +1,12 @@
+# offline pipeline (CPU)
+deepseek-tokenizer
+scikit-learn
+pandas
+numpy
+# fine-tuning (Kaggle GPU)
+torch
+transformers>=4.51   # Qwen3 support; 5.x also works
+peft
+accelerate
+# DeepSeek router baseline
+openai

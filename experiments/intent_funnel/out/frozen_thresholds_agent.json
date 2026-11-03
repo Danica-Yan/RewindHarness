@@ -1,0 +1,81 @@
+{
+ "agent_cfg": {
+  "class_weight": null,
+  "horizon": 2,
+  "t_agent": 0.8
+ },
+ "routers": {
+  "tfidf_traj": {
+   "t_include": 0.15,
+   "gate": 0.0,
+   "dev": {
+    "n_traj": 249,
+    "n_writes": 359,
+    "write_coverage": 0.9944289693593314,
+    "task_coverage": 0.9919678714859438,
+    "step_token": 0.6169191228190928,
+    "traj_fell_back": 0.03614457831325301
+   }
+  },
+  "tfidf_traj+agent": {
+   "t_include": 0.15,
+   "gate": 0.0,
+   "dev": {
+    "n_traj": 249,
+    "n_writes": 359,
+    "write_coverage": 0.9944289693593314,
+    "task_coverage": 0.9919678714859438,
+    "step_token": 0.6169191228190928,
+    "traj_fell_back": 0.03614457831325301
+   }
+  },
+  "qwen_avg3": {
+   "t_include": 0.15,
+   "gate": 0.0,
+   "dev": {
+    "n_traj": 249,
+    "n_writes": 359,
+    "write_coverage": 0.9916434540389972,
+    "task_coverage": 0.9879518072289156,
+    "step_token": 0.5634067563007717,
+    "traj_fell_back": 0.008032128514056224
+   }
+  },
+  "qwen_avg3+agent": {
+   "t_include": 0.15,
+   "gate": 0.0,
+   "dev": {
+    "n_traj": 249,
+    "n_writes": 359,
+    "write_coverage": 0.9944289693593314,
+    "task_coverage": 0.9919678714859438,
+    "step_token": 0.5625106390836706,
+    "traj_fell_back": 0.004016064257028112
+   }
+  },
+  "hybrid_avg3": {
+   "t_include": 0.4,
+   "gate": 0.0,
+   "dev": {
+    "n_traj": 249,
+    "n_writes": 359,
+    "write_coverage": 0.9944289693593314,
+    "task_coverage": 0.9919678714859438,
+    "step_token": 0.5821968469701064,
+    "traj_fell_back": 0.05220883534136546
+   }
+  },
+  "hybrid_avg3+agent": {
+   "t_include": 0.4,
+   "gate": 0.0,
+   "dev": {
+    "n_traj": 249,
+    "n_writes": 359,
+    "write_coverage": 0.9972144846796658,
+    "task_coverage": 0.9959839357429718,
+    "step_token": 0.5821290254347545,
+    "traj_fell_back": 0.04819277108433735
+   }
+  }
+ }
+}
