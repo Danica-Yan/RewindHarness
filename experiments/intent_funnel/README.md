@@ -3,18 +3,16 @@
 Lives in `experiments/intent_funnel/`. It is developed and evaluated offline here; it is not yet wired into the
 rewind agent loop (see *Integration sketch*).
 
-**Headline (held-out, thresholds frozen in advance):** on τ-bench retail conversations from models never used for
-development (gpt-4o and Claude 3.5 Sonnet agents; 915 trajectories), the router keeps **99.7–100% of required
-write-tool calls** while cutting the static prompt by **35–38%**. Router = fine-tuned Qwen3-0.6B (LoRA) ⊕ TF-IDF on user
-turns + agent-proposal rules + route groups. End-to-end task success and billed cost are not measured yet.
-
-Goal: put a cheap router in front of the DeepSeek agent on τ-bench retail. The router predicts which
-intents a user turn contains, and the agent then gets **only the tools and policy sections those intents need**.
-If the router isn't confident, it **falls back** to the full prompt. On τ-bench retail this works as
-routing + context pruning, not as skipping LLM calls: almost every retail task needs tool calls.
-
-Everything here runs offline. The only scripts that spend API budget are `deepseek_zeroshot.py`
-(capped and cached) and, later, the end-to-end τ-bench rerun.
+**Headline.**
+- *Offline* (held-out τ-bench retail conversations from gpt-4o / Claude 3.5 Sonnet agents, 915 trajectories, thresholds
+  frozen in advance): the router keeps **99.7–100% of required write-tool calls** while removing **35–38% of the
+  static prompt** (tool schemas + policy).
+- *End-to-end on DeepSeek* (3-task pilot inside rewind): routing cuts processed input tokens by **27%** but raises the
+  billed cost by **82%**. DeepSeek's prefix cache bills hits at 1/50 of misses, and a route change invalidates the
+  cached prefix, so the whole conversation so far is re-billed at the miss price. From the same traces, **no**
+  cache-friendly design could save more than **4.2%** of the bill at these prices. On a cache-discounted API,
+  per-turn prompt pruning is not a cost lever. Token count is not cost.
+- Still open: whether routing changes task success (accuracy run below), and the no-cache setting (to-do).
 
 ## Results so far
 
@@ -34,6 +32,7 @@ Caveats before claiming dollar savings:
 2. DeepSeek bills cached prefix tokens at a lower rate. The full prompt is a perfectly stable prefix;
    a routed prompt is stable *per route*, so cache hits are spread across ~10 prefixes instead of 1.
    The end-to-end run has to report billed cost (cache hit/miss), not just token counts.
+   → **Confirmed end-to-end, and worse than expected:** see *End-to-end results* (−27% tokens, +82% cost).
 
 ### Data findings
 - **τ-bench retail train instructions are template-generated** (mean 8 words, e.g. *"Cancel order #W… because
@@ -185,6 +184,11 @@ scripts/
   run_baselines.py        # primary metric: replay write coverage (intent_funnel/evaluate.py)
   finetune.py             # Qwen3-0.6B LoRA (or encoder) multi-label router; --smoke runs on CPU
   deepseek_zeroshot.py    # big-model router baseline; cached, capped, --dry-run
+  validate_heldout.py, agent_heldout.py, agent_rules_heldout.py  # frozen-threshold held-out evaluation
+  router_parity.py        # live TauRouter vs offline numbers
+  router_e2e_report.py    # end-to-end pass^1 / tokens / billed cost / routing stats from rewind runs
+  cache_bound.py          # prefix-cache economics from real traces (bound on any router's saving)
+intent_funnel/rewind_router.py, agent_rules.py   # the router rewind actually calls
 ```
 
 ## Data kept out of git
@@ -216,19 +220,15 @@ python scripts/build_tau.py data/taubench data/processed/tau_instr.jsonl
 python scripts/run_baselines.py
 ```
 
-## Next steps (in order)
-1. ~~Turn trajectories into in-domain data~~ (done: 448 train / 249 test trajectories).
-2. ~~Hand-audit weak labels~~ (done: 97.5% after fixes).
-3. **Fine-tune on Kaggle (T4):** upload this folder *including* `data/processed/`, run `pip uninstall -y torchao`
-   (Kaggle's preinstalled 0.10 breaks recent peft), then
-   `python scripts/finetune.py --model Qwen/Qwen3-0.6B --seeds 0` (then `--seeds 0 1 2`). Encoder control:
-   `--model answerdotai/ModernBERT-base --no-lora --lr 3e-5 --epochs 3`. Target: ≥99% replay write coverage at ≈0.6 tokens.
-4. **DeepSeek router baseline:** `python scripts/deepseek_zeroshot.py --dry-run`, then `--sets tau_traj --max-calls ...`.
-   Report its routing quality *and* its own overhead (one extra call per user turn).
-5. **End-to-end** only once replay looks good: treatment arm on τ test with the existing multi-trial + bootstrap CI;
-   the unpatched 3-trial run is the control (rerun one control trial first to check DeepSeek hasn't drifted).
+## Status
+1. ~~In-domain data from trajectories~~ · ~~hand audit~~ · ~~fine-tuning (3 seeds)~~ · ~~held-out validation~~ ·
+   ~~agent context~~ · ~~integration into rewind~~ · ~~end-to-end cost pilot~~ (see *End-to-end results*).
+2. End-to-end accuracy run: pending (commands below).
+3. DeepSeek-as-router baseline (`deepseek_zeroshot.py`): not run. It now matters less, because routing doesn't pay on
+   DeepSeek anyway, and a router that costs an extra LLM call per turn would only widen the gap.
+4. To-do list at the end.
 
-## Integration into rewind (done; end-to-end run pending)
+## Integration into rewind (done)
 - `src/rewind/routing.py`: a generic `ToolRouter` protocol, the `request_full_toolset` escalation tool, and
   `RecordedRouter` for replay. rewind itself knows nothing about intents.
 - `AgentRunner(router=...)`: on every new user turn the router updates the route. Each LLM call then gets only
@@ -259,6 +259,51 @@ python experiments/intent_funnel/scripts/router_e2e_report.py --control runs/p0/
 python scripts/taubench_multitrial_compare.py runs/p0/test_rewind.json runs/router/test_tfidf.json
 ```
 
-### Still open
-- Flywheel: add a `misroute` failure label (escalation fired, or a failed task whose needed tool was missing
-  from the route) so misroutes feed the router's next training round.
+## End-to-end results
+
+### Cost: routing does not pay on a prefix-cached API (`data/e2e_pilot/`, `scripts/cache_bound.py`)
+3 test tasks, routed (`--router tfidf`) vs the existing rewind control run (`runs/p0/test_rewind.json`, same tasks/trial).
+Both use the same served model (`deepseek-flash` in the traces). Prices: DeepSeek official, USD per 1M tokens: cache-hit input 0.0028,
+cache-miss input 0.14, output 0.28.
+
+| per episode | control | routed |
+|---|---|---|
+| pass^1 (3 tasks) | 3/3 | 3/3 |
+| input tokens | 73,949 | 53,906 (**−27%**) |
+| of which cache hits | 69,291 (94%) | 41,728 (77%) |
+| cache-miss tokens | 4,659 | 12,179 (**2.6×**) |
+| billed cost | $0.0012 | $0.0022 (**+82%**) |
+
+Why:
+- Cached token counts are all multiples of **128**, so caching works on 128-token prefix blocks. The full static prompt
+  (~4.1k tokens of tools + wiki) is identical across calls *and across episodes*, so the control run is ~94% cache
+  hits from the first call on.
+- Routing removes ~1,440 static tokens per call. Those tokens were cache hits anyway, which caps the possible
+  saving at **4.2%** of the bill even for a router that never breaks the cache. The cap is 12.7% if hits cost 1/10
+  of misses and 23.2% with no prefix cache.
+- Each route change alters the start of the request, so everything after it is re-billed at the miss price:
+  3,300–5,800 tokens per bust. **3 of the 4 busts came from the agent-proposal rules** adding `modify_payment` /
+  `return` when the agent's confirmation of an exchange mentioned the refund/payment method. Those tools were never
+  called. The offline "zero misses" of those rules was paid for with false positives that only the bill shows.
+
+### Accuracy (pending): does routing change task success?
+Fewer tools and less policy text could also change how well the agent works. Run (≈$0.002/episode, ≈$0.7 total):
+```bash
+python scripts/run_taubench_rewind.py --split test --num-trials 3 --router tfidf --out runs/router/test_tfidf_3t.json
+python scripts/taubench_multitrial_compare.py runs/p0/test_rewind.json runs/router/test_tfidf_3t.json \
+    --label-a control --label-b routed
+python experiments/intent_funnel/scripts/router_e2e_report.py --control runs/p0/test_rewind.json \
+    --treatment runs/router/test_tfidf_3t.json --paired --price-miss 0.14 --price-hit 0.0028 --price-out 0.28
+```
+The router config is the frozen one used in the pilot (no changes after seeing the pilot), so the comparison stays
+clean. The second command gives the paired bootstrap CI on pass^1. The third confirms the cost result at full
+scale, where routed static prefixes also get cached across episodes.
+
+## To-do
+- [ ] **No-cache / small-discount setting** (where routing could save up to ~23% of the bill): serve the agent
+  model ourselves (e.g. vLLM with prefix caching off, or a provider without a cache discount) and rerun the
+  end-to-end comparison. **Blocked for now by hardware:** no local GPU that can serve a DeepSeek-class agent model.
+  If revisited, make routing cache-aware first: decide the route once, early, and freeze it apart from escalation;
+  drop the refund/payment triggers from the agent-proposal rules.
+- [ ] Flywheel: add a `misroute` failure label (escalation fired, or a failed task whose needed tool was missing from
+  the route) so misroutes feed the router's next training round.
