@@ -83,7 +83,8 @@ async def main_async(args: argparse.Namespace) -> None:
     out = Path(args.out)
     store = SnapshotStore(args.store_dir or out.parent / "snapshots")
     ids = parse_ids(args.task_ids, n_tasks(args.split))
-    router = build_router(args.router, args.qwen_adapters)
+    # getattr: callers that build their own Namespace (tests, other scripts) predate routing
+    router = build_router(getattr(args, "router", "none"), getattr(args, "qwen_adapters", []))
     if router is not None:
         print(f"tool routing: {router.name} (t_include={router.t_include}, gate={router.gate})", flush=True)
     rows = await run_batch(args.split, ids, args.num_trials, out, ctx=ContextVersion(), router=router,
