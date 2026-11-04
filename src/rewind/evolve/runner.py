@@ -43,9 +43,11 @@ def write_rows(path: str | Path, rows: list[ResultRow]) -> None:
 async def run_batch(split: str, task_ids: list[int], trials: int, out: str | Path, *,
                     ctx: ContextVersion, bench: Benchmark, provider: Any, user_llm: Any, store: SnapshotStore,
                     trace_dir: str | Path | None = None, concurrency: int = 4,
-                    log: Callable[[str], None] = print, trial_offset: int = 0) -> list[ResultRow]:
+                    log: Callable[[str], None] = print, trial_offset: int = 0,
+                    router: Any = None) -> list[ResultRow]:
     """Run `trials` trials (numbered from `trial_offset`) of each task; rows
-    already in `out` are kept and skipped."""
+    already in `out` are kept and skipped. `router` (rewind.routing.ToolRouter) enables per-turn
+    tool routing; its escalation tool is added to the registry."""
     out = Path(out)
     trace_dir = Path(trace_dir or out.with_suffix("").as_posix() + "_traces")
     rows = load_rows(out)
@@ -54,6 +56,9 @@ async def run_batch(split: str, task_ids: list[int], trials: int, out: str | Pat
             if (i, t) not in done]
     log(f"{out.name}: {len(jobs)} episodes to run ({len(done)} already done)")
     cfg, registry = version_setup(ctx, bench=bench)
+    if router is not None:
+        from ..routing import escalate_tool
+        registry.register(escalate_tool())
     sem = asyncio.Semaphore(concurrency)
     lock = asyncio.Lock()
     t0 = time.time()
@@ -64,7 +69,8 @@ async def run_batch(split: str, task_ids: list[int], trials: int, out: str | Pat
             path = trace_dir / f"{name}.jsonl"
             try:
                 ep = await run_episode(bench, split, idx, provider=provider, user_llm=user_llm, store=store,
-                                       cfg=cfg, registry=registry, run_id=name, trace_path=str(path))
+                                       cfg=cfg, registry=registry, run_id=name, trace_path=str(path),
+                                       router=router)
             except Exception as e:  # one broken episode must not kill the batch
                 log(f"[error] {name}: {type(e).__name__}: {e}")
                 return

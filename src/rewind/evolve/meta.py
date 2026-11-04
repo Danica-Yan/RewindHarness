@@ -29,7 +29,7 @@ from pydantic import BaseModel
 
 from ..benchmark import Benchmark
 from .ledger import EditLedger
-from .surface import leak_reasons
+from .surface import integrity_reasons, leak_reasons
 
 JsonLLM = Callable[[list[dict]], Awaitable[str]]
 KEY = "proposer_lessons"
@@ -87,7 +87,7 @@ def validate_lessons(xs: Any) -> tuple[list[str], str | None]:
             dropped.append(f"too long: {x[:60]}...")
         elif leak_reasons(x):
             dropped.append(f"case-specific ({', '.join(leak_reasons(x))}): {x[:60]}")
-        elif _GAMING.search(x):
+        elif _GAMING.search(x) or integrity_reasons(x):
             dropped.append(f"about beating the evaluation, not writing edits: {x[:60]}")
         else:
             kept.append(x)
@@ -223,6 +223,8 @@ async def meta_eval(cfg: Any, ledger: EditLedger, new: list[str], clusters: list
             edits = await prop.propose(c["cluster"], a_rows, cfg.split, inc, rejected, cfg.n_candidates)
             res.proposed += len(edits)
             for e in edits:
+                from .surface import normalize_edit
+                e = normalize_edit(e, inc, tools)
                 why = validate_edit(e, inc, known_tools=tools, max_tokens=cfg.gate.max_ctx_tokens)
                 if why is None and e.kind == "check" and e.op != "delete":
                     ok, why2, _ = backtest_edit(cfg, e, rows, store, {r.task_id for r in c["A"] + c["B"]},

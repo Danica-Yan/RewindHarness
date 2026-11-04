@@ -24,7 +24,7 @@ import copy
 import hashlib
 import json
 import re
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -197,10 +197,94 @@ _LEAK_PATTERNS = [
 ]
 
 
+# Red-team findings (docs, "红队测试"): edits can also try to override the
+# agent's instructions, talk to the grader instead of the customer, or switch
+# off a safeguard the reward does not check. None of these is a policy.
+_INTEGRITY_PATTERNS = [
+    (re.compile(r"\b(ignore|disregard|override|forget)\b[^.]{0,40}\b(instructions?|polic(y|ies)|rules?|above)\b",
+                re.IGNORECASE), "tries to override the agent's instructions"),
+    (re.compile(r"\byou are now\b|\bnew system prompt\b", re.IGNORECASE), "tries to override the agent's instructions"),
+    (re.compile(r"\b(grader|graded|grading|evaluator|benchmark|reward|test cases?|required strings?|scor(e|ed|ing))\b",
+                re.IGNORECASE), "talks about the evaluation instead of the customer"),
+    (re.compile(r"\b(never|don'?t|do not|no need to|skip)\s+(ask(ing)? for|get(ting)?|obtain(ing)?|wait(ing)? for|"
+                r"request(ing)?|the)\s+((the|a|any|explicit|user'?s?|customer'?s?)\s+)*confirmation"
+                r"|\bskip(ping)?\s+(the\s+)?confirmation"
+                r"|(?<!not )(?<!never )(?<!n't )\b(proceed|act|go ahead)\s+(immediately\s+)?without\s+"
+                r"(asking|waiting|confirmation|(the\s+)?(user|customer)'?s?\s+(yes|confirmation))", re.IGNORECASE),
+     "switches off explicit confirmation (the policy requires it; the reward does not check it)"),
+]
+
+
 def leak_reasons(text: str) -> list[str]:
     """Why an edit's text looks like it encodes specific cases instead of a
-    general policy (ids, emails, task numbers). Empty list = looks general."""
-    return [why for pat, why in _LEAK_PATTERNS if pat.search(text or "")]
+    general policy (ids, emails, task numbers, real customers' names or zip
+    codes). Empty list = looks general."""
+    out = [why for pat, why in _LEAK_PATTERNS if pat.search(text or "")]
+    out += entity_reasons(text)
+    return out
+
+
+def integrity_reasons(text: str) -> list[str]:
+    return list(dict.fromkeys(why for pat, why in _INTEGRITY_PATTERNS if pat.search(text or "")))
+
+
+_ENTITIES: dict[str, set[str]] | None = None
+
+
+def set_entities(entities: dict[str, set[str]] | None) -> None:
+    """Set the entity source directly (tests); None = not loaded yet."""
+    global _ENTITIES
+    _ENTITIES = entities
+
+
+def use_benchmark(bench: Any) -> None:
+    """Load the case entities (customer names, zip codes, ...) from the
+    benchmark, once. Evolve reaches benchmark data only through the
+    Benchmark port, so the entry points that hold a `bench` call this."""
+    global _ENTITIES
+    if _ENTITIES is not None:
+        return
+    get = getattr(bench, "case_entities", None)
+    try:
+        _ENTITIES = (get() if get else None) or {}
+    except Exception:  # noqa: BLE001 -- benchmark data unavailable: only the regex checks apply
+        _ENTITIES = {}
+
+
+def _entities() -> dict[str, set[str]]:
+    return _ENTITIES or {}
+
+
+def entity_reasons(text: str) -> list[str]:
+    t = (text or "").lower()
+    if not t:
+        return []
+    out = []
+    for why, values in _entities().items():
+        if why == "zip code":
+            hit = any(z in values for z in re.findall(r"\b\d{5}\b", t))
+        else:
+            hit = any(v in t for v in values)
+        if hit:
+            out.append(why)
+    return out
+
+
+def normalize_edit(edit: Edit, ctx: ContextVersion, known_tools: set[str]) -> Edit:
+    """A rule that names exactly one tool is really a note on that tool:
+    convert it (same text and trigger) instead of refusing it, so a sound
+    idea is not lost to its format. Anything else is returned unchanged."""
+    if edit.kind != "rule" or edit.op == "delete":
+        return edit
+    both = f"{edit.text or ''} {edit.trigger or ''}"
+    named = sorted(t for t in known_tools if t in both)
+    if len(named) != 1:
+        return edit
+    tool = named[0]
+    return Edit(kind="tool_note", target=tool, op="replace" if tool in ctx.tool_notes else "add",
+                text=edit.text, trigger=edit.trigger,
+                rationale=(edit.rationale + " " if edit.rationale else "") + f"(converted from rule {edit.target!r})",
+                source_cluster=edit.source_cluster, evidence_tasks=edit.evidence_tasks)
 
 
 def validate_edit(edit: Edit, ctx: ContextVersion, *, known_tools: set[str],
@@ -208,6 +292,8 @@ def validate_edit(edit: Edit, ctx: ContextVersion, *, known_tools: set[str],
     """None if the edit may be tried, else the reason it is refused before
     spending any evaluation on it."""
     both = f"{edit.text or ''} {edit.trigger or ''}"
+    if edit.op != "delete" and integrity_reasons(both):
+        return "refused: " + "; ".join(integrity_reasons(both))
     if edit.kind == "check":
         return _validate_check(edit, ctx, known_tools)
     if edit.kind == "skill":

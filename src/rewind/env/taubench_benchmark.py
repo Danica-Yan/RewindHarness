@@ -75,6 +75,16 @@ class TauBenchRetail:
     def policy_text(self) -> str:
         return wiki()
 
+    def case_entities(self) -> dict[str, set[str]]:
+        """Customer full names, zip codes and street lines from the retail database."""
+        from .taubench_adapter import TauBenchRetailEnv
+        users = TauBenchRetailEnv().data["users"].values()
+        return {
+            "customer name": {f"{u['name']['first_name']} {u['name']['last_name']}".lower() for u in users},
+            "zip code": {u["address"]["zip"] for u in users},
+            "street address": {u["address"]["address1"].lower() for u in users},
+        }
+
     def agent_config(self, **overrides: Any):
         return faithful_config(**overrides)
 

@@ -1,0 +1,19 @@
+{
+ "groups": true,
+ "picks": [
+  [
+   0.1,
+   0.0
+  ],
+  [
+   0.05,
+   0.0
+  ]
+ ],
+ "write_coverage": 0.994417510779712,
+ "task_coverage": 0.9919678714859438,
+ "step_token": 0.5716413774976385,
+ "traj_fell_back": 0.04417670682730924,
+ "n_traj": 249
+}
+pareto (token, write_cov, t_include|gate): [(0.571, 0.9916, '0.1|0.0'), (0.571, 0.9972, '0.05|0.0')]

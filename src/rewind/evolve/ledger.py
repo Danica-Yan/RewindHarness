@@ -67,6 +67,12 @@ class EditLedger:
     def rows_path(self, v: int) -> str:
         return self.db.execute("SELECT rows_path FROM versions WHERE version=?", (v,)).fetchone()[0]
 
+    def set_rows_path(self, v: int, rows_path: str) -> None:
+        """Point a version at a results file covering more tasks (task-range
+        extension); the version's context is unchanged."""
+        self.db.execute("UPDATE versions SET rows_path=? WHERE version=?", (rows_path, v))
+        self.db.commit()
+
     def next_version_number(self) -> int:
         return (self.db.execute("SELECT MAX(version) FROM versions").fetchone()[0] or 0) + 1
 

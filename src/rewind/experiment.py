@@ -36,11 +36,11 @@ class Episode:
 async def run_episode(bench: Benchmark, split: str, index: int, *, provider: Any, user_llm: Any,
                       store: SnapshotStore, cfg: AgentConfig | None = None,
                       registry: ToolRegistry | None = None, run_id: str | None = None,
-                      trace_path: str | None = None) -> Episode:
+                      trace_path: str | None = None, router: Any = None) -> Episode:
     cfg = cfg or bench.agent_config()
     registry = registry or bench.build_registry()
     env, first = await bench.start_episode(split, index, store=store, user=user_llm)
-    runner = AgentRunner(provider, registry, cfg, store)
+    runner = AgentRunner(provider, registry, cfg, store, router=router)
     with TraceWriter(run_id or f"{bench.name}-{split}-{index}", path=trace_path) as trace:
         rr = await runner.run(env, first, trace)
         events = list(trace.events)

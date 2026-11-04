@@ -1,0 +1,102 @@
+{
+ "gpt-4o_retail": {
+  "tfidf_traj": {
+   "n_traj": 278,
+   "n_writes": 381,
+   "write_coverage": 0.9816272965879265,
+   "task_coverage": 0.9748201438848921,
+   "step_token": 0.6240789216306711,
+   "traj_fell_back": 0.03597122302158273
+  },
+  "tfidf_traj+agent_rules": {
+   "n_traj": 278,
+   "n_writes": 381,
+   "write_coverage": 1.0,
+   "task_coverage": 1.0,
+   "step_token": 0.6646138489684612,
+   "traj_fell_back": 0.025179856115107913
+  },
+  "qwen_avg3": {
+   "n_traj": 278,
+   "n_writes": 381,
+   "write_coverage": 0.979002624671916,
+   "task_coverage": 0.9748201438848921,
+   "step_token": 0.5570513410578881,
+   "traj_fell_back": 0.014388489208633094
+  },
+  "qwen_avg3+agent_rules": {
+   "n_traj": 278,
+   "n_writes": 381,
+   "write_coverage": 0.9973753280839895,
+   "task_coverage": 0.9964028776978417,
+   "step_token": 0.612513088402812,
+   "traj_fell_back": 0.014388489208633094
+  },
+  "hybrid_avg3": {
+   "n_traj": 278,
+   "n_writes": 381,
+   "write_coverage": 0.9816272965879265,
+   "task_coverage": 0.9784172661870504,
+   "step_token": 0.572091498003659,
+   "traj_fell_back": 0.017985611510791366
+  },
+  "hybrid_avg3+agent_rules": {
+   "n_traj": 278,
+   "n_writes": 381,
+   "write_coverage": 1.0,
+   "task_coverage": 1.0,
+   "step_token": 0.6222479835229954,
+   "traj_fell_back": 0.014388489208633094
+  }
+ },
+ "sonnet-35-new_retail": {
+  "tfidf_traj": {
+   "n_traj": 637,
+   "n_writes": 946,
+   "write_coverage": 0.9788583509513742,
+   "task_coverage": 0.9748822605965463,
+   "step_token": 0.5970960452936054,
+   "traj_fell_back": 0.018838304552590265
+  },
+  "tfidf_traj+agent_rules": {
+   "n_traj": 637,
+   "n_writes": 946,
+   "write_coverage": 0.9978858350951374,
+   "task_coverage": 0.9968602825745683,
+   "step_token": 0.6704190280652934,
+   "traj_fell_back": 0.0031397174254317113
+  },
+  "qwen_avg3": {
+   "n_traj": 637,
+   "n_writes": 946,
+   "write_coverage": 0.9756871035940803,
+   "task_coverage": 0.9717425431711146,
+   "step_token": 0.5664294662956302,
+   "traj_fell_back": 0.03296703296703297
+  },
+  "qwen_avg3+agent_rules": {
+   "n_traj": 637,
+   "n_writes": 946,
+   "write_coverage": 0.9978858350951374,
+   "task_coverage": 0.9968602825745683,
+   "step_token": 0.6513865793373378,
+   "traj_fell_back": 0.009419152276295133
+  },
+  "hybrid_avg3": {
+   "n_traj": 637,
+   "n_writes": 946,
+   "write_coverage": 0.9767441860465116,
+   "task_coverage": 0.9733124018838305,
+   "step_token": 0.5758686977522879,
+   "traj_fell_back": 0.06593406593406594
+  },
+  "hybrid_avg3+agent_rules": {
+   "n_traj": 637,
+   "n_writes": 946,
+   "write_coverage": 0.9968287526427061,
+   "task_coverage": 0.9952904238618524,
+   "step_token": 0.6536166163278695,
+   "traj_fell_back": 0.018838304552590265
+  }
+ }
+}

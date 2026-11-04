@@ -39,8 +39,10 @@ from rewind.evolve.skills import (  # noqa: E402
 )
 from rewind.evolve.surface import Edit, validate_edit  # noqa: E402
 from rewind.env.taubench_benchmark import TauBenchRetail  # noqa: E402
+from rewind.evolve.surface import use_benchmark  # noqa: E402
 
 TAU = TauBenchRetail()
+use_benchmark(TAU)  # case entities for the edit/lesson leak checks
 
 
 def main() -> None:
@@ -60,6 +62,8 @@ def main() -> None:
     ap.add_argument("--model", default="deepseek-chat")
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--yes", action="store_true")
+    ap.add_argument("--accept-judge-change", metavar="REASON",
+                    help="gate code/settings changed on purpose: record why and continue")
     a = ap.parse_args()
 
     run = Path(a.run_dir)
@@ -114,7 +118,7 @@ def main() -> None:
         tp = skill_target_plan(cfg, base_rows, {g.tool for g in groups}, evidence, bench=TAU)
         n_t = min(a.max_targets, len(tp["stable"]) + len(tp["missing"]))
         pool = _pool(load_rows(led.rows_path(inc.version)), led.shown() | evidence
-                     | {r["task_id"] for r in tp["failures"]})
+                     | {r["task_id"] for r in tp["failures"]}, cfg.max_pool)
         print(f"\ninduce: {len(groups)} LLM calls (~{prompt_chars // 4} prompt tokens in total), no episodes")
         print(target_summary(tp, n_t, pool))
         return
@@ -149,6 +153,11 @@ def main() -> None:
         return
 
     # gate
+    from rewind.evolve import integrity
+    try:
+        integrity.verify(led, cfg, a.accept_judge_change)
+    except integrity.JudgeChanged as e:
+        sys.exit(str(e))
     if not cand_path.exists():
         sys.exit(f"no candidates at {cand_path}: run `induce` first")
     edits = [Edit.model_validate(c["edit"]) for c in json.loads(cand_path.read_text(encoding="utf-8"))
@@ -158,7 +167,7 @@ def main() -> None:
     tp = skill_target_plan(cfg, base_rows, tools_cov, evidence, bench=TAU)
     n_t = min(a.max_targets, len(tp["stable"]) + len(tp["missing"]))
     pool = _pool(load_rows(led.rows_path(inc.version)), led.shown() | evidence
-                 | {r["task_id"] for r in tp["failures"]})
+                 | {r["task_id"] for r in tp["failures"]}, cfg.max_pool)
     print(f"gate {len(edits)} skills as one version on top of v{inc.version}: {[e.target for e in edits]}\n"
           f"  known stable targets: {[r['task_id'] for r in tp['stable']]}\n" + target_summary(tp, n_t, pool))
     if not (a.yes or input("gate now? [y/N] ").strip().lower() == "y"):

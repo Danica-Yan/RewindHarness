@@ -91,8 +91,12 @@ async def replay_run(events: list[Event], snapshots: SnapshotStore, registry: To
     d = start.data
     cfg = AgentConfig(**{**d["cfg"], **(cfg_override or {})})
     rp = ReplayProvider(events)
+    router = None
+    if any(e.type == "route" for e in events):  # routed run: serve recorded decisions, no router model
+        from .routing import RecordedRouter
+        router = RecordedRouter(events, snapshots)
     runner = AgentRunner(rp, registry, cfg, snapshots,
-                         fallback=rp if d.get("has_fallback") else None, sleep=_no_sleep)
+                         fallback=rp if d.get("has_fallback") else None, sleep=_no_sleep, router=router)
     env = env_factory(snapshots.get(d["initial_env_hash"]))
     trace = TraceWriter(run_id=start.run_id + "~replay")
     try:

@@ -25,6 +25,12 @@ Usage:
 
   # P0 parity check against the run.py baseline (70.4% pass^1 on test):
   python scripts/taubench_multitrial_compare.py <run.py results> runs/p0/test_baseline.json
+
+  # with per-turn tool routing (experiments/intent_funnel), CPU-only router:
+  python scripts/run_taubench_rewind.py --split test --router tfidf --out runs/router/test_tfidf.json
+  # Qwen hybrid router (3 LoRA adapters from Kaggle):
+  python scripts/run_taubench_rewind.py --split test --router hybrid \
+      --qwen-adapters a/seed0_adapter a/seed1_adapter a/seed2_adapter --out runs/router/test_hybrid.json
 """
 from __future__ import annotations
 
@@ -45,6 +51,23 @@ from rewind.env.taubench_benchmark import TauBenchRetail  # noqa: E402
 
 TAU = TauBenchRetail()
 
+ROUTER_ROOT = Path(__file__).resolve().parents[1] / "experiments" / "intent_funnel"
+
+
+def build_router(kind: str, adapters: list[str]):
+    """Per-turn tool router from experiments/intent_funnel (thresholds frozen on the dev replay)."""
+    if kind == "none":
+        return None
+    sys.path.insert(0, str(ROUTER_ROOT))
+    from intent_funnel.rewind_router import build_router as _build
+    from intent_funnel.taxonomy import SHARED_TOOLS, ACTION_TO_INTENT
+    from rewind.env.taubench_dialogue import wiki
+    from rewind.evolve.runner import version_setup
+    _, reg = version_setup(ContextVersion(), bench=TAU)
+    retail = set(SHARED_TOOLS) | set(ACTION_TO_INTENT)
+    extra = sorted(t["name"] for t in reg.schemas() if t["name"] not in retail)
+    return _build(kind, qwen_adapters=adapters, wiki=wiki(), always_tools=extra)
+
 
 def parse_ids(spec: str | None, total: int) -> list[int]:
     if not spec:
@@ -63,7 +86,11 @@ async def main_async(args: argparse.Namespace) -> None:
     out = Path(args.out)
     store = SnapshotStore(args.store_dir or out.parent / "snapshots")
     ids = parse_ids(args.task_ids, n_tasks(args.split))
-    rows = await run_batch(args.split, ids, args.num_trials, out, ctx=ContextVersion(),
+    # getattr: callers that build their own Namespace (tests, other scripts) predate routing
+    router = build_router(getattr(args, "router", "none"), getattr(args, "qwen_adapters", []))
+    if router is not None:
+        print(f"tool routing: {router.name} (t_include={router.t_include}, gate={router.gate})", flush=True)
+    rows = await run_batch(args.split, ids, args.num_trials, out, ctx=ContextVersion(), router=router,
                            provider=DeepSeekProvider(model=args.model),
                            user_llm=litellm_user_llm(model=args.user_model, provider=args.user_provider),
                            store=store, trace_dir=args.trace_dir, concurrency=args.concurrency,
@@ -88,6 +115,9 @@ def main() -> None:
     ap.add_argument("--model", default="deepseek-chat")
     ap.add_argument("--user-model", default="deepseek-chat")
     ap.add_argument("--user-provider", default="deepseek")
+    ap.add_argument("--router", default="none", choices=["none", "tfidf", "hybrid"],
+                    help="per-turn tool routing from experiments/intent_funnel (default: off)")
+    ap.add_argument("--qwen-adapters", nargs="*", default=[], help="3 LoRA adapter dirs for --router hybrid")
     asyncio.run(main_async(ap.parse_args()))
 
 

@@ -194,6 +194,10 @@ class Benchmark(Protocol):
     # -- agent -------------------------------------------------------------------
     def policy_text(self) -> str: ...
 
+    # Optional, outside the checked protocol: `case_entities() -> dict[str, set[str]]`,
+    # values that name one specific case in the data (customer names, zip codes, ...).
+    # Evolve refuses an edit containing one; see evolve.surface.use_benchmark.
+
     def agent_config(self, **overrides: Any) -> AgentConfig: ...
 
     def build_registry(self) -> ToolRegistry: ...

@@ -1,0 +1,211 @@
+{
+ "full_prompt_tokens": 3730,
+ "wiki_tokens": 1205,
+ "tool_schema_tokens": 2525,
+ "wiki_sections": {
+  "<preamble>": 297,
+  "## Domain basic": 229,
+  "## Cancel pending order": 104,
+  "## Modify pending order": 58,
+  "### Modify payment": 86,
+  "### Modify items": 157,
+  "## Return delivered order": 105,
+  "## Exchange delivered order": 169
+ },
+ "tool_tokens": {
+  "exchange_delivered_order_items": 304,
+  "modify_pending_order_items": 301,
+  "modify_pending_order_address": 252,
+  "return_delivered_order_items": 238,
+  "modify_user_address": 237,
+  "cancel_pending_order": 228,
+  "find_user_id_by_name_zip": 169,
+  "modify_pending_order_payment": 168,
+  "transfer_to_human_agents": 97,
+  "think": 84,
+  "get_order_details": 79,
+  "calculate": 78,
+  "find_user_id_by_email": 78,
+  "get_product_details": 74,
+  "get_user_details": 69,
+  "list_all_product_types": 69
+ },
+ "per_intent_routed": {
+  "cancel": {
+   "tokens": 1655,
+   "saving": 0.5563002680965148
+  },
+  "modify_items": {
+   "tokens": 1839,
+   "saving": 0.5069705093833781
+  },
+  "modify_order_address": {
+   "tokens": 1633,
+   "saving": 0.5621983914209115
+  },
+  "modify_payment": {
+   "tokens": 1635,
+   "saving": 0.561662198391421
+  },
+  "modify_user_address": {
+   "tokens": 1560,
+   "saving": 0.581769436997319
+  },
+  "return": {
+   "tokens": 1666,
+   "saving": 0.5533512064343163
+  },
+  "exchange": {
+   "tokens": 1796,
+   "saving": 0.5184986595174264
+  },
+  "info_query": {
+   "tokens": 1323,
+   "saving": 0.6453083109919571
+  },
+  "transfer": {
+   "tokens": 1323,
+   "saving": 0.6453083109919571
+  },
+  "out_of_scope": {
+   "tokens": 1323,
+   "saving": 0.6453083109919571
+  }
+ },
+ "splits": {
+  "train": {
+   "n_tasks": 500,
+   "multi_intent_tasks": 144,
+   "mean_saving_if_routed_perfectly": 0.4937378016085791,
+   "label_mix_top": [
+    [
+     "exchange",
+     102
+    ],
+    [
+     "cancel",
+     92
+    ],
+    [
+     "return",
+     91
+    ],
+    [
+     "modify_items",
+     71
+    ],
+    [
+     "modify_items+modify_order_address",
+     18
+    ],
+    [
+     "modify_items+modify_payment",
+     17
+    ],
+    [
+     "cancel+modify_items",
+     15
+    ],
+    [
+     "cancel+exchange",
+     14
+    ],
+    [
+     "exchange+modify_items",
+     12
+    ],
+    [
+     "cancel+return",
+     11
+    ],
+    [
+     "modify_items+return",
+     9
+    ],
+    [
+     "exchange+return",
+     8
+    ],
+    [
+     "modify_items+modify_order_address+return",
+     5
+    ],
+    [
+     "cancel+modify_items+modify_order_address",
+     4
+    ],
+    [
+     "cancel+modify_items+return",
+     4
+    ]
+   ]
+  },
+  "test": {
+   "n_tasks": 115,
+   "multi_intent_tasks": 34,
+   "mean_saving_if_routed_perfectly": 0.5119267979951043,
+   "label_mix_top": [
+    [
+     "exchange",
+     25
+    ],
+    [
+     "return",
+     19
+    ],
+    [
+     "modify_items",
+     14
+    ],
+    [
+     "cancel",
+     8
+    ],
+    [
+     "info_query",
+     7
+    ],
+    [
+     "modify_items+modify_order_address",
+     7
+    ],
+    [
+     "cancel+return",
+     6
+    ],
+    [
+     "modify_items+modify_order_address+modify_user_address",
+     4
+    ],
+    [
+     "modify_user_address",
+     3
+    ],
+    [
+     "transfer",
+     2
+    ],
+    [
+     "return+transfer",
+     2
+    ],
+    [
+     "modify_order_address",
+     2
+    ],
+    [
+     "modify_order_address+modify_user_address",
+     2
+    ],
+    [
+     "exchange+modify_items",
+     2
+    ],
+    [
+     "modify_items+return",
+     2
+    ]
+   ]
+  }
+ }
+}

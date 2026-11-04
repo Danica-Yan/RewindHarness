@@ -166,3 +166,74 @@ def test_overturned_rejections_teach_nothing(setup):
     first = next(x for x in exp if x["reason"].startswith("OVERTURNED"))
     assert first["feedback"] == "" and "did not reproduce" in first["reason"]
     assert "OVERTURNED" in meta.reflect_messages(exp, [])[0]["content"]
+
+
+def test_run_report_accounts_for_the_funnel_and_cost(setup):
+    from rewind.evolve.report import build, report
+    from rewind.evolve.loop import _paths
+    store, ledger, cfg = setup
+    from rewind.evolve.loop import run_round
+    asyncio.run(run_round(cfg, ledger, provider=FakeAgent(), user_llm=fake_user, store=store,
+                          proposer=FakeProposer([rule("poison", f"You must {POISON}."),
+                                                 rule("leaky", "For #W1234567 do an exchange."),
+                                                 rule("exchange_confirm", GOOD)]), log=lambda m: None,
+                          bench=TAU))
+    r = build(ledger, _paths(cfg)["stability"])
+    assert r["proposed"] == 3 and r["accepted"] == 1
+    assert r["funnel"] == {"gate: passed": 1, "invalid: stopped": 1, "screen: stopped": 1}
+    e = r["episodes"]
+    assert e["stability"] > 0 and e["screening"] > 0 and e["gate"] > 0
+    assert e["total"] == r["per_accepted_edit"] == sum(v for k, v in e.items() if k != "total")
+    md = report(ledger, cfg)
+    assert "per accepted edit" in md and "screening" in md and "1 candidates stopped before the gate" in md
+
+
+def test_gate_simulation_reproduces_the_audit():
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        "gate_simulation", Path(__file__).resolve().parents[1] / "scripts" / "gate_simulation.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    r = mod.sim(pool=188, runs=400, broken=5, seed=1)
+    h, b = r["harmless"], r["broken"]
+    assert h["old: drop > 2 pt"] / 400 > 0.12                     # the miscalibrated rule
+    assert h["confirm all, k=2 (used)"] / 400 < 0.06              # the rule in use
+    assert b["confirm all, k=2 (used)"] / 400 > 0.95
+    assert h["confirm any, k=2"] > h["confirm all, k=2 (used)"] > h["confirm all, k=3"]
+
+
+def test_report_counts_a_library_gate_once(setup):
+    """A skill library is gated as ONE version but recorded once per skill."""
+    from rewind.evolve.report import build
+    from rewind.evolve.loop import _paths
+    from rewind.evolve.surface import Edit
+    store, ledger, cfg = setup
+    data = {"episodes": 80, "n_tasks": 0, "rows_path": "runs/gate/v2_skills.json"}
+    for name in ("a_skill", "b_skill", "c_skill"):
+        e = Edit(kind="skill", target=name, op="add", text="{}", source_cluster="skill:x")
+        ledger.record(1, 0, e, "gate", False, "no proven effect", data, cluster=e.source_cluster)
+    r = build(ledger, _paths(cfg)["stability"])
+    assert r["episodes"]["gate"] == 80
+    assert r["funnel"] == {"gate (skill library): stopped": 3}
+
+
+def test_gate_pool_cap_is_a_stable_subset_that_grows_with_the_task_range():
+    from rewind.evolve.loop import _pool
+    rows = [{"task_id": t} for t in range(200)]
+    assert _pool(rows, set(), None) == list(range(200))
+    a = _pool(rows, {1, 2}, 50)
+    assert len(a) == 50 and a == _pool(rows, {1, 2}, 50) and not {1, 2} & set(a)
+    more = _pool(rows + [{"task_id": t} for t in range(200, 500)], {1, 2}, 150)
+    assert len(more) == 150                                   # cost stays flat as tasks are added
+    assert set(_pool(rows, {1, 2}, 150)) - set(more) <= set(range(200))
+
+
+def test_extending_a_version_points_it_at_more_tasks(tmp_path):
+    from rewind.evolve.ledger import EditLedger
+    led = EditLedger(tmp_path / "l.sqlite")
+    (tmp_path / "base.json").write_text(json.dumps([{"task_id": 0, "trial": 0, "reward": 1.0}]))
+    led.init_base(str(tmp_path / "base.json"))
+    (tmp_path / "more.json").write_text(json.dumps([{"task_id": t, "trial": 0, "reward": 1.0} for t in range(3)]))
+    led.set_rows_path(0, str(tmp_path / "more.json"))
+    assert led.rows_path(0) == str(tmp_path / "more.json") and led.current().version == 0

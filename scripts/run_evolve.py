@@ -16,6 +16,11 @@
             history -> <run-dir>/meta/proposed_lessons.json (not adopted yet)
   meta-eval old vs proposed lessons on recorded clusters (validation +
             screening); adopts the proposed lessons only if they win
+  report    funnel, episodes per stage and per accepted edit, and what each
+            filter saved -- NO API calls (--out file.md to save it)
+  extend    run the current version on more train tasks (--tasks 200-499) and
+            add them to its results, so later rounds have new failures to
+            learn from; the gate pool stays capped at --max-pool
 
 Regression memory: every task an accepted version fixed is re-checked by
 every later gate; `status` lists them (versions from before it existed are
@@ -48,15 +53,17 @@ from rewind.evolve.loop import (  # noqa: E402
     plan, regate, regate_candidates, retry_candidates, retry_cluster, run_round,
 )
 from rewind.evolve import consolidate as consol  # noqa: E402
-from rewind.evolve import meta  # noqa: E402
+from rewind.evolve import integrity, meta  # noqa: E402
 from rewind.evolve.prevalence import PrevalencePolicy  # noqa: E402
 from rewind.evolve.proposer import LLMProposer, deepseek_json_llm  # noqa: E402
 from rewind.evolve.screen import ScreenPolicy  # noqa: E402
 from rewind.providers import DeepSeekProvider  # noqa: E402
 from rewind.snapshot import SnapshotStore  # noqa: E402
 from rewind.env.taubench_benchmark import TauBenchRetail  # noqa: E402
+from rewind.evolve.surface import use_benchmark  # noqa: E402
 
 TAU = TauBenchRetail()
+use_benchmark(TAU)  # case entities for the edit/lesson leak checks
 
 
 def make_cfg(a: argparse.Namespace) -> EvolveConfig:
@@ -68,7 +75,7 @@ def make_cfg(a: argparse.Namespace) -> EvolveConfig:
                         max_drop=a.max_drop, confirm_k=a.confirm_k,
                         max_confirmed_regressions=a.max_confirmed_regressions, regression_k=a.regression_k,
                         regression_budget=a.regression_budget),
-        n_candidates=a.candidates, max_clusters_per_round=a.max_clusters,
+        n_candidates=a.candidates, max_clusters_per_round=a.max_clusters, max_pool=a.max_pool,
         max_members_per_cluster=a.max_members, budget_episodes=a.budget, concurrency=a.concurrency)
 
 
@@ -86,7 +93,7 @@ def open_ledger(a: argparse.Namespace) -> EditLedger:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["plan", "round", "status", "rollback", "gate-pending", "retry",
-                                    "regate", "consolidate", "reflect", "meta-eval"])
+                                    "regate", "consolidate", "reflect", "meta-eval", "report", "extend"])
     ap.add_argument("--base", help="baseline results json (registered as v0 on first use)")
     ap.add_argument("--run-dir", default="runs/p1")
     ap.add_argument("--store-dir", default="runs/p1/snapshots")
@@ -110,7 +117,12 @@ def main() -> None:
     ap.add_argument("--max-attempts", type=int, default=3, help="retry: proposer batches per cluster")
     ap.add_argument("--regression-k", type=int, default=3, help="forks per remembered fix, per version (0 = off)")
     ap.add_argument("--item", help="consolidate: only this rule/note/check/skill")
+    ap.add_argument("--accept-judge-change", metavar="REASON",
+                    help="the gate/screening code or settings changed on purpose: record why and continue")
     ap.add_argument("--meta-clusters", type=int, default=2, help="meta-eval: clusters to compare on")
+    ap.add_argument("--out", help="report: also write the markdown here")
+    ap.add_argument("--tasks", help="extend: task range(s), e.g. 200-499 or 200-299,350")
+    ap.add_argument("--max-pool", type=int, default=200, help="cap on gate pool tasks (fixed hash-ranked subset)")
     ap.add_argument("--regression-budget", type=int, default=None,
                     help="optional hard cap on raw regressions (noisy at high baselines)")
     ap.add_argument("--candidates", type=int, default=3)
@@ -124,9 +136,23 @@ def main() -> None:
     cfg = make_cfg(a)
     if (n := backfill_memory(led, cfg)):
         print(f"regression memory: backfilled {n} fixed task(s) from earlier versions")
+    if a.cmd == "report":
+        from rewind.evolve.report import report
+        md = report(led, cfg)
+        print(md)
+        if a.out:
+            Path(a.out).write_text(md, encoding="utf-8")
+        return
+    if a.cmd not in ("status", "plan", "rollback", "reflect", "extend"):
+        try:
+            integrity.verify(led, cfg, a.accept_judge_change)
+        except integrity.JudgeChanged as e:
+            sys.exit(str(e))
     if a.cmd == "status":
         cur = led.current()
         print(f"current version: v{cur.version}")
+        jh = integrity.history(led)
+        print(f"judge: {jh[-1]['id'] if jh else 'not recorded yet'} ({len(jh)} recorded change(s))")
         print(f"regression memory: {[t for t, _ in led.regression_suite()] or 'empty'}")
         print("proposer lessons: " + ("none" if not meta.lessons(led) else ""))
         for x in meta.lessons(led):
@@ -149,6 +175,43 @@ def main() -> None:
 
     def ask(prompt: str) -> bool:
         return a.yes or input(prompt).strip().lower() == "y"
+
+    if a.cmd == "extend":
+        if not a.tasks:
+            sys.exit("extend: give --tasks, e.g. 200-499")
+        want = []
+        for part in a.tasks.split(","):
+            lo, _, hi = part.partition("-")
+            want += list(range(int(lo), int(hi or lo) + 1))
+        inc = led.current()
+        rows = json.loads(Path(led.rows_path(inc.version)).read_text())
+        have = {r["task_id"] for r in rows}
+        from rewind.env.taubench_dialogue import n_tasks
+        new = [t for t in dict.fromkeys(want) if t not in have and t < n_tasks(a.split)]
+        print(f"v{inc.version} has results for {len(have)} tasks; {len(new)} new task(s) to run, 1 trial each "
+              f"= {len(new)} episodes (budget {a.budget})")
+        if not new or len(new) > a.budget:
+            if new:
+                print("over budget: raise --budget or narrow --tasks")
+            return
+        if not ask("run? [y/N] "):
+            return
+        prov, user, store = clients()
+        from rewind.evolve.runner import run_batch
+        out = Path(a.run_dir) / "extend" / f"v{inc.version}_tasks_{min(new)}-{max(new)}.json"
+        new_rows = asyncio.run(run_batch(a.split, new, 1, out, ctx=inc, bench=TAU, provider=prov, user_llm=user,
+                                         store=store, concurrency=a.concurrency,
+                                         log=lambda m: print(m, flush=True)))
+        merged = Path(a.run_dir) / f"v{inc.version}_rows_{len(have) + len(new_rows)}tasks.json"
+        merged.write_text(json.dumps(rows + new_rows, ensure_ascii=False, indent=1, default=str))
+        led.set_rows_path(inc.version, str(merged))
+        rnd = led.bump_round()
+        led.record(rnd, inc.version, None, "extend", True,
+                   f"added {len(new_rows)} tasks ({sum(r['reward'] < 1 for r in new_rows)} failed)",
+                   {"tasks": new, "rows_path": str(merged), "from": str(out)})
+        print(f"v{inc.version} now has results for {len(have) + len(new_rows)} tasks "
+              f"({sum(r['reward'] < 1 for r in new_rows)} new failures); run `plan` to see the clusters")
+        return
 
     if a.cmd == "consolidate":
         items = [i for i in consol.plan(led, cfg.gate) if a.item in (None, i["target"])]

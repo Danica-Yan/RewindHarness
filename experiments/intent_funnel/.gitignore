@@ -1,0 +1,18 @@
+# ---- large data files: kept locally, not in git (see README "Data kept out of git") ----
+data/processed/external.jsonl
+data/processed/tau_instr.jsonl
+data/processed/tau_traj_train.jsonl
+data/processed/agentctx/
+data/heldout/
+ext/
+
+# ---- training artefacts ----
+out/**/seed*_ckpt/
+out/**/seed*_adapter/
+out/smoke*/
+out/deepseek/cache.jsonl
+
+# ---- misc ----
+__pycache__/
+*.pyc
+.DS_Store

@@ -81,7 +81,8 @@ class AgentRunner:
     def __init__(self, provider, registry: ToolRegistry, cfg: AgentConfig,
                  snapshots: SnapshotStore, clock=None, fallback=None, sleep=None,
                  checkpointer: Checkpointer | None = None,
-                 debug_hook: Callable[[str, int], None] | None = None) -> None:
+                 debug_hook: Callable[[str, int], None] | None = None,
+                 router: Any = None) -> None:
         self.provider = provider
         self.registry = registry
         self.cfg = cfg
@@ -90,6 +91,8 @@ class AgentRunner:
         self.fallback = fallback
         self.sleep = sleep or asyncio.sleep
         self.checkpointer = checkpointer
+        # Optional per-turn tool router (routing.ToolRouter). None = every tool, unmodified prompt.
+        self.router = router
         # Test/debug seam only: lets tests simulate a process crash at an exact
         # point (e.g. "after this tool call, before the step checkpoint") by
         # raising from the hook. Never used in production wiring.
@@ -142,7 +145,17 @@ class AgentRunner:
                 point = StepStart(trace.last_seq, list(messages), copy.deepcopy(state), start_hash)
                 trace.emit("step_start", step, {"env_hash": start_hash})
                 last_step = step
-                resp = await self._llm_step(messages, tools, step, trace, state, rng, forced)
+                if self.router is not None:
+                    self._route_new_turns(messages, state, step, trace)
+                step_tools, routed_prompt = self._routed_view(tools, state)
+                system_msg = messages[0] if messages and messages[0].get("role") == "system" else None
+                if routed_prompt is not None and system_msg is not None:
+                    messages[0] = {**system_msg, "content": routed_prompt}
+                try:
+                    resp = await self._llm_step(messages, step_tools, step, trace, state, rng, forced)
+                finally:
+                    if routed_prompt is not None and system_msg is not None:
+                        messages[0] = system_msg  # history keeps the canonical prompt
                 forced = None
                 if cfg.single_tool_call and len(resp.tool_calls) > 1:
                     trace.emit("guard", step, {"guard": "truncate_tool_calls",
@@ -202,6 +215,8 @@ class AgentRunner:
                     continue
 
                 outcomes = await self._run_tool_batch(env, resp, step, pre_tool_messages, state, trace, rng, point)
+                if self.router is not None and not state.route_full:
+                    self._check_escalation(resp, state, step, trace)
                 for idx, call in enumerate(resp.tool_calls):
                     outcome = outcomes[idx]
                     tool_msg = {"role": "tool", "tool_call_id": call.id,
@@ -236,6 +251,55 @@ class AgentRunner:
                                           "tokens": state.tokens, "env_hash": end_hash,
                                           "final_text": final_text})
         return RunResult(trace.run_id, status, reason, last_step, state.tokens, final_text, end_hash)
+
+    # ---- tool routing -----------------------------------------------------------
+    def _route_new_turns(self, messages: list[dict], state: LoopState, step: int,
+                         trace: TraceWriter) -> None:
+        """Route every user turn that arrived since the last routing decision."""
+        users = [i for i, m in enumerate(messages)
+                 if m.get("role") == "user" and m.get("content") != REPAIR_PROMPT]
+        for n, i in enumerate(users):
+            if n < state.route_user_seen:
+                continue
+            agent_text = next((m.get("content") or "" for m in reversed(messages[:i])
+                               if m.get("role") == "assistant" and m.get("content")), "")
+            full_prompt = messages[0]["content"] if messages and messages[0].get("role") == "system" else ""
+            u = self.router.update(list(state.route_units), state.route_full,
+                                   messages[i].get("content") or "", agent_text, full_prompt)
+            prompt_ref = self.snapshots.put({"prompt": u.prompt}) if u.prompt is not None else None
+            state.route_units, state.route_full = list(u.units), u.full
+            state.route_tools, state.route_prompt_ref = (None if u.full else u.tools), \
+                (None if u.full else prompt_ref)
+            state.route_user_seen = n + 1
+            trace.emit("route", step, {"reason": "user_turn", "user_seen": state.route_user_seen,
+                                       "units": state.route_units, "full": state.route_full,
+                                       "tools": state.route_tools, "prompt_ref": state.route_prompt_ref,
+                                       "detail": u.detail})
+
+    def _routed_view(self, tools: list[dict], state: LoopState) -> tuple[list[dict], str | None]:
+        """(tool schemas, system prompt override) to send for this step."""
+        from .routing import ESCALATE_TOOL
+        if self.router is None or state.route_full or state.route_tools is None:
+            return [t for t in tools if t["name"] != ESCALATE_TOOL], None
+        allowed = set(state.route_tools) | {ESCALATE_TOOL}
+        prompt = self.snapshots.get(state.route_prompt_ref)["prompt"] if state.route_prompt_ref else None
+        return [t for t in tools if t["name"] in allowed], prompt
+
+    def _check_escalation(self, resp: LLMResponse, state: LoopState, step: int, trace: TraceWriter) -> None:
+        """The escalation tool, or a registered tool outside the current route, switches the run to the
+        full toolset for its remaining steps."""
+        from .routing import ESCALATE_TOOL
+        if state.route_tools is None:
+            return
+        allowed = set(state.route_tools)
+        for c in resp.tool_calls:
+            if c.name == ESCALATE_TOOL or (c.name not in allowed and self.registry.has(c.name)):
+                reason = "escalate" if c.name == ESCALATE_TOOL else f"route_violation:{c.name}"
+                state.route_full, state.route_tools, state.route_prompt_ref = True, None, None
+                trace.emit("route", step, {"reason": reason, "user_seen": state.route_user_seen,
+                                           "units": state.route_units, "full": True, "tools": None,
+                                           "prompt_ref": None, "detail": {}})
+                return
 
     @staticmethod
     def _normalize(resp: LLMResponse, step: int) -> LLMResponse:

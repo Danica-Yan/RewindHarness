@@ -1,0 +1,138 @@
+{
+ "target_write_coverage": 0.99,
+ "dev": "data/processed/tau_traj_test.replay.jsonl",
+ "routers": {
+  "rules": {
+   "t_include": 0.05,
+   "gate": 0.0,
+   "dev": {
+    "n_traj": 249,
+    "n_writes": 359,
+    "write_coverage": 0.935933147632312,
+    "task_coverage": 0.9116465863453815,
+    "step_token": 0.5580669855174162,
+    "traj_fell_back": 0.0
+   }
+  },
+  "tfidf_all": {
+   "t_include": 0.25,
+   "gate": 0.0,
+   "dev": {
+    "n_traj": 249,
+    "n_writes": 359,
+    "write_coverage": 0.9944289693593314,
+    "task_coverage": 0.9919678714859438,
+    "step_token": 0.6268922460175832,
+    "traj_fell_back": 0.28112449799196787
+   }
+  },
+  "tfidf_traj": {
+   "t_include": 0.15,
+   "gate": 0.0,
+   "dev": {
+    "n_traj": 249,
+    "n_writes": 359,
+    "write_coverage": 0.9944289693593314,
+    "task_coverage": 0.9919678714859438,
+    "step_token": 0.6169191228190928,
+    "traj_fell_back": 0.03614457831325301
+   }
+  },
+  "qwen_seed0": {
+   "t_include": 0.1,
+   "gate": 0.0,
+   "dev": {
+    "n_traj": 249,
+    "n_writes": 359,
+    "write_coverage": 0.9916434540389972,
+    "task_coverage": 0.9879518072289156,
+    "step_token": 0.5711165875695213,
+    "traj_fell_back": 0.04819277108433735
+   }
+  },
+  "qwen_seed1": {
+   "t_include": 0.15,
+   "gate": 0.0,
+   "dev": {
+    "n_traj": 249,
+    "n_writes": 359,
+    "write_coverage": 0.9916434540389972,
+    "task_coverage": 0.9879518072289156,
+    "step_token": 0.5704014396967504,
+    "traj_fell_back": 0.05622489959839357
+   }
+  },
+  "qwen_seed2": {
+   "t_include": 0.05,
+   "gate": 0.8,
+   "dev": {
+    "n_traj": 249,
+    "n_writes": 359,
+    "write_coverage": 0.9805013927576601,
+    "task_coverage": 0.9799196787148594,
+    "step_token": 0.6762184793538824,
+    "traj_fell_back": 0.39357429718875503
+   }
+  },
+  "qwen_avg3": {
+   "t_include": 0.15,
+   "gate": 0.0,
+   "dev": {
+    "n_traj": 249,
+    "n_writes": 359,
+    "write_coverage": 0.9916434540389972,
+    "task_coverage": 0.9879518072289156,
+    "step_token": 0.5634067563007717,
+    "traj_fell_back": 0.008032128514056224
+   }
+  },
+  "hybrid_avg3": {
+   "t_include": 0.4,
+   "gate": 0.0,
+   "dev": {
+    "n_traj": 249,
+    "n_writes": 359,
+    "write_coverage": 0.9944289693593314,
+    "task_coverage": 0.9919678714859438,
+    "step_token": 0.5821968469701064,
+    "traj_fell_back": 0.05220883534136546
+   }
+  },
+  "hybrid_qwen_seed0": {
+   "t_include": 0.4,
+   "gate": 0.0,
+   "dev": {
+    "n_traj": 249,
+    "n_writes": 359,
+    "write_coverage": 0.9944289693593314,
+    "task_coverage": 0.9919678714859438,
+    "step_token": 0.5835982682005972,
+    "traj_fell_back": 0.05622489959839357
+   }
+  },
+  "hybrid_qwen_seed1": {
+   "t_include": 0.4,
+   "gate": 0.0,
+   "dev": {
+    "n_traj": 249,
+    "n_writes": 359,
+    "write_coverage": 0.9944289693593314,
+    "task_coverage": 0.9919678714859438,
+    "step_token": 0.5783278298283813,
+    "traj_fell_back": 0.03614457831325301
+   }
+  },
+  "hybrid_qwen_seed2": {
+   "t_include": 0.25,
+   "gate": 0.0,
+   "dev": {
+    "n_traj": 249,
+    "n_writes": 359,
+    "write_coverage": 0.9944289693593314,
+    "task_coverage": 0.9919678714859438,
+    "step_token": 0.5907168434111546,
+    "traj_fell_back": 0.0321285140562249
+   }
+  }
+ }
+}

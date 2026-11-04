@@ -46,6 +46,12 @@ class LoopState:
     tokens: int = 0
     call_counts: dict[str, int] = field(default_factory=dict)
     consecutive_invalid: int = 0
+    # tool routing (see routing.py); defaults = no routing, full toolset
+    route_units: list[str] = field(default_factory=list)
+    route_full: bool = False
+    route_tools: list[str] | None = None      # None = full toolset
+    route_prompt_ref: str | None = None       # SnapshotStore ref of the routed system prompt
+    route_user_seen: int = 0                  # user turns already routed
 
     def bump_call(self, name: str, args_hash: str) -> int:
         key = f"{name}|{args_hash}"
@@ -65,4 +71,9 @@ class LoopState:
             elif e.type == "tool_call":
                 st.bump_call(e.data["name"], e.data["args_hash"])
                 st.note_result(e.data["error_class"])
+            elif e.type == "route":
+                d = e.data
+                st.route_units, st.route_full = list(d["units"]), d["full"]
+                st.route_tools, st.route_prompt_ref = d["tools"], d.get("prompt_ref")
+                st.route_user_seen = d["user_seen"]
         return st
