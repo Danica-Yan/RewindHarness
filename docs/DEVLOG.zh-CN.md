@@ -1131,6 +1131,202 @@ v1 的门禁集（188 个任务，单次运行）里还有 15 个之前没给 pr
 第二个候选是格式问题，不是想法问题，直接拒绝等于浪费一个候选名额。现在只点名一个工具的规则会被**自动转换**为那个工具的说明（文字和触发条件不变），再走后面的检验；同时涉及多个工具的仍是规则。
 
 另：第 3 轮的整理（消融）测试过 v1 规则——去掉它，目标任务 6/15 → 1/15（p = 0.04），所以保留。这是"规则仍在起作用"的直接证据。
+## Agent Platform P0：访问控制（`rewind.platform`）
+
+**目标**：把 rewind 从"单用户跑 benchmark 的 runtime"推向"多用户、多 agent 的服务端"。P0 只做一件事：所有工具调用前面有且只有一个执行点（PEP），由一个默认拒绝的策略引擎（PDP）做决定。MCP、Skill 版本管理、配额、沙箱都在后面的阶段，接口已为它们留好位置。
+
+**和已有 `policy.py` 的区别**：`policy.py` 管的是**业务规则**（写操作前要用户明确同意、只能替已认证用户操作），本模块管的是**访问控制**（谁、属于哪个租户、有什么角色、能不能调这个能力）。两者在 loop 里串联：循环检测 → 访问控制 → 业务规则 → 执行。
+
+**模块**：
+
+- `identity.Principal`：tenant / user / agent / roles / scopes。放在 `AgentConfig.principal` 里，因此会随配置写进 `run_start`，replay、fork、worker 续跑都自动拿到同一个身份，不需要额外传参。`attenuate()` 给子 agent 派生身份，只能收窄：角色必须是父角色子集，scope 必须被父 scope 覆盖（覆盖判断是保守的：通配的子 scope 只接受 `前缀*` 形式的父 scope）。
+- `capability.CapabilityDescriptor`：工具的统一描述——id（`local.<name>`，以后是 `mcp.<server>.<tool>`）、风险等级（read / write / external / destructive）、输出是否不可信、schema 哈希（P2 做 MCP schema pinning 用）。
+- `authz.PolicyEngine`：规则是数据（JSON），条件来自固定的小函数库（`arg_prefix`、`arg_in`、`arg_host_in`、`context_tainted`，可取反），与 `policy.py` 同样的思路：策略能组合、不能写代码。每个条件都是（身份、能力、参数、上下文是否被污染）的纯函数，所以 replay 能复现、以后也能离线对历史 trace 重新判决。策略内容哈希成 `policy_version`，每条决策都带着它。
+- `access.AccessControl`：挂在 `registry.access`（和 `registry.policy` 同一个位置，理由也一样：所有构造 AgentRunner 的路径都会带上它）。
+
+**几个设计点**：
+
+1. **决策顺序**：scope 之外直接拒绝 → 有 deny 就拒（deny 优先）→ 没有 allow 就拒（默认拒绝）→ 有 require_approval 就要审批 → 否则放行。
+2. **require_approval 只是叠加在授权之上的义务，本身不授权。** 这一条是测试抓出来的真 bug：最初的实现里"上下文被污染后，所有 external 能力都要审批"这条规则（作用域是 `*`）本身就算一次授权——一个**完全没有邮件权限**的 agent 只要先读一个网页，`send_email` 就会进入审批队列、被人点一下就执行了。规则越宽，越会把"加一道门"变成"开一扇门"。现在只有 allow 授权，审批规则不能单独生效；回归测试固定了这一点。
+3. **按批预授权**：同一轮里的所有调用先全部判决、再执行任何一个。只要有一个需要审批且尚未批准，整步一个都不执行，run 以 `awaiting_approval` 状态停下。这一步的 intent checkpoint 在判决之前已经落盘，所以审批通过后 `Coordinator.requeue()` 把任务放回队列，worker 按崩溃恢复的同一条路径续跑：重放这一步**已记录的动作**（不重新问模型），按 `(run, action_id, tool, args)` 找到审批记录，执行。审批不需要新的挂起机制，就是"在 checkpoint 处暂停"的又一个理由。被暂停那一次的 authz 事件和 run_end 在续跑时随 torn-write 截断一起丢弃，最终 trace 的 seq 连续、只有一个 run_end（测试断言）。
+4. **看不到的能力，和不存在的工具回答得一模一样。** 模型只会被展示它可能被允许用的工具（上下文里的最小权限）；如果它还是调了一个隐藏工具（猜的，或被注入诱导的），返回的错误类别和措辞与随口编的工具名完全相同，不泄露"这个工具存在但你没权限"。真实原因只写在审计事件里。注意 registry 原本的"未知工具"错误会列出**所有**已注册工具，在访问控制模式下这本身就是泄露，所以由 AccessControl 只列可见工具。
+5. **Fail closed**：registry 带访问控制但配置里没有 principal → 直接以 `access_denied` 结束，一个工具都不执行；catalog 建好之后才注册进 registry 的工具不可调用、也不可见。
+6. **路径前缀先规范化再比较**：`/workspaces/t1/../t2/x` 不算在 t1 下面，`/workspaces/t10/` 也不算在 `/workspaces/t1/` 下面（按路径段比较，不是字符串前缀）。前缀可以用 `${tenant_id}` 等身份变量，所以一条规则就能表达所有租户的隔离。
+7. **replay 同时验证访问控制**：每条决策都是一个 `authz` 事件。策略不变时 replay 逐字节一致；把租户隔离规则删掉再 replay，原来的 deny 变成 allow，replay 失败——策略变更会表现为"这个 run 不能复现"，而不是悄悄改变行为。这是 P5"用新策略回放历史 trace、输出差异报告"的基础。
+
+**测试**（`tests/test_platform.py`，33 个，全部离线、零 API）：引擎语义（默认拒绝、deny 优先、审批不授权、scope、URL host 匹配的边界如 `docs.example.com.evil.net`、条件校验、版本哈希）；loop 里的威胁场景（隐藏工具与未知工具不可区分、8 个路径/租户组合、子 agent scope、无身份 fail closed、后注册工具、被污染后无授权 agent 被拒而不是进审批队列）；完整的审批流程（worker → 暂停 → 人工批准/拒绝 → requeue → 续跑，模型调用次数不变）；replay。另外做了三个变异检查确认测试真的会失败：去掉路径规范化（1 个失败）、审批不暂停（2 个）、拒绝后仍执行（10 个）。
+
+**还没做的（P0 范围之外）**：审批存储只有进程内实现，多 worker 需要共享存储（接口很小：get / request / decide）；MCP 网关、Skill manifest 与版本发布、配额、沙箱分别是 P1–P4；`awaiting_approval` 的 run 用 fork 续跑时 run_id 不同，审批记录不匹配（按设计，审批只对同一个 run 有效）。
+
+## Agent Platform P1：配额（使用权限，`platform/quota.py`）
+
+**问题**：访问控制回答"能不能调"，配额回答"能调多少次"——按租户 / 用户 / agent / 单个 run 计数，可选固定时间窗口，每次调用可以有不同成本。配额是有状态、跨 worker 共享的，所以必须放在存储里，难点全在并发和崩溃恢复上。
+
+**规则**：`QuotaRule` 和访问规则一样是数据（示例 `data/access_policies/example_quotas.json`）。一次调用会命中若干条规则，每条规则对应一个桶（规则 id + 计数主体 + 窗口起点）。计数主体都带租户前缀，两个租户里同名的 `u1` 不会共用一个桶。
+
+**存储保证的三件事（都有测试固定）**：
+
+1. **并发不超扣**。Postgres 里检查和递增在同一条条件 UPDATE 里完成（`WHERE used + cost <= limit`），20 个协程同时抢最后 5 个额度，恰好 5 个成功。变异检查：改成"先 SELECT 再 UPDATE"的写法（最常见的竞态写法），测试立刻失败。
+2. **全有或全无**。一次调用命中多条规则时，只要有一条没额度，所有桶都不扣。Postgres 用 savepoint 实现：桶按 key 排序加锁（固定加锁顺序，两个覆盖相同桶的扣减不会死锁），失败就回滚到 savepoint。
+3. **每个动作只扣一次**。扣减以 `(run_id, action_id)` 为键。worker 扣完额度后崩溃，续跑时会重放**同一个已记录的动作**、用同一个 action_id，于是拿回之前记录的结果而不是再扣一次——和 `env.applied` 幂等台账是同一个思路。Postgres 里先 `INSERT .. ON CONFLICT DO NOTHING` 占住扣减 id：并发的同 id 请求会等前一个事务提交后冲突，然后读取它的结果。被拒的结果也会记录，续跑时窗口即使已经重置，答案也不变。测试：在全部 7 个 checkpoint 位置分别模拟崩溃再续跑，桶的用量永远等于实际工具调用次数（2）。
+
+**和 loop 的衔接**：扣减发生在访问控制放行之后、执行之前（按"尝试"计数：工具本身失败也算一次）。同一步里只要还有调用在等审批，这一步一个额度都不扣——暂停的步骤不花钱。超额的调用返回 `QUOTA_EXCEEDED`，消息里告诉模型多久后重置、不要立刻重试；结果写进同一个 `authz` 事件。
+
+**replay**：配额结果和模型回复一样，是外部状态。`replay_run` 发现 registry 上有配额时，换成 `RecordedQuota`，从 trace 里取回当时的结果，**完全不碰真实存储**。测试：replay 前后存储不变；把额度全部清空再 replay，当时的拒绝照样复现。
+
+**一个测试里的"bug"其实是保证在生效**：测试辅助函数给每个 run 用了同一个 run_id，第二个 agent 的第一次调用和第一个 agent 的扣减 id 相同，被当成重复扣减，直接返回了旧结果。修的是测试（每个 run 用不同 id），不是代码——生产里 run_id 本来就唯一。
+
+**测量**（`scripts/quota_bench.py`，2 vCPU 沙箱上的本地 Postgres 16，2000 次扣减、20 个并发 worker，跑两遍）：
+
+| 场景 | 吞吐 | p50 | p99 |
+|---|---|---|---|
+| 分散（每次扣不同的桶） | 1408–1563 次/s | 11.6–13.0 ms | 38–43 ms |
+| 热点（全部扣同一个桶） | 603–643 次/s | 25–27 ms | 108–121 ms |
+
+热点桶上所有写入都排队等同一行的行锁，吞吐降到约 40%、p99 涨到约 3 倍。这不是边缘情况：按租户计数的配额天然就是热点桶。现在的规模用不着优化；真正需要时的标准做法是分片计数（一个桶拆成 N 行，随机扣一行，读的时候求和）或者让每个 worker 一次预领一小批额度、本地扣减。这只是在 2 vCPU 机器上的数字，绝对值没有参考意义，相对差距才有。
+
+**还没做的**：成本目前是每条规则固定值，没有按实际 token 或费用计；超额只会拒绝，没做降级（换便宜模型）或排队；旧窗口的桶行不会自动清理（热路径不读它们，清理应该是定时任务）；LLM 本身的 token 预算仍在 `dist/gateway.py` 的限流器里，没有和这里的配额统一。
+
+## Agent Platform P2：MCP 网关（`platform/mcp_gateway.py`、`platform/mcp_pins.py`）
+
+**目标**：第三方 MCP server 的工具，和本地工具一样受同一套访问控制、配额、审批和审计约束。网关负责把"别人家的工具"变成 rewind 里的一个 capability：`notes` server 的 `read_note` 是能力 `mcp.notes.read_note`，模型看到的名字是 `notes__read_note`。所以 P0 的规则（租户路径隔离、上下文污染后升级审批）和 P1 的配额不需要任何改动就能作用到 MCP 工具上，测试里就是同一套规则。
+
+**SDK**：装到的是 `mcp` 2.3（FastMCP 已改名 MCPServer、客户端统一成 `mcp.Client`），所以 extra 固定在 `mcp>=2.3,<3`。
+
+**设计点**：
+
+1. **固定（pinning）的是完整定义，不是工具名。** 指纹覆盖名字、描述、input schema、annotations——模型读到的每一个字。每次同步，工具分成 approved / new / changed / removed 四种状态，只有 approved 会注册成 rewind 工具。之后定义变了（rug pull，比如描述里被塞进"先调用 admin_reset"），这个工具进入隔离：server 还在列出它，网关拒绝调用，直到有人批准新定义。
+2. **重连时先核对定义，再让连接可用。** 冒烟测试发现的漏洞：最初只有手动 `sync()` 才会重新核对，server 被重启、带着新定义回来之后，到下一次 sync 之前，旧的批准仍然覆盖新的描述。现在每次（重新）连接都先列出工具、核对固定结果，核对完之前连接不可用；连接存活期间也会按 `recheck_interval_s` 定期复核。测试：`kill -9` 杀掉 stdio server，让它以新定义重启，**不手动 sync**，重连后第一次调用被篡改的工具就被拒绝。
+3. **server 自报的风险只能往上调，不能往下调。** MCP annotations（readOnlyHint、destructiveHint）是 server 自己的说法。demo server 有一个开关让 `write_note` 谎称自己只读。规则：管理员给每个 server 设一个风险下限（默认 `write`），annotations 只能把风险抬高（声明 destructive 就是 destructive），只有管理员的逐工具覆盖能把风险降到下限以下。风险高于 `read` 的工具注册为 mutating，于是在 loop 里串行执行、受幂等台账保护。MCP 输出默认不可信，这正是 P0 里"上下文污染 → 外部/破坏性调用需审批"规则的触发条件。
+4. **密钥：配置里只存引用。** `secret_env` / `secret_headers` 记的是引用名，连接时才解析成值，只交给对应的那个 server（stdio 的进程环境，或 HTTP 头），不进配置序列化、不进 trace、模型看不到。stdio server 只继承 SDK 的最小默认环境（PATH 等少数几个），不会拿到父进程里别的密钥——测试里父进程设了 `REWIND_SECRET_UNRELATED`，server 里查不到。
+5. **连接管理**：每个 server 一个 supervisor 任务持有客户端会话；传输断开后带上限的指数退避重连；每个 server 有并发上限和调用超时；输出截断到 `max_output_chars`。传输错误、超时 → `TransientToolError`（走 loop 已有的重试），工具自己报的错 → `ToolError`。
+6. **replay 不调用 server。** 网关注册的工具标记为 `external`，`replay_run` 遇到这类工具时从 trace 里按 action_id 取回当时的结果（包括中间的瞬时失败），不重新调用。测试：跑完之后把网关关掉、server 状态清空，replay 仍然逐字节一致。fork 会真的调用 server——外部系统的状态不在 env 快照里，这是给"碰过外部世界的 run"做 fork 的诚实边界。
+7. **崩溃续跑只调用一次**：可变的 MCP 工具受 `env.applied` 保护，在所有 checkpoint 位置模拟崩溃续跑，server 端 `write_note` 的调用计数都是 1。**局限**：如果崩溃恰好发生在"server 已经执行完"和"tool checkpoint 写入"之间，续跑会再调一次——对外部系统要真正 exactly-once，需要 server 支持幂等键（比如把 `run_id:action_id` 放进请求的 `_meta`），这一点没有做，和 W4 那条"幂等台账只对 env 内部状态成立"的局限是同一回事。
+
+**测试暴露、随后修掉的问题**：
+
+- 上面第 2 点的重连窗口。
+- 网关关闭后再调用会把协程交给已经停止的事件循环，然后干等到超时（每次 45 秒，一次变异测试跑了 140 秒才发现）。现在关闭后立刻失败，`close()` 幂等。
+- **3.10/3.11 上的超时竞争**：SDK 自己的读超时和网关的 `wait_for` 设成了同一个值，在 3.11 上 SDK 先触发，抛出 `MCPError(REQUEST_TIMEOUT)`，被当成了工具的永久错误。修复：SDK 超时设得比网关长，同时把 `REQUEST_TIMEOUT` 归为可重试。另外 3.10 上 `asyncio.TimeoutError`、`concurrent.futures.TimeoutError` 还不是内置 `TimeoutError` 的别名，统一显式捕获。现在在 3.10 / 3.11 / 3.13 上全量测试都通过，3.11 上 MCP 测试连跑 5 遍稳定。
+
+**测试**（`tests/test_platform_mcp.py`，20 个，全部本地、零 API，约 5 秒）：指纹与状态核对；annotations 只升不降（6 种组合）；未批准不暴露；定义变化被隔离；错误映射（缺参数在发出请求前就是 `TOOL_ARG_INVALID`、工具报错、超时、输出截断）；同一套访问规则作用于 MCP 参数（`/t1/../t2/plan` 被拒）；注入后的破坏性调用进入审批；replay 不碰 server；所有崩溃点只调用一次；真实 `kill -9` + 新定义重启；密钥只到达对应 server；HTTP server 重启后恢复。四个变异检查（不在连接时核对、信任 server 的风险声明、replay 调用 server、子进程继承全部环境）各自让测试失败。
+
+**测量**（`scripts/mcp_bench.py`，2 vCPU 沙箱，两遍）：
+
+| | p50 | p99 |
+|---|---|---|
+| 进程内调用 | 1.1 ms | 2.2–2.4 ms |
+| stdio 调用 | 2.0–2.3 ms | 4.3–5.6 ms |
+| Streamable HTTP 调用 | 3.3–3.5 ms | 6.2–6.3 ms |
+| `kill -9` 后恢复（10 次） | 660–754 ms | 最大 741–884 ms |
+
+恢复时间几乎全是新 server 进程的启动：单独冷启动导入 MCP SDK 就要 0.67–0.77 秒。网关自己的重连开销可以忽略；要缩短恢复时间，应该从 server 侧下手（常驻、预热），而不是网关。
+
+**还没做的**：MCP 的 resources / prompts 没有接（只接了 tools）；server 端幂等键（见上）；固定结果的审批目前是 API 调用，没有审批界面；HTTP server 的 OAuth 流程没接，只支持由密钥解析出的静态请求头。
+
+## Agent Platform P3：Skill 管理（`platform/skills.py`）
+
+**和已有代码的关系**：`rewind.skills` 定义了 skill 对 agent 来说是什么（`load_skill` 背后的步骤）；Evolve 的 `ContextVersion` 管的是一个 benchmark agent 的整套上下文。P3 不重做这两件事，而是在平台层补上多租户需要的部分：每个 skill 独立的不可变版本、声明所需能力的 manifest、发布通道、门控、回滚，以及加载时鉴权。Evolve 的产出通过适配函数走同一条发布管线。
+
+**先修的一个集成 bug（P0 起就存在）**：Evolve 的 `patch_registry()` 新建 `ToolRegistry` 再逐个拷贝工具，只带走了 `policy`，没带走 `registry.access` / `registry.quota`，重建 `Tool` 时还丢了 P2 加的 `external`。后果：Evolve 一旦加一条 tool note，访问控制和配额就悄悄失效，MCP 工具在 replay 时会被真实调用。用测试复现后修复（带上平台层，`dataclasses.replace` 保留其余字段），加了回归测试。这类"包一层再重建对象时漏字段"的问题，只有在两条独立开发的功能线第一次交汇时才会暴露。
+
+**设计**：
+
+1. **manifest 声明所需能力**：`requires` 必须是具体的能力 id（不允许通配），可选 `tenants` 限定可见租户。名字、描述、步骤用和 agent skill 完全相同的规则校验。
+2. **版本不可变**：同名同版本内容不同直接拒绝；同内容重复注册是幂等的；版本号必须递增。
+3. **通道状态由只追加的事件日志推导出来**：每次 promote、被拒的 promote、rollback、yank 都记一条带操作人和门控结果的事件，`candidate` / `stable` 的当前位置从日志重放得到，所以审计日志和当前状态不可能不一致。
+4. **门控**：进 candidate 需要通过静态门（所需能力都存在；文本里没有提到未声明的工具；没有订单号、邮箱这类具体数据，复用 Evolve 的泄露检查）。进 stable 需要它当前就是 candidate，并且至少有一个静态检查以外的质量门。Evolve 的统计门控结果通过 `verdict_from_evolve` 转成门控结果。离线测试里没有真正的质量门可跑：skill 的质量只能靠真实模型的 episode 来衡量，那正是 Evolve 门控做的事，这里只负责接收它的结论，不假装自己能判断。
+5. **"文本里提到了未声明的工具"是一条安全检查**：如果 skill 写着"先调用 cancel_order"，却没有在 requires 里声明它，加载时的鉴权就看不到这个依赖——没有这项权限的 agent 照样能加载这个 skill，然后去尝试一个调用。这个调用会被策略引擎拦住，所以不是越权，但它让 manifest 说了假话，因此在发布时就拒绝。
+6. **回滚 + 撤回（yank）**：回滚就是弹出 stable 栈；被回滚的版本默认被撤回：新的 run 不能再绑定它，也不能再被 promote，但对 replay 仍然可读（`allow_yanked`），因为审计要求旧 run 能复现。
+7. **租户私有 skill 对其他租户就像不存在**：报错和"没有这个 skill"一样，不泄露它存在。
+8. **加载时鉴权**（`bind_skills`）：一个 skill 只有在策略允许 `skill.<name>`、**并且**主体能用它要求的每一个能力时才会提供给 agent；被排除的 skill 带着原因（缺哪个能力、哪条规则拒绝）。`load_skill` 工具按这次绑定重建，只认这次提供的版本。skill 本身不授予任何权限：加载只是让 agent 看到一段文字，之后的每个调用仍然由策略引擎判定。
+9. **每次 run 固定版本**：绑定结果是精确版本（`cancel_flow@1.0.0`），写进 `AgentConfig.skill_pins`，随 `run_start` 记录。之后 stable 换了版本、甚至旧版本被撤回，新 run 拿到新版本，旧 run 用记录下来的版本重新绑定后仍然逐字节 replay；用当前 stable 去 replay 旧 run 会失败——这正是应该的。
+10. **"Agent 授权 ∩ Skill 声明"落在子 agent 上**：`principal_for_skill` 给专门执行某个 skill 的子 agent 派生身份，scope 等于 skill 的 requires，复用 P0 的 `attenuate`。测试里父 agent 有发邮件的权限，skill 没声明，子 agent 就看不到也调不了。
+
+**测试**（`tests/test_platform_skills.py`，11 个，零 API）：版本不可变与递增；静态门（未声明的工具、未知能力、泄露）；stable 的流程要求和 Evolve 结论适配；回滚与撤回；租户私有；绑定时排除并给出原因；agent 只能加载绑定的 skill；跨发布的版本固定与 replay；子 agent 的交集权限；Evolve skill 转 manifest；`patch_registry` 回归。五个变异检查（静态门不查未声明工具、绑定不查所需能力、撤回的版本仍可解析、不是 candidate 也能进 stable、Evolve 丢掉平台层）各自让测试失败。
+
+**还没做的**：存储是 sqlite，多 worker 部署需要换成共享库（接口不变）；没有灰度（按比例把一部分 run 绑定到 candidate），这是下一步最自然的扩展，配合 Evolve 的门控可以做成"小流量验证再全量"；skill 之间的依赖没有建模。
+
+## Agent Platform P4：运行时加固（`platform/sandbox.py`、`platform/context.py`）
+
+**信任分级**：平台自己写的工具（玩具零售工具、MCP 网关的客户端一侧）仍在进程内运行，由访问控制和配额决定能不能跑；租户注册的代码、agent 写出来的代码进 `DockerSandbox` 容器；更不可信的代码用同一个接口，只需把 `SandboxPolicy.runtime` 设为 `"runsc"`（gVisor，在代码和宿主机内核之间加一层用户态内核）。这台沙箱机器没有 runsc，所以 gVisor 只验证了参数会正确传给 docker，没有真实跑过。
+
+**环境**：沙箱里有 Docker 客户端但没有守护进程，手动启动 dockerd 成功；Docker Hub 被出站白名单拦住、拉不到镜像，于是把宿主机上的 Python 解释器、标准库和它依赖的共享库拷进一个最小 rootfs，用 `docker import` 导入成本地镜像（69 MB）。正常机器和 CI 上用 `docker/sandbox.Dockerfile`（基于 `python:3.12-slim`）构建同名镜像；容器测试在没有 Docker 或镜像时自动跳过。
+
+**容器拿到什么**（`SandboxPolicy.container_flags`）：完全没有网络；根文件系统只读，/tmp 是小的 tmpfs（noexec、nosuid）；以 nobody 运行，丢掉全部 capability，no-new-privileges；内存（不允许额外 swap）、CPU、进程数上限；超时后整个容器被杀。只挂载**一个**宿主机目录：调用方租户的工作区，挂在 /work。另一个租户的文件不是被某条规则挡住，而是根本不在这个容器里。
+
+**密钥**：只给需要它的那一次调用，通过 `docker exec -e NAME` 按名字传，值放在 docker CLI 进程自己的环境变量里——不出现在命令行参数里（宿主机 `ps` 看不到），也不进容器配置（`docker inspect` 看不到）。
+
+**预热池：预热，但用后即焚**。每个租户可以提前启动几个空白容器，但每个容器只服务一次调用，用完立刻销毁，后台再补一个。这样省掉了启动延迟，又不会让两次调用——哪怕是同一个租户的——共享 /tmp 或残留进程。
+
+**租户从哪来**：工具函数只拿得到 `(env, args)`。新增 `platform/context.py`：loop 在执行每个工具前，把当前调用的身份、run_id、action_id 放进一个 `ContextVar`；`asyncio.to_thread` 会复制上下文到工作线程，并行的只读调用各在自己的 task 里，互不串。没有调用方身份就不执行（fail closed）。
+
+**顺带补上 P2 的局限**：同一个调用上下文让 MCP 网关在每次调用时带上幂等键 `run_id:action_id`（放在请求的 `_meta` 里）。崩溃续跑会重放同一个 action_id，所以键不变；支持幂等键的 server 就能处理 rewind 自己的台账覆盖不到的那种情况——server 已经执行完、checkpoint 还没写入时崩溃。测试确认 server 收到的键就是 `run-42:s1:c0`、`run-42:s2:c0`。
+
+**replay**：沙箱工具的结果取决于工作区文件和容器，不在 env 快照里，所以标为 `external`，replay 返回录制结果、不启动容器。测试：关掉沙箱后 replay 仍然逐字节一致。
+
+**测试中发现的问题**：
+
+1. **一个"通过"的测试其实什么都没证明**。预热池测试断言"第二次调用看不到第一次写在 /tmp 的文件"，一直是绿的；但第一次写入本身就失败了（tmpfs 默认属于 root，nobody 写不进去），我没有断言第一步的结果。另一个测试（/tmp 不可执行）报错时才发现。修复 tmpfs 权限（`mode=1777`），并给第一步加上断言。教训：断言"某件事没发生"的测试，必须同时断言前提确实成立。
+2. **网络测试原来也可能是空洞的**：它只断言"连 1.1.1.1 失败"，但这台机器自己就有出站白名单，即使容器连着网络也可能失败。改成直接断言容器里只有 `lo` 一个网络接口，并且错误码是 ENETUNREACH。
+3. **测量写错了**：第一次压测显示预热池比冷启动还慢——计时从拿到容器之后才开始，冷启动的创建时间根本没算。
+4. **CI 上会挂的权限问题**：GitHub runner 不是 root，没法把工作区 `chown` 给 nobody，0700 的目录容器写不进去。改为根目录 0700（宿主机其他用户进不来）、非 root 时租户子目录 0777（容器直接挂载子目录）。在这台机器上建了一个非 root、在 docker 组里的用户实际跑了一遍：新逻辑 18 个全过，旧逻辑 3 个失败。
+
+**测试**（`tests/test_platform_sandbox.py`，18 个；容器测试启动真实容器）：参数默认全部拒绝（含 gVisor 开关）；工作区 id 不能越界；两种身份下的目录权限；密钥值不进命令行参数；nobody 且无 capability；无网络（只有 lo）；根文件系统只读且 /tmp 不可执行；租户只看到自己的工作区；内存炸弹被杀；死循环超时被杀；fork 炸弹撞到进程数上限；密钥只在那一次调用里存在；预热容器只用一次、关闭后零残留；输出截断；作为工具接入 loop（按调用方租户执行、无权限的角色看不到）；replay 不启动容器；没有调用方身份时拒绝执行。六个变异检查（开网络、根文件系统可写、以 root 运行、去掉内存上限、/tmp 可执行、预热容器复用）各自让测试失败。
+
+**测量**（`scripts/sandbox_bench.py`，2 vCPU，各两遍）：
+
+| 场景 | 冷启动（每次新建） | 预热池 |
+|---|---|---|
+| 背靠背连续调用，p50 | 270–283 ms | 185–187 ms（命中 29/30） |
+| 调用间隔 1 秒，p50 | 252–269 ms | 127–132 ms（命中 20/20） |
+
+调用间有思考时间时（真实 agent 两次工具调用之间隔着一次 LLM 调用，通常是秒级），预热池把延迟减半；背靠背时只降约三分之一，因为后台销毁和补位与当前调用抢这 2 个 CPU。剩下的约 100 ms 主要是 docker CLI 本身的开销；换成直接走 Docker Engine API（unix socket）是下一个优化点，没有做。
+
+**还没做的**：没有出站白名单代理（容器要么完全无网络，要么——目前不支持——有网络；需要联网的能力走 MCP 网关，由策略的 `arg_host_in` 限制域名）；gVisor 没有真实跑过；预热池只在单进程内，多 worker 时每个 worker 各有一个池。
+
+## Agent Platform P5：用新策略重新评估历史 trace（`platform/whatif.py`）
+
+**问题**：改一条访问策略之前，想知道它会改变什么——哪些原本能做的事会被拦下（可能弄坏正常业务），哪些原本被拦下的事会被放行（安全风险）。P0 让 replay 在策略变化时直接失败，这能发现"变了"，但说不出变了什么。
+
+**为什么能离线做**：P0 的每个访问判决都是 trace 里已记录内容的纯函数：身份（`run_start` 里的配置）、调用本身（assistant 消息）、调用之前对话里是否已经出现过不可信内容（之前的消息）。所以新策略可以在所有录制的 run 上重新判一遍，不调用模型。这和 Evolve 的 `backtest.py`（在录制 trace 上回测业务规则）是同一个思路，这里换成访问控制。
+
+**先拆出一个没有副作用的判定**：P0 的 `AccessControl.check()` 在需要审批时会往审批存储里登记请求——离线重判如果直接调用它，会给每个历史调用都提交一条审批申请。拆成 `evaluate()`（纯判定，不碰审批存储）和 `check()`（在 `evaluate` 之上处理审批）。变异检查：重判改用 `check`，测试失败。
+
+**报告**：每个调用对比"当时发生了什么"（authz 事件；开启访问控制之前录的 run 记为 `unenforced`）和"新策略怎么说"，分成收紧、放松、换了拦截方式（deny 和 hidden 之间）、同样结果但由别的规则决定。单独列出两个最重要的视图：**真实执行过、新策略会拦下或要求审批的写操作**（新策略本可以防止什么、也可能弄坏什么），以及**原本被拦下、现在会放行的调用**（放松策略时的风险审查）。可以传入每个 run 的成败，把"会被打断的 run"按成败分开——和 backtest 里"在通过的 episode 上误触发"是同一个问题。
+
+**只有第一处分歧是可靠的**：一个 run 里第一处判决变化之后，agent 本应看到拒绝而不是结果，后面的对话不会是录下来的样子，所以后续的分歧是在一段不会存在的历史上判出来的。它们仍然报告，但标为 `downstream`，不算进"受影响的 run"。
+
+**用 fork 把预测变成事实**：`confirm_first_divergence` 在第一处分歧所在的步骤 fork 这个 run，**重放模型当时选择的动作**（不重新问模型），在新策略下执行，然后接着真实运行。这是整个流程里唯一花模型调用的一步。测试对语料里**每一个**首次分歧都这样验证：15 个首次分歧（审批改拒绝 7、拒绝改放行 5、放行改审批 3），loop 真实运行时的判决和离线预测 **15/15 一致**。
+
+**几个靠测试固定的细节**：
+
+1. **自洽是基础**：同一套策略在整个语料上重判，零变化。语料是真实 rewind 执行（不是手写的 JSON）：各种身份、自动批准和挂起的审批、上下文污染、同一轮里的并行调用、子 agent、fork 出来的 run（带继承的前缀）、审批后由 worker 续跑的 run（被截断重写过的 trace）、开启访问控制之前录的 run。
+2. **污染按调用当时的历史判断**：同一轮里先抓网页、再发邮件，发邮件被授权时网页内容还不在对话里，所以不算污染；只有下一轮的发邮件才算。变异检查：用整个 run 的历史判断污染，7 个测试失败。
+3. **fork 只算自己的调用**：继承的前缀是父 run 的判决，不重复计数。
+4. **目录（catalog）的变化也被评估**：把抓网页工具标为可信，原来需要审批的发邮件就变成直接放行。策略变更不只是规则文件，工具的风险等级和可信度也是策略的一部分。
+5. **开启访问控制之前的 run**：没有记录身份，默认跳过；用 `principal_for` / `--as` 指定一个身份后可以评估——这正是"给一个已有系统第一次加上访问控制"时要回答的问题。
+
+**CLI 作为 CI 检查**：`scripts/policy_diff.py traces/ --policy new.json --registry mod:fn --fail-on loosened`，打印报告，可以输出完整 JSON，违反 `--fail-on` 时退出码为 1。适合挂在修改策略文件的 PR 上。
+
+**测试**（`tests/test_platform_whatif.py`，22 个，零 API 调用）：同策略零变化；分类表；去掉租户隔离后找出跨租户写入；收紧时统计真实执行过的写操作并按 run 成败拆分；污染按当时的历史判断；目录变化；只有第一处分歧是干净的；开启访问控制之前的 run；fork 只算自己的调用；没有副作用；报告渲染和 JSON；单个 fork 验证；全部首次分歧的 fork 验证；CLI 退出码。五个变异检查（用整个 run 的历史判断污染、重复计数继承前缀、不标 downstream、重判时登记审批申请、把已批准的调用当成普通放行）各自让测试失败。
+
+**测量**（`scripts/whatif_bench.py`，2 vCPU，两遍）：2202 个 run（其中 200 个开启访问控制之前录的被跳过）、4503 个调用、15.4 MB 的 trace：内存中 0.19–0.24 秒（约 1.9–2.4 万次调用/秒），从 JSONL 读盘含解析 0.47–0.54 秒（约 0.8–1 万次调用/秒）。语料里的 run 都很短（平均 2 个调用）；污染判断每次扫一遍之前的消息，长 run 是平方级，τ-bench 规模（几十步）下可以忽略，更长的 run 可以改成增量计算。
+
+**还没做的**：配额不重新评估（取决于所有其他 run 的用量，一组 trace 记录不下来）；业务规则检查（`rewind.policy`）的回测在 Evolve 的 `backtest.py` 里，两者没有合并成一个报告；没有在真实 τ-bench trace 上跑过——那些 trace 在本地机器上，而且录制时还没有访问控制，需要用 `--as` 指定身份。
+
+## Agent Platform：移植到分层重构后的 main
+
+P0–P5 最初是在分层重构之前的 main（`7ddb845`）上写的。在它们合入之前，main 先合入了分层重构、Evolve 的后续工作和 intent router。平台的 6 个 commit 因此在新 main 上逐个重新应用：每个 commit 解决冲突后都单独跑全量测试，修复放回它所属的 commit，所以每个 commit 自己都是绿的（平台测试从 P0 的 255 个逐步增加到 P5 的 349 个，跳过数始终和 main 一样）。
+
+**文本冲突**（机械性的）：`checkpoint.py` 里的 sqlite Coordinator 搬到了 `coordination/sqlite.py` 并改为 async，`requeue` 随之加到新的协调层和 `CoordinatorStore` 端口上，端口测试里的方法清单也相应更新；loop 和 replay 里 main 加了 `router`、平台加了 `quota_meter`，两者都保留；main 删掉了 `_await` 这个同步/异步桥接模块（理由是后端已经统一为 async），所以配额调用改为就地判断返回值是否需要 await，没有把这个模块加回来。
+
+**比冲突更要紧的两件事**：
+
+1. **一组测试会被静默跳过**。main 把 `submit_job` 改成了 async，P1 的"在任意 checkpoint 崩溃，额度只扣一次"测试仍然同步调用它，于是拿到的是一个从没执行的协程，崩溃点列表为空，这组参数化测试的 7 个用例被 pytest 判定为"参数集为空"而跳过。测试结果是绿的，实际上一个崩溃点都没测。P2 的同类测试因为本身有断言而直接失败，才没有出现同样的情况。修复后在模块加载时断言崩溃点列表非空，以后同类问题会直接报错。这次移植的验证都用 `pytest -W error::RuntimeWarning` 跑，没被 await 的协程会直接让测试失败；项目的 pytest 配置里还没有加这一项。
+2. **路由的逃生工具被访问控制藏起来了**。main 新增的按轮次工具路由会给模型一个 `request_full_toolset` 工具，用来在路由不够用时切回全部工具。它注册在工具表里，但没有任何访问规则允许它，默认拒绝就把它当成了隐藏工具：开了访问控制之后，模型第一轮根本看不到它，路由就失去了逃生通道。两边各自的测试都是绿的，只有两个功能第一次组合时才会出现。修复：`AccessControl` 把它当作元工具，始终可见、始终允许、不扣配额。这样做是安全的：路由本来就是在访问控制过滤之后的工具上再筛选，所以"切回全部工具"只会回到这个主体本来就能用的范围。回归测试同时验证了两件事：有权限的主体逃生后能正常执行；没有权限的主体逃生后仍然调不了被拒的工具。变异检查：去掉这条豁免，测试失败。离线重判（P5）对元工具得出同样的结论，所以不会报出虚假的差异。
+
+**验证范围比之前大**：之前的测试环境没有装 τ-bench，Evolve 的大部分测试一直被跳过，P3 对 `patch_registry` 的修改在 Evolve 里其实没有被验证过。这次装上了 τ-bench 并启动了 Redis，全量 431 个通过，只剩 3 个因为缺 Toxiproxy 而跳过。
 
 ## 已知局限（诚实版）
 

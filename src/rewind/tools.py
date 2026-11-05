@@ -34,6 +34,10 @@ class Tool:
     # string result through as-is instead of JSON-encoding it.
     input_schema: dict | None = None
     raw_text_result: bool = False
+    # The result comes from outside the env (an MCP server, a web API): it is
+    # not reproducible from env snapshots, so replay serves the recorded
+    # outcome instead of calling it again (see replay.RecordedExternalTools).
+    external: bool = False
 
 
 @dataclass
@@ -98,6 +102,9 @@ class ToolRegistry:
 
     def has(self, name: str) -> bool:
         return name in self._tools
+
+    def get(self, name: str) -> Tool | None:
+        return self._tools.get(name)
 
     def is_mutating(self, name: str) -> bool:
         t = self._tools.get(name)

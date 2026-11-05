@@ -38,3 +38,8 @@ class CoordinatorStore(Protocol):
     async def complete(self, job_id: str, fencing_token: int, status: str,
                        result: dict | None = None) -> bool:
         """Token-gated completion. False if the token is stale."""
+
+    async def requeue(self, job_id: str, from_status: str = "awaiting_approval") -> bool:
+        """Move a parked job (e.g. one waiting for a human approval) back to
+        PENDING so the next claim resumes it from its latest checkpoint. False
+        unless the job is currently in `from_status`."""

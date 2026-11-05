@@ -27,7 +27,7 @@ def _backends():
 
 def test_port_lists_the_full_protocol():
     assert set(PORT_METHODS) == {"submit", "claim", "heartbeat", "get", "write_checkpoint",
-                                 "latest_checkpoint", "complete"}
+                                 "latest_checkpoint", "complete", "requeue"}
 
 
 @pytest.mark.parametrize("backend", list(_backends()), ids=lambda b: b.__name__)

@@ -1,0 +1,24 @@
+[
+  {
+    "id": "tenant-external-hourly",
+    "capabilities": ["local.send_email"],
+    "per": "tenant",
+    "limit": 100,
+    "window_seconds": 3600,
+    "description": "Each tenant may send at most 100 emails per hour, across all its agents."
+  },
+  {
+    "id": "agent-writes-per-run",
+    "capabilities": ["local.cancel_order", "local.write_file"],
+    "per": "run",
+    "limit": 5,
+    "description": "A single run may change at most 5 things: a runaway loop cannot mass-cancel orders."
+  },
+  {
+    "id": "user-web-daily",
+    "capabilities": ["local.fetch_url"],
+    "per": "user",
+    "limit": 200,
+    "window_seconds": 86400
+  }
+]

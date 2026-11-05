@@ -21,6 +21,7 @@ be rolled back to. Skills and guard templates are later surfaces (design P3).
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import json
 import re
@@ -162,12 +163,17 @@ class ContextVersion(BaseModel):
             return reg
         out = ToolRegistry()
         out.policy = self.policy() if self.checks else getattr(reg, "policy", None)
+        # Carry the platform layer over too (rewind.platform): a context edit
+        # must never switch off access control or quotas as a side effect.
+        for attr in ("access", "quota"):
+            if getattr(reg, attr, None) is not None:
+                setattr(out, attr, getattr(reg, attr))
         for t in reg._tools.values():
             note = self.tool_notes.get(t.name)
-            out.register(t if note is None else Tool(
-                name=t.name, description=f"{t.description}\n\nNote: {note}", args_model=t.args_model,
-                fn=t.fn, mutating=t.mutating, input_schema=copy.deepcopy(t.input_schema),
-                raw_text_result=t.raw_text_result))
+            # dataclasses.replace keeps every other field (e.g. `external`).
+            out.register(t if note is None else dataclasses.replace(
+                t, description=f"{t.description}\n\nNote: {note}",
+                input_schema=copy.deepcopy(t.input_schema)))
         if self.skills:
             out.register(load_skill_tool(self.skill_objects()))
         return out

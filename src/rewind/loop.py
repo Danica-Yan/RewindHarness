@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import random
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -48,6 +49,14 @@ class AgentConfig:
     # failures as "Error: <msg>"); defaults keep rewind's native behaviour
     single_tool_call: bool = False
     tool_error_format: str = "ERROR[{cls}]: {msg}"
+    # Who this run acts as (rewind.platform.Principal, JSON form). Only read
+    # when the registry carries an AccessControl; kept in the config so the
+    # identity is recorded in run_start and replay/fork/resume rebuild it.
+    principal: dict | None = None
+    # Exact skill versions this run was bound to ("name@1.2.0"), from
+    # rewind.platform.skills.bind_skills(...).pins(); recorded with the config
+    # so a later release cannot change what this run -- or its replay -- saw.
+    skill_pins: list[str] | None = None
 
 
 @dataclass
@@ -82,7 +91,7 @@ class AgentRunner:
                  snapshots: SnapshotStore, clock=None, fallback=None, sleep=None,
                  checkpointer: Checkpointer | None = None,
                  debug_hook: Callable[[str, int], None] | None = None,
-                 router: Any = None) -> None:
+                 router: Any = None, quota_meter: Any = None) -> None:
         self.provider = provider
         self.registry = registry
         self.cfg = cfg
@@ -93,6 +102,10 @@ class AgentRunner:
         self.checkpointer = checkpointer
         # Optional per-turn tool router (routing.ToolRouter). None = every tool, unmodified prompt.
         self.router = router
+        # Overrides `registry.quota` (rewind.platform.QuotaMeter). Replay
+        # passes a RecordedQuota here so it serves recorded outcomes instead
+        # of charging the real store again.
+        self.quota_meter = quota_meter
         # Test/debug seam only: lets tests simulate a process crash at an exact
         # point (e.g. "after this tool call, before the step checkpoint") by
         # raising from the hook. Never used in production wiring.
@@ -102,11 +115,15 @@ class AgentRunner:
     async def run(self, env: Environment, task: str, trace: TraceWriter) -> RunResult:
         messages = [{"role": "system", "content": self.cfg.system_prompt},
                     {"role": "user", "content": task}]
-        trace.emit("run_start", 0, {
+        start = {
             "task": task, "cfg": asdict(self.cfg),
             "initial_env_hash": self.snapshots.put(env.snapshot()),
             "has_fallback": self.fallback is not None,
-        })
+        }
+        access = getattr(self.registry, "access", None)
+        if access is not None:
+            start["access_policy_version"] = access.version
+        trace.emit("run_start", 0, start)
         for m in messages:
             trace.emit("message", 0, {"message": m})
         return await self._loop(env, messages, LoopState(), 1, trace, None)
@@ -129,9 +146,17 @@ class AgentRunner:
         rng = random.Random(int(sha(trace.run_id)[7:19], 16))
         t0 = self.clock.perf()
         tools = self.registry.schemas()
+        access, principal = self._access()
+        if access is not None and principal is not None:
+            # Least privilege for the context window: the model is only shown
+            # capabilities it could be allowed to use. Enforcement itself is
+            # per call, in _authorize_batch.
+            tools = access.filter_schemas(principal, tools)
         status, reason, final_text = "completed", None, None
         last_step = step - 1
         try:
+            if access is not None and principal is None:
+                raise RunAbort("access_denied", "registry has access control but the config has no principal")
             while True:
                 if step > cfg.max_steps:
                     raise RunAbort("budget_exceeded", "max_steps")
@@ -399,10 +424,12 @@ class AgentRunner:
         indexed = list(enumerate(resp.tool_calls))
         readonly = [(i, c) for i, c in indexed if not self.registry.is_mutating(c.name)]
         mutating = [(i, c) for i, c in indexed if self.registry.is_mutating(c.name)]
+        denied = await self._authorize_batch(resp, step, pre_tool_messages, trace)
 
         if len(readonly) >= 2:
             results = await asyncio.gather(
-                *(self._tool_step(env, c, step, i, state, trace, rng, pre_tool_messages) for i, c in readonly))
+                *(self._tool_step(env, c, step, i, state, trace, rng, pre_tool_messages, denied.get(i))
+                  for i, c in readonly))
             for (i, _c), outcome in zip(readonly, results):
                 outcomes[i] = outcome
             self.debug_hook("after_readonly_batch", step)
@@ -411,20 +438,77 @@ class AgentRunner:
                                              action=resp, point=point)
         else:
             for i, c in readonly:
-                outcomes[i] = await self._tool_step(env, c, step, i, state, trace, rng, pre_tool_messages)
+                outcomes[i] = await self._tool_step(env, c, step, i, state, trace, rng, pre_tool_messages,
+                                                   denied.get(i))
                 if self.checkpointer is not None:
                     await self.checkpointer.save("tool", step, trace, env, point.messages, point.state,
                                                  action=resp, point=point)
                 self.debug_hook("after_tool_call", step)
 
         for i, c in mutating:
-            outcomes[i] = await self._tool_step(env, c, step, i, state, trace, rng, pre_tool_messages)
+            outcomes[i] = await self._tool_step(env, c, step, i, state, trace, rng, pre_tool_messages,
+                                                   denied.get(i))
             if self.checkpointer is not None:
                 await self.checkpointer.save("tool", step, trace, env, point.messages, point.state,
                                              action=resp, point=point)
             self.debug_hook("after_tool_call", step)
 
         return outcomes
+
+    def _access(self):
+        """(AccessControl, Principal) when access control is on, else (None, None)."""
+        access = getattr(self.registry, "access", None)
+        if access is None:
+            return None, None
+        if not self.cfg.principal:
+            return access, None
+        from .platform.identity import Principal   # local import: keeps the loop free of a hard dependency
+        return access, Principal.model_validate(self.cfg.principal)
+
+    async def _authorize_batch(self, resp: LLMResponse, step: int, history: list[dict],
+                               trace: TraceWriter) -> dict[int, ToolOutcome]:
+        """Decide every call of this turn BEFORE any of them runs. Each
+        decision becomes an `authz` event. Calls that may not run come back
+        as ready-made error outcomes keyed by index (a hidden capability is
+        answered exactly like an unknown tool). If any call needs a human
+        approval that has not been granted yet, nothing in the step runs: the
+        run stops with status `awaiting_approval`. The intent checkpoint for
+        this step is already durable, so a resumed run redoes this same
+        recorded action, finds the grant, and continues -- approval is just
+        another reason to pause at a checkpoint.
+
+        Then quotas: each allowed call is charged to every quota rule that
+        covers it (all-or-nothing, see platform/quota.py); a call without
+        room is answered with QUOTA_EXCEEDED and does not run. Charging only
+        starts once no call is waiting for approval, so a paused step has
+        spent nothing. The quota outcome goes into the same authz event."""
+        access, principal = self._access()
+        if access is None:
+            return {}
+        verdicts = [access.check(principal, trace.run_id, f"s{step}:c{i}", c.name, c.args, history)
+                    for i, c in enumerate(resp.tool_calls)]
+        pending = [v.approval_key for v in verdicts if v.verdict == "pending_approval"]
+        meter = self.quota_meter if self.quota_meter is not None else getattr(self.registry, "quota", None)
+        denied: dict[int, ToolOutcome] = {}
+        for i, (c, v) in enumerate(zip(resp.tool_calls, verdicts)):
+            data = {"call_id": c.id, "idx": i, "name": c.name, **v.to_event()}
+            if v.verdict == "allow" and v.capability is not None and meter is not None and not pending:
+                q = meter.charge(principal, v.capability, trace.run_id, f"s{step}:c{i}")
+                if inspect.isawaitable(q):              # PgQuotaStore is async, the in-memory store is not
+                    q = await q
+                data["quota"] = q.to_event()
+                if not q.ok:
+                    wait = "" if q.retry_after is None else f"; it resets in {q.retry_after:.0f}s"
+                    denied[i] = ToolOutcome(False, f"usage limit reached for {c.name}{wait}. "
+                                                   "Do not retry it now; tell the user.", "QUOTA_EXCEEDED")
+            trace.emit("authz", step, data)
+            if v.verdict == "deny":
+                denied[i] = ToolOutcome(False, v.message, "ACCESS_DENIED")
+            elif v.verdict in ("hidden", "unknown"):
+                denied[i] = ToolOutcome(False, v.message, "HALLUCINATED_TOOL")
+        if pending:
+            raise RunAbort("awaiting_approval", ",".join(pending))
+        return denied
 
     def _policy_block(self, env, call: ToolCall, step: int, history: list[dict] | None,
                       trace: TraceWriter) -> ToolOutcome | None:
@@ -446,7 +530,8 @@ class AgentRunner:
         return blocked
 
     async def _tool_step(self, env, call: ToolCall, step: int, idx: int, state: LoopState,
-                         trace: TraceWriter, rng, history: list[dict] | None = None) -> ToolOutcome:
+                         trace: TraceWriter, rng, history: list[dict] | None = None,
+                         denied: ToolOutcome | None = None) -> ToolOutcome:
         cfg = self.cfg
         args_hash = sha(call.args)
         n = state.bump_call(call.name, args_hash)
@@ -467,26 +552,19 @@ class AgentRunner:
             outcome = ToolOutcome(
                 False, f"you have called {call.name} with identical arguments {n} times. "
                        "Change your approach or give a final answer.", "LOOP_DETECTED")
+        elif denied is not None:
+            outcome = denied                       # access control said no: never executed
         elif (blocked := self._policy_block(env, call, step, history, trace)) is not None:
             outcome = blocked
         else:
-            attempt = 0
-            while True:
-                # Dispatched to a thread pool (not called directly) so that when
-                # `_run_tool_batch` gathers several of these coroutines at once
-                # for non-mutating calls, their actual work genuinely overlaps
-                # instead of running one-at-a-time on the event loop thread.
-                outcome = await asyncio.to_thread(self.registry.execute, env, call.name,
-                                                  call.args, action_id)
-                if outcome.transient and attempt < cfg.max_transient_tool_retries:
-                    trace.emit("error", step, {"class": outcome.error_class, "attempt": attempt,
-                                               "message": outcome.content, "call_id": call.id})
-                    delay = self._backoff(attempt, rng)
-                    attempt += 1
-                    await self.sleep(delay)
-                    continue
-                break
-
+            # Who is calling, for executors that need it (sandbox, MCP gateway).
+            # to_thread copies the context into the worker thread; reset after.
+            from .platform.context import CALL_CONTEXT, CallContext
+            ctx_token = CALL_CONTEXT.set(CallContext(self._access()[1], trace.run_id, action_id))
+            try:
+                outcome = await self._execute_with_retries(env, call, action_id, step, trace, rng)
+            finally:
+                CALL_CONTEXT.reset(ctx_token)
         state.note_result(outcome.error_class)
         trace.emit("tool_call", step, {
             **base, "ok": outcome.ok, "error_class": outcome.error_class,
@@ -494,3 +572,23 @@ class AgentRunner:
             "latency_ms": round((self.clock.perf() - t) * 1000, 3)})
         trace.emit("env_snapshot", step, {"env_hash": self.snapshots.put(env.snapshot())})
         return outcome
+
+    async def _execute_with_retries(self, env, call: ToolCall, action_id: str, step: int,
+                                    trace: TraceWriter, rng) -> ToolOutcome:
+        cfg = self.cfg
+        attempt = 0
+        while True:
+            # Dispatched to a thread pool (not called directly) so that when
+            # `_run_tool_batch` gathers several of these coroutines at once
+            # for non-mutating calls, their actual work genuinely overlaps
+            # instead of running one-at-a-time on the event loop thread.
+            outcome = await asyncio.to_thread(self.registry.execute, env, call.name,
+                                              call.args, action_id)
+            if outcome.transient and attempt < cfg.max_transient_tool_retries:
+                trace.emit("error", step, {"class": outcome.error_class, "attempt": attempt,
+                                           "message": outcome.content, "call_id": call.id})
+                delay = self._backoff(attempt, rng)
+                attempt += 1
+                await self.sleep(delay)
+                continue
+            return outcome

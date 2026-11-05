@@ -139,6 +139,16 @@ class SqliteCoordinator:
                 (status, json.dumps(result or {}), job_id, fencing_token))
             return cur.rowcount > 0
 
+    async def requeue(self, job_id: str, from_status: str = "awaiting_approval") -> bool:
+        """Put a parked job back in the queue (e.g. once its pending approval
+        was decided). The next claim resumes it from its latest checkpoint
+        like any crashed job; only a job currently in `from_status` moves."""
+        with self.db:
+            cur = self.db.execute(
+                "UPDATE jobs SET status='PENDING', lease_owner=NULL, lease_expires_at=NULL "
+                "WHERE job_id=? AND status=?", (job_id, from_status))
+            return cur.rowcount > 0
+
 
 # Historical name, kept so existing callers (`from rewind import Coordinator`)
 # keep working.
